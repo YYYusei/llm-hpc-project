@@ -1,0 +1,214 @@
+You are an expert in High-Performance Computing (HPC) performance analysis. I will show you three examples of code analysis, then ask you to analyze a new piece of code.
+
+---
+
+## Example 1: Dense Matrix Multiplication
+
+### Code:
+```cpp
+void matmul(double* A, double* B, double* C, int N) {{
+    for (int i = 0; i < N; i++) {{
+        for (int j = 0; j < N; j++) {{
+            double sum = 0.0;
+            for (int k = 0; k < N; k++) {{
+                sum += A[i*N + k] * B[k*N + j];
+            }}
+            C[i*N + j] = sum;
+        }}
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner k-loop (line 6-7)",
+      "estimated_time_percentage": "95%",
+      "reason": "O(N³) operations, executed N² times with N iterations each",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "B[k*N + j] has stride-N access pattern causing cache misses. Arithmetic intensity is low due to poor data reuse."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "k-loop memory access",
+      "suggestion": "Loop tiling (blocking) for cache optimization",
+      "expected_speedup": "2-5x",
+      "implementation_difficulty": "medium",
+      "details": "Divide matrices into blocks that fit in L1/L2 cache, reorder loops to i-j-k blocking"
+    }},
+    {{
+      "target": "k-loop",
+      "suggestion": "SIMD vectorization",
+      "expected_speedup": "4x (AVX2) to 8x (AVX-512)",
+      "implementation_difficulty": "easy",
+      "details": "Use #pragma omp simd or intrinsics for inner loop"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Highly parallel, regular access patterns after tiling, high compute-to-memory ratio achievable",
+    "recommended_approach": "Use cuBLAS or implement tiled matrix multiplication with shared memory"
+  }}
+}}
+```
+
+---
+
+## Example 2: Sparse Matrix-Vector Multiplication (SpMV)
+
+### Code:
+```cpp
+// CSR format SpMV: y = A * x
+void spmv_csr(int nrows, int* row_ptr, int* col_idx, 
+              double* values, double* x, double* y) {{
+    for (int i = 0; i < nrows; i++) {{
+        double sum = 0.0;
+        for (int j = row_ptr[i]; j < row_ptr[i+1]; j++) {{
+            sum += values[j] * x[col_idx[j]];
+        }}
+        y[i] = sum;
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner j-loop (line 6-7)",
+      "estimated_time_percentage": "90%",
+      "reason": "Indirect indexing x[col_idx[j]] causes random memory access",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "Irregular access pattern through col_idx causes poor cache utilization. Only 2 FLOPs per memory access (multiply-add), very low arithmetic intensity (~0.25 FLOPs/byte)."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "x vector access",
+      "suggestion": "Matrix reordering (RCM, Metis) to improve locality",
+      "expected_speedup": "1.2-2x",
+      "implementation_difficulty": "hard",
+      "details": "Reorder rows/columns to cluster non-zeros near diagonal"
+    }},
+    {{
+      "target": "row processing",
+      "suggestion": "OpenMP parallelization over rows",
+      "expected_speedup": "Nx (N = cores)",
+      "implementation_difficulty": "easy",
+      "details": "#pragma omp parallel for on outer i-loop"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Many independent rows can be processed in parallel, but irregular access remains a challenge",
+    "recommended_approach": "Use cuSPARSE or implement with one thread per row, consider CSR5 or SELL-C-sigma formats"
+  }}
+}}
+```
+
+---
+
+## Example 3: Particle Pairwise Interaction (N-body style with neighbor list)
+
+### Code:
+```cpp
+// Compute pairwise forces with cutoff and neighbor list
+void compute_forces(int n, double* x, double* y, double* z,
+                    double* fx, double* fy, double* fz,
+                    int* neighbors, int* num_neighbors, double cutoff_sq) {{
+    for (int i = 0; i < n; i++) {{
+        double fxi = 0.0, fyi = 0.0, fzi = 0.0;
+        double xi = x[i], yi = y[i], zi = z[i];
+        
+        for (int k = 0; k < num_neighbors[i]; k++) {{
+            int j = neighbors[i * MAX_NEIGHBORS + k];
+            double dx = xi - x[j];
+            double dy = yi - y[j];
+            double dz = zi - z[j];
+            double rsq = dx*dx + dy*dy + dz*dz;
+            
+            if (rsq < cutoff_sq && rsq > 0.0) {{
+                double r2inv = 1.0 / rsq;
+                double r6inv = r2inv * r2inv * r2inv;
+                double force = 48.0 * r6inv * (r6inv - 0.5) * r2inv;
+                fxi += dx * force;
+                fyi += dy * force;
+                fzi += dz * force;
+            }}
+        }}
+        fx[i] += fxi;
+        fy[i] += fyi;
+        fz[i] += fzi;
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner k-loop force calculation (lines 10-23)",
+      "estimated_time_percentage": "85%",
+      "reason": "Force computation with expensive operations (division, multiple multiplications) executed for each neighbor pair",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "compute",
+    "reasoning": "Division (1.0/rsq) and multiple floating-point operations dominate. Neighbor list provides good data locality, so memory is not the primary bottleneck. Arithmetic intensity is moderate (~1-2 FLOPs/byte)."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "k-loop",
+      "suggestion": "SIMD vectorization with masking for conditional",
+      "expected_speedup": "2-4x",
+      "implementation_difficulty": "medium",
+      "details": "Use AVX2/AVX-512 with blend instructions for the if condition"
+    }},
+    {{
+      "target": "division operation",
+      "suggestion": "Use fast reciprocal approximation",
+      "expected_speedup": "1.2-1.5x",
+      "implementation_difficulty": "easy",
+      "details": "Replace 1.0/rsq with approximate reciprocal if precision allows"
+    }},
+    {{
+      "target": "i-loop",
+      "suggestion": "OpenMP parallelization",
+      "expected_speedup": "Nx (N = cores)",
+      "implementation_difficulty": "easy",
+      "details": "#pragma omp parallel for on outer loop (works because only f[i] is updated)"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Each atom's force calculation is independent (in this full-neighbor version), making it highly parallel",
+    "recommended_approach": "One thread per atom, ensure coalesced memory access for position arrays, use shared memory for neighbor positions if possible"
+  }}
+}}
+```
+
+---
+
+## Now Your Turn
+
+Analyze the following code using the same JSON format as the examples above.
+Output ONLY valid JSON, no markdown, no extra text.
+
+### Code to Analyze:
+```cpp
+{code}
+```
+
+Provide your analysis in JSON format.
