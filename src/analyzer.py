@@ -56,11 +56,6 @@ class AnalysisResult:
     bottleneck_type: Dict[str, Any]
     optimization_suggestions: List[Dict[str, Any]]
     gpu_suitability: Dict[str, Any]
-    
-    # 性能指标与深入分析（可选）
-    # 例如：算术强度估计、缓存行为、关键性能限制因素等
-    performance_metrics: Dict[str, Any] = field(default_factory=dict)
-    
     # 元数据
     elapsed_time: float
     total_tokens: int
@@ -68,6 +63,7 @@ class AnalysisResult:
     raw_response: str
     
     # 评估结果（可选）
+    performance_metrics: Dict[str, Any] = field(default_factory=dict)
     evaluation: Optional[Dict[str, Any]] = None
     
     def to_dict(self) -> Dict[str, Any]:
@@ -400,19 +396,36 @@ class HPCAnalyzer:
         logger.info(f"Analyzing {code_name} with {prompt_type} prompt...")
         response = self.client.chat(prompt)
         
-# 解析结果
+        # 初始化性能指标收集容器
+        performance_metrics: Dict[str, Any] = {}
+        
+        # 解析结果
         if response.parsed_json:
             result_data = response.parsed_json
             
             # 处理 contextual 格式的不同结构
             if prompt_type == "contextual":
-                # 从 root_cause_analysis 提取瓶颈信息
-                if "root_cause_analysis" in result_data and "bottleneck_type" not in result_data:
-                    root_cause = result_data.get("root_cause_analysis", {})
-                    result_data["bottleneck_type"] = {
-                        "primary": root_cause.get("primary_bottleneck", ""),
-                        "reasoning": root_cause.get("arithmetic_intensity_estimate", "")
-                    }
+                # 从 root_cause_analysis 提取瓶颈信息 + 性能指标
+                root_cause = result_data.get("root_cause_analysis", {})
+                if root_cause:
+                    # 如果还没有显式的 bottleneck_type，就从 root cause 里填充
+                    if "bottleneck_type" not in result_data:
+                        result_data["bottleneck_type"] = {
+                            "primary": root_cause.get("primary_bottleneck", ""),
+                            "reasoning": root_cause.get("arithmetic_intensity_estimate", "")
+                        }
+                    
+                    # 从 root_cause_analysis 提取性能指标
+                    performance_metrics["arithmetic_intensity_estimate_llm"] = root_cause.get(
+                        "arithmetic_intensity_estimate"
+                    )
+                    performance_metrics["cache_behavior_llm"] = root_cause.get("cache_behavior")
+                    performance_metrics["key_performance_limiters_llm"] = root_cause.get(
+                        "key_performance_limiters", []
+                    )
+                    performance_metrics["data_dependencies_llm"] = root_cause.get(
+                        "data_dependencies", []
+                    )
                 
                 # 从 optimization_recommendations 映射到 optimization_suggestions
                 if "optimization_recommendations" in result_data and "optimization_suggestions" not in result_data:
@@ -438,41 +451,33 @@ class HPCAnalyzer:
                         "reason": result_data["profiler_validation"].get("reasoning", ""),
                         "confidence": "high"
                     }]
+            
+            # 从 profiling_data 估算算术强度等硬件相关指标
+            if profiling_data:
+                performance_metrics["profiling_raw"] = profiling_data
+                
+                # 例如：HPCG 提供了 gflops 和 bandwidth_gbs，可以估算算术强度
+                gflops = profiling_data.get("gflops")
+                bandwidth = profiling_data.get("bandwidth_gbs")
+                if isinstance(gflops, (int, float)) and isinstance(bandwidth, (int, float)) and bandwidth > 0:
+                    ai_est = gflops / bandwidth  # 单位约为 FLOPs/byte（忽略单位差异的粗略估计）
+                    performance_metrics["arithmetic_intensity_estimate_profile"] = ai_est
+                
+                # 对 miniMD 这类：基于时间占比给出简单带宽/计算占比的提示
+                total_time = profiling_data.get("total_time")
+                t_force = profiling_data.get("t_force")
+                t_neigh = profiling_data.get("t_neigh")
+                if isinstance(total_time, (int, float)) and total_time > 0:
+                    ratios = {}
+                    if isinstance(t_force, (int, float)):
+                        ratios["force_time_ratio"] = t_force / total_time
+                    if isinstance(t_neigh, (int, float)):
+                        ratios["neigh_time_ratio"] = t_neigh / total_time
+                    if ratios:
+                        performance_metrics["time_ratios_profile"] = ratios
         else:
             logger.warning("Failed to parse JSON, using empty result")
             result_data = {}
-        
-        # ========= 性能指标抽取（算术强度 / 缓存行为等）=========
-        performance_metrics: Dict[str, Any] = {}
-        
-        # 1) 从 LLM 的 root_cause_analysis 中抽取信息（主要在 contextual 模式可用）
-        root_cause = result_data.get("root_cause_analysis", {})
-        if isinstance(root_cause, dict) and root_cause:
-            performance_metrics["arithmetic_intensity_estimate"] = root_cause.get("arithmetic_intensity_estimate")
-            performance_metrics["key_performance_limiters"] = root_cause.get("key_performance_limiters", [])
-            performance_metrics["cache_behavior"] = root_cause.get("cache_behavior")
-            performance_metrics["data_dependencies"] = root_cause.get("data_dependencies", [])
-        
-        # 2) 如果有 profiling_data（例如 HPCG 提供 gflops / bandwidth_gbs），计算一个简单的 AI
-        profiling_metrics: Dict[str, Any] = {}
-        if profiling_data:
-            gflops = profiling_data.get("gflops")
-            bandwidth = profiling_data.get("bandwidth_gbs")
-            try:
-                if gflops is not None and bandwidth is not None:
-                    gflops_val = float(gflops)
-                    bandwidth_val = float(bandwidth)
-                    if bandwidth_val > 0:
-                        # 算术强度 ~= GFlop/s / GB/s = Flop/Byte
-                        profiling_metrics["arithmetic_intensity_from_profile"] = gflops_val / bandwidth_val
-                        profiling_metrics["gflops"] = gflops_val
-                        profiling_metrics["bandwidth_gbs"] = bandwidth_val
-            except (TypeError, ValueError):
-                # 配置里不是数值就忽略
-                pass
-        
-        if profiling_metrics:
-            performance_metrics["profiling"] = profiling_metrics
         
         # 构建结果对象
         result = AnalysisResult(
