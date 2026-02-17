@@ -1,240 +1,200 @@
 # LLM-HPC: LLM 辅助 HPC 性能分析与 GPU 转换
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-
-## 📖 项目简介
+## 项目简介
 
 本项目研究使用大型语言模型（LLM）辅助高性能计算（HPC）代码的性能分析和 GPU 转换。
 
-### 研究问题
+主要研究问题：
+1. LLM 能否准确识别 HPC 代码的性能瓶颈？
+2. 不同 prompt 策略对分析准确率的影响？
+3. LLM 能否辅助将 CPU 热点代码转换为 GPU 代码？
 
-1. **LLM 能否准确识别 HPC 代码的性能瓶颈？**
-2. **LLM 能否辅助将 CPU 代码转换为 GPU 代码？**
+## 支持的基准程序
 
-### 测试基准
+| 程序 | 领域 | 语言 | 主要热点 | 瓶颈类型 |
+|------|------|------|----------|----------|
+| miniMD | 分子动力学 | C++ | ForceLJ::compute | compute |
+| HPCG | 稀疏线性代数 | C++ | ComputeSYMGS/SPMV | memory |
+| Abinit | DFT 计算 | Fortran | nonlop/fourwf | compute/memory |
+| CP2K | 量子化学 | Fortran | grid_integrate/dbcsr | compute |
 
-| 基准程序 | 领域 | 主要热点 | 瓶颈类型 |
-|----------|------|----------|----------|
-| miniMD | 分子动力学 | ForceLJ::compute (80%) | compute/latency |
-| HPCG | 稀疏线性代数 | SpMV (60-70%) | memory |
+其中 miniMD 和 HPCG 做完整分析 + GPU 转换，Abinit 和 CP2K 仅做 LLM 分析对比。
 
-## 🚀 快速开始
+## 快速开始
 
 ### 环境要求
 
 - Python 3.8+
 - OpenAI API Key
-- (可选) CUDA Toolkit 12.0+
+- (可选) VTune 用于 profiling
+- (可选) CUDA Toolkit 用于 GPU 转换
 
 ### 安装
 
 ```bash
-# 克隆项目
 git clone https://github.com/yourusername/llm-hpc-project.git
 cd llm-hpc-project
 
-# 创建虚拟环境
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# 或 venv\Scripts\activate  # Windows
-
-# 安装依赖
 pip install -r requirements.txt
 
-# 配置 API Key
-cp configs/config.example.yaml configs/config.yaml
-# 编辑 config.yaml，填入你的 API Key
+# 设置 API Key
+export OPENAI_API_KEY="your-key"  # Linux/Mac
+$env:OPENAI_API_KEY="your-key"   # Windows PowerShell
 ```
 
 ### 运行测试
 
 ```bash
-# 运行 LLM 性能分析
-python src/main.py analyze --code minimd
+# 本地测试（不调用 API）
+python test_local.py
 
-# 运行 GPU 转换
-python src/main.py convert --code minimd --function compute_fullneigh
+# miniMD 完整分析
+python test_api.py
 
-# 运行完整实验
-python src/main.py experiment --all
+# HPCG 完整分析
+python test_hpcg.py
 ```
 
-## 📁 项目结构
+## 项目结构
 
 ```
 llm-hpc-project/
-├── README.md                 # 项目说明
-├── requirements.txt          # Python 依赖
-├── setup.py                  # 安装配置
-├── .gitignore               # Git 忽略文件
-├── .env.example             # 环境变量示例
+├── src/
+│   ├── analyzer.py           # LLM 性能分析
+│   ├── benchmark_config.py   # 基准程序配置（支持4个程序）
+│   ├── generalized_evaluator.py  # 通用评估器
+│   ├── vtune_integration.py  # VTune 数据解析
+│   ├── analysis_pipeline.py  # 端到端流水线
+│   ├── converter.py          # GPU 转换
+│   └── llm_client.py         # OpenAI API 封装
 │
-├── configs/                  # 配置文件
-│   ├── config.yaml          # 主配置
-│   └── prompts.yaml         # Prompt 配置
+├── prompts/
+│   ├── zero_shot.txt         # 无示例
+│   ├── few_shot.txt          # 带示例（原版）
+│   ├── few_shot_v2.txt       # 带示例（泛化版）
+│   └── contextual.txt        # 带 profiling 数据
 │
-├── src/                      # 源代码
-│   ├── __init__.py
-│   ├── main.py              # 主入口
-│   ├── llm_client.py        # LLM API 客户端
-│   ├── analyzer.py          # 性能分析模块
-│   ├── converter.py         # GPU 转换模块
-│   ├── evaluator.py         # 结果评估模块
-│   └── utils.py             # 工具函数
+├── configs/
+│   ├── config.yaml           # 基础配置
+│   └── config_v2.yaml        # 支持4个程序的配置
 │
-├── prompts/                  # Prompt 模板
-│   ├── zero_shot.txt
-│   ├── few_shot.txt
-│   └── contextual.txt
-│
-├── benchmarks/               # 基准代码
+├── benchmarks/               # 待分析的代码
 │   ├── minimd/
-│   │   └── force_lj.cpp
 │   └── hpcg/
-│       └── ComputeSPMV_ref.cpp
 │
-├── results/                  # 实验结果
-│   ├── analysis/            # 性能分析结果
-│   └── conversion/          # GPU 转换结果
+├── results/
+│   ├── analysis/             # LLM 分析结果
+│   ├── evaluation/           # 评估结果
+│   ├── vtune/                # VTune 数据
+│   └── reports/              # 汇总报告
 │
-├── tests/                    # 测试代码
-│   ├── test_analyzer.py
-│   └── test_converter.py
-│
-├── docs/                     # 文档
-│   ├── baseline_report.md   # D1: Baseline 报告
-│   ├── llm_experiment.md    # D2: LLM 实验报告
-│   └── gpu_conversion.md    # D3: GPU 转换报告
-│
-└── scripts/                  # 部署脚本
-    ├── deploy.sh            # 服务器部署
-    └── run_experiment.sh    # 批量实验
+└── docs/
+    └── IMPROVEMENT_NOTES.md  # 改进说明
 ```
 
-## 📊 实验结果
+## 使用方法
 
-### LLM 性能分析准确率
-
-| 指标 | Zero-shot | Few-shot | Contextual |
-|------|-----------|----------|------------|
-| 热点识别 | 100% | 100% | 100% |
-| 瓶颈类型 | 83% | 100% | 100% |
-| 平均得分 | 95 | 100 | 116.5 |
-
-### GPU 转换效果
-
-| 代码 | CPU 时间 | GPU 时间 | 加速比 |
-|------|----------|----------|--------|
-| miniMD force | TBD | TBD | TBD |
-| HPCG SpMV | TBD | TBD | TBD |
-
-## 📝 使用示例
-
-### Python API
+### 方法1：使用集成流水线
 
 ```python
-from src.analyzer import HPCAnalyzer
-from src.converter import GPUConverter
+from analysis_pipeline import IntegratedAnalysisPipeline
 
-# 性能分析
-analyzer = HPCAnalyzer(api_key="your-key")
-result = analyzer.analyze(
-    code_path="benchmarks/minimd/force_lj.cpp",
-    prompt_type="contextual",
-    profiling_data=profiling_data
-)
-print(result.hotspots)
-print(result.bottleneck_type)
+pipeline = IntegratedAnalysisPipeline()
 
-# GPU 转换
-converter = GPUConverter(api_key="your-key")
-cuda_code = converter.convert(
-    code_path="benchmarks/minimd/force_lj.cpp",
-    function_name="compute_fullneigh"
+# 使用手动输入的 VTune 数据
+results = pipeline.run_with_manual_vtune_data(
+    code_path='benchmarks/minimd/force_lj.cpp',
+    benchmark_name='minimd',
+    hotspots=[
+        {"name": "ForceLJ::compute", "time": 3.685, "percentage": 73.7},
+        {"name": "Neighbor::build", "time": 0.859, "percentage": 17.2},
+    ],
+    total_time=5.0,
+    cpu_utilization=9.5
 )
-cuda_code.save("output/force_lj.cu")
+
+print(f"最佳 prompt: {results['summary']['best_prompt_type']}")
+print(f"最高分: {results['summary']['best_score']}")
 ```
 
-### 命令行
+### 方法2：使用 VTune 报告文件
+
+```python
+results = pipeline.run_with_vtune_report(
+    code_path='benchmarks/minimd/force_lj.cpp',
+    vtune_report_path='vtune_hotspots.csv',
+    benchmark_name='minimd'
+)
+```
+
+### 方法3：使用预定义配置
+
+```python
+results = pipeline.run_with_config(
+    code_path='benchmarks/minimd/force_lj.cpp',
+    benchmark_name='minimd'
+)
+```
+
+### 快捷函数
+
+```python
+from analysis_pipeline import run_minimd_analysis, run_hpcg_analysis
+
+results = run_minimd_analysis()
+results = run_hpcg_analysis()
+```
+
+## 实验结果
+
+### miniMD (2026-02-17)
+
+| Prompt | 分数 | 热点数 | 花费 |
+|--------|------|--------|------|
+| zero_shot | 91.71 | 4 | $0.018 |
+| few_shot | **96.17** | 4 | $0.022 |
+| contextual | 93.09 | 1 | $0.019 |
+
+### HPCG (2026-02-17)
+
+| Prompt | 分数 | 热点数 | 花费 |
+|--------|------|--------|------|
+| zero_shot | **85.20** | 2 | $0.006 |
+| few_shot | 82.40 | 1 | $0.009 |
+| contextual | 82.20 | 1 | $0.009 |
+
+## VTune 使用
 
 ```bash
-# 分析单个文件
-python src/main.py analyze \
-    --code benchmarks/minimd/force_lj.cpp \
-    --prompt contextual \
-    --output results/analysis/
+# 运行热点分析
+vtune -collect hotspots -result-dir vtune_result -- ./minimd < in.lj
 
-# 批量实验
-python src/main.py experiment \
-    --config configs/experiment.yaml \
-    --output results/
+# 导出 CSV
+vtune -report hotspots -result-dir vtune_result -format csv -report-output hotspots.csv
 ```
 
-## 🔧 配置说明
+支持的 VTune 报告格式：CSV、TXT、JSON
 
-### config.yaml
+## 配置说明
+
+`configs/config_v2.yaml` 包含4个基准程序的配置：
 
 ```yaml
-llm:
-  provider: openai
-  model: gpt-4o
-  temperature: 0
-  max_tokens: 4096
+# 完整分析 + GPU 转换
+primary_benchmarks:
+  - minimd
+  - hpcg
 
-analysis:
-  prompt_types:
-    - zero_shot
-    - few_shot
-    - contextual
-
-benchmarks:
-  minimd:
-    path: benchmarks/minimd/force_lj.cpp
-    hotspot: ForceLJ::compute
-    bottleneck: compute
-  hpcg:
-    path: benchmarks/hpcg/ComputeSPMV_ref.cpp
-    hotspot: SpMV inner loop
-    bottleneck: memory
+# 仅 LLM 分析
+secondary_benchmarks:
+  - abinit
+  - cp2k
 ```
 
-## 🚢 部署
-
-### 服务器部署
-
-```bash
-# 上传到服务器
-scp -r llm-hpc-project user@server:/path/to/
-
-# SSH 登录并运行
-ssh user@server
-cd /path/to/llm-hpc-project
-./scripts/deploy.sh
-```
-
-### Docker 部署
-
-```bash
-docker build -t llm-hpc .
-docker run -e OPENAI_API_KEY=your-key llm-hpc
-```
-
-## 📚 文档
-
-- [Baseline 报告 (D1)](docs/baseline_report.md)
-- [LLM 实验报告 (D2)](docs/llm_experiment.md)
-- [GPU 转换报告 (D3)](docs/gpu_conversion.md)
-- [API 文档](docs/api.md)
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 📄 许可证
+## 许可证
 
 MIT License
 
-## 👤 作者
+## 作者
 
-- Yusei - 毕业设计项目
+Yusei - 毕业设计项目
