@@ -1,0 +1,203 @@
+You are an expert in High-Performance Computing (HPC) performance analysis. I will show you three examples of code analysis covering different bottleneck types, then ask you to analyze a new piece of code.
+
+IMPORTANT: Focus on general performance analysis principles, not pattern matching to specific applications.
+
+---
+
+## Example 1: Compute-Bound Kernel (Stencil Computation)
+
+### Code:
+```cpp
+// 2D 5-point stencil (heat diffusion)
+void stencil_2d(double* u_new, double* u, int nx, int ny, double cx, double cy) {{
+    for (int j = 1; j < ny-1; j++) {{
+        for (int i = 1; i < nx-1; i++) {{
+            int idx = j * nx + i;
+            u_new[idx] = u[idx] + cx * (u[idx-1] - 2*u[idx] + u[idx+1])
+                                + cy * (u[idx-nx] - 2*u[idx] + u[idx+nx]);
+        }}
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner i-loop (stencil update, lines 4-7)",
+      "estimated_time_percentage": "95%",
+      "reason": "O(nx*ny) operations with multiple floating-point operations per grid point",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "compute",
+    "reasoning": "7 FLOPs per 5 memory accesses gives ~1.4 FLOPs/byte. With good spatial locality from contiguous i-loop access, this is compute-limited on modern CPUs with high memory bandwidth."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "stencil loop",
+      "suggestion": "Temporal blocking (time tiling) to increase arithmetic intensity",
+      "expected_speedup": "1.5-3x",
+      "implementation_difficulty": "hard",
+      "details": "Process multiple time steps within a cache-resident tile before moving to next spatial region"
+    }},
+    {{
+      "target": "i-loop",
+      "suggestion": "SIMD vectorization with aligned loads",
+      "expected_speedup": "4-8x (AVX2/AVX-512)",
+      "implementation_difficulty": "easy",
+      "details": "Use #pragma omp simd or explicit intrinsics; ensure 32/64-byte alignment"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Regular grid access pattern, high parallelism across grid points, good memory coalescing for i-dimension",
+    "recommended_approach": "2D thread blocks with shared memory halo regions for boundary elements"
+  }}
+}}
+```
+
+---
+
+## Example 2: Memory-Bound Kernel (Indirect Access Pattern)
+
+### Code:
+```cpp
+// Gather operation with indirect indexing
+void gather_indirect(double* dest, double* src, int* indices, int n) {{
+    for (int i = 0; i < n; i++) {{
+        dest[i] = src[indices[i]];  // Random access through indices
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "main loop (line 3-4)",
+      "estimated_time_percentage": "99%",
+      "reason": "Entire kernel is a single loop with indirect memory access pattern",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "Indirect indexing src[indices[i]] causes random memory access. Even with cache, each access may miss. Only 1 load + 1 store per iteration, arithmetic intensity is near zero. Limited by memory latency, not bandwidth."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "indices array",
+      "suggestion": "Index sorting or binning to improve locality",
+      "expected_speedup": "1.5-2x",
+      "implementation_difficulty": "medium",
+      "details": "Sort indices to access src in more sequential order; or bin indices into cache-sized groups"
+    }},
+    {{
+      "target": "hardware",
+      "suggestion": "Software prefetching",
+      "expected_speedup": "1.2-1.5x",
+      "implementation_difficulty": "medium",
+      "details": "Use __builtin_prefetch() to prefetch src[indices[i+k]] ahead of actual access"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": false,
+    "reasoning": "Random access patterns defeat GPU memory coalescing. Effective bandwidth drops dramatically. Better to restructure algorithm or use texture memory for hardware caching.",
+    "recommended_approach": "Only consider GPU if indices can be reordered for better coalescing, or if problem size is large enough to hide latency"
+  }}
+}}
+```
+
+---
+
+## Example 3: Mixed Bottleneck (Reduction Pattern)
+
+### Code:
+```fortran
+! Fortran-style reduction with conditional
+subroutine reduce_conditional(a, mask, n, result)
+    real(8), intent(in) :: a(n)
+    logical, intent(in) :: mask(n)
+    integer, intent(in) :: n
+    real(8), intent(out) :: result
+    
+    integer :: i
+    real(8) :: local_sum
+    
+    local_sum = 0.0d0
+    do i = 1, n
+        if (mask(i)) then
+            local_sum = local_sum + a(i) * a(i)
+        end if
+    end do
+    result = local_sum
+end subroutine
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "do loop with conditional (lines 11-15)",
+      "estimated_time_percentage": "98%",
+      "reason": "Single loop over n elements with branch and reduction dependency",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "Only 2 FLOPs (multiply-add) per 2 loads (a[i] and mask[i]), giving ~0.5 FLOPs/byte. Streaming access pattern is good, but low arithmetic intensity makes this bandwidth-limited. The conditional may cause branch mispredictions."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "conditional branch",
+      "suggestion": "Use masked operations instead of branches",
+      "expected_speedup": "1.2-1.5x",
+      "implementation_difficulty": "easy",
+      "details": "Replace if/then with: local_sum = local_sum + merge(a(i)*a(i), 0.0d0, mask(i))"
+    }},
+    {{
+      "target": "loop",
+      "suggestion": "Parallel reduction with OpenMP",
+      "expected_speedup": "Nx (N = cores)",
+      "implementation_difficulty": "easy",
+      "details": "!$omp parallel do reduction(+:local_sum) on the loop"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Reduction is well-supported on GPUs with parallel reduction algorithms. Masked operations avoid warp divergence better than conditionals.",
+    "recommended_approach": "Use CUB or Thrust for masked reduction, or implement tree-based reduction with mask predication"
+  }}
+}}
+```
+
+---
+
+## Analysis Guidelines
+
+When analyzing code, consider:
+1. **Hotspot identification**: Look for nested loops, expensive operations (division, transcendentals), and high iteration counts
+2. **Bottleneck classification**: Calculate or estimate arithmetic intensity (FLOPs/byte). >10 is compute-bound, <1 is memory-bound, 1-10 depends on hardware
+3. **Memory patterns**: Sequential (good), strided (moderate), indirect/random (poor)
+4. **Language patterns**: Recognize both C/C++ and Fortran idioms
+5. **GPU suitability**: Consider parallelism, memory access patterns, and data transfer overhead
+
+---
+
+## Now Your Turn
+
+Analyze the following code using the same JSON format as the examples above.
+Output ONLY valid JSON, no markdown, no extra text.
+
+### Code to Analyze:
+```
+{code}
+```
+
+Provide your analysis in JSON format.

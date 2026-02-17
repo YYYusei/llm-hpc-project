@@ -1,0 +1,216 @@
+# LLM-HPC 项目配置文件 (v2 - 支持4个基准程序)
+
+# ============== LLM 配置 ==============
+llm:
+  provider: openai
+  model: gpt-4o  # 可选: gpt-4o, gpt-4-turbo, gpt-3.5-turbo
+  temperature: 0  # 0 = 确定性输出，便于复现
+  max_tokens: 4096
+  timeout: 120  # 秒
+
+# ============== API Key ==============
+api:
+  openai_key: ${OPENAI_API_KEY}
+
+# ============== 分析配置 ==============
+analysis:
+  prompt_types:
+    - zero_shot
+    - few_shot
+    - contextual
+  
+  output_format: json
+  
+  # 评估指标权重
+  evaluation:
+    hotspot_weight: 40
+    bottleneck_weight: 30
+    gpu_weight: 20
+    suggestions_weight: 10
+
+# ============== 基准程序配置 ==============
+# 完整分析 + GPU 转换
+primary_benchmarks:
+  - minimd
+  - hpcg
+
+# 仅 LLM 分析对比
+secondary_benchmarks:
+  - abinit
+  - cp2k
+
+benchmarks:
+  # -------- miniMD (Primary) --------
+  minimd:
+    name: miniMD
+    full_name: Molecular Dynamics Proxy App
+    language: cpp
+    path: benchmarks/minimd/force_lj.cpp
+    description: Lennard-Jones Force Calculation
+    
+    ground_truth:
+      primary_hotspot: ForceLJ::compute
+      hotspots:
+        - name: ForceLJ::compute
+          time_percentage: 73.7
+          bottleneck_type: compute
+        - name: Neighbor::build
+          time_percentage: 17.2
+          bottleneck_type: memory
+      gpu_suitable: true
+    
+    profiling_data:
+      source: vtune
+      total_time: 5.0
+      t_force: 3.685
+      t_neigh: 0.859
+      force_percentage: 73.7
+      neigh_percentage: 17.2
+      cpu_utilization: 9.5
+      system_info:
+        cpu: Intel Core i7-11800H
+        cores: 8
+        threads: 16
+        cache_l1: 48KB
+        cache_l2: 1.25MB
+        cache_l3: 24MB
+
+  # -------- HPCG (Primary) --------
+  hpcg:
+    name: HPCG
+    full_name: High Performance Conjugate Gradients
+    language: cpp
+    path: benchmarks/hpcg/ComputeSPMV_ref.cpp
+    description: Sparse Matrix-Vector Multiplication
+    
+    ground_truth:
+      primary_hotspot: ComputeSYMGS_ref  # 注意：最大热点是 SYMGS，不是 SPMV
+      hotspots:
+        - name: ComputeSYMGS_ref
+          time_percentage: 67.3
+          bottleneck_type: memory
+        - name: ComputeSPMV_ref
+          time_percentage: 27.7
+          bottleneck_type: memory
+        - name: ComputeDotProduct_ref
+          time_percentage: 2.0
+          bottleneck_type: memory
+      gpu_suitable: true
+      gpu_notes: SPMV is GPU-friendly, SYMGS has sequential dependencies
+    
+    profiling_data:
+      source: vtune
+      total_time: 67.977
+      symgs_time: 45.731
+      symgs_percentage: 67.3
+      spmv_time: 18.834
+      spmv_percentage: 27.7
+      ddot_time: 1.358
+      waxpby_time: 0.865
+      cpu_utilization: 11.6
+
+  # -------- Abinit (Secondary - LLM only) --------
+  abinit:
+    name: ABINIT
+    full_name: First-principles DFT Code
+    language: fortran
+    path: benchmarks/abinit/nonlop.F90
+    description: DFT plane-wave calculations
+    
+    ground_truth:
+      primary_hotspot: nonlop
+      hotspots:
+        - name: nonlop
+          time_percentage: 40.0  # 需要实际 profiling 数据更新
+          bottleneck_type: compute
+        - name: fourwf
+          time_percentage: 30.0
+          bottleneck_type: memory
+        - name: vtowfk
+          time_percentage: 15.0
+          bottleneck_type: compute
+      gpu_suitable: true
+      gpu_notes: GPU-accelerated via GPU-enabled FFT libraries and CUDA kernels
+    
+    profiling_data:
+      source: gprof  # 或 vtune
+      # TODO: 添加实际 profiling 数据
+      note: Profiling data to be collected
+
+  # -------- CP2K (Secondary - LLM only) --------
+  cp2k:
+    name: CP2K
+    full_name: Quantum Chemistry and Solid State Physics
+    language: fortran
+    path: benchmarks/cp2k/grid_integrate.F
+    description: Gaussian and plane wave hybrid method
+    
+    ground_truth:
+      primary_hotspot: grid_integrate
+      hotspots:
+        - name: grid_integrate
+          time_percentage: 35.0  # 需要实际 profiling 数据更新
+          bottleneck_type: compute
+        - name: pw_operations
+          time_percentage: 25.0
+          bottleneck_type: memory
+        - name: dbcsr_multiply
+          time_percentage: 20.0
+          bottleneck_type: compute
+      gpu_suitable: true
+      gpu_notes: Native GPU support via DBCSR and PW libraries
+    
+    profiling_data:
+      source: gprof
+      # TODO: 添加实际 profiling 数据
+      note: Profiling data to be collected
+
+# ============== GPU 转换配置 ==============
+conversion:
+  # 只对 primary benchmarks 进行 GPU 转换
+  target_functions:
+    minimd:
+      - compute_fullneigh
+      - compute_halfneigh
+    hpcg:
+      - ComputeSPMV_ref
+  
+  cuda:
+    arch: sm_86  # RTX 3060
+    optimization_level: 3
+    fast_math: false
+
+# ============== 输出配置 ==============
+output:
+  results_dir: results
+  analysis_dir: results/analysis
+  conversion_dir: results/conversion
+  logs_dir: logs
+  
+  save_raw_response: true
+  save_evaluation: true
+  timestamp_format: "%Y%m%d_%H%M%S"
+
+# ============== 日志配置 ==============
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: logs/llm_hpc.log
+
+# ============== 实验配置 ==============
+experiment:
+  # 方案B: Primary 完整做，Secondary 只做 LLM 分析
+  mode: "hybrid"  # hybrid / full / llm_only
+  
+  primary_tasks:
+    - profiling
+    - llm_analysis
+    - gpu_conversion
+    - evaluation
+  
+  secondary_tasks:
+    - llm_analysis
+    - evaluation
+  
+  # 运行次数（用于统计）
+  runs_per_benchmark: 1  # 可以增加到3以测试一致性
