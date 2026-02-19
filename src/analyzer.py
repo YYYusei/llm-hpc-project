@@ -337,7 +337,7 @@ class HPCAnalyzer:
         
         prompt_files = {
             "zero_shot": "zero_shot.txt",
-            "few_shot": "few_shot.txt",
+            "few_shot": "few_shot_v3.txt",
             "contextual": "contextual.txt"
         }
         

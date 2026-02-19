@@ -1,0 +1,325 @@
+You are an expert in High-Performance Computing (HPC) performance analysis. I will show you examples of code analysis covering C++ and Fortran, then ask you to analyze a new piece of code.
+
+IMPORTANT: Focus on general performance analysis principles. Recognize both C/C++ and Fortran idioms.
+
+---
+
+## Example 1: Stencil Computation (C++)
+
+### Code:
+```cpp
+// 2D 5-point stencil (heat diffusion)
+void stencil_2d(double* u_new, double* u, int nx, int ny, double cx, double cy) {{
+    for (int j = 1; j < ny-1; j++) {{
+        for (int i = 1; i < nx-1; i++) {{
+            int idx = j * nx + i;
+            u_new[idx] = u[idx] + cx * (u[idx-1] - 2*u[idx] + u[idx+1])
+                                + cy * (u[idx-nx] - 2*u[idx] + u[idx+nx]);
+        }}
+    }}
+}}
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner i-loop (stencil update, lines 4-7)",
+      "estimated_time_percentage": "95%",
+      "reason": "O(nx*ny) operations with multiple floating-point operations per grid point",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "compute",
+    "reasoning": "7 FLOPs per 5 memory accesses gives ~1.4 FLOPs/byte. With good spatial locality, this is compute-limited."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "stencil loop",
+      "suggestion": "Temporal blocking (time tiling)",
+      "expected_speedup": "1.5-3x",
+      "implementation_difficulty": "hard"
+    }},
+    {{
+      "target": "i-loop",
+      "suggestion": "SIMD vectorization",
+      "expected_speedup": "4-8x",
+      "implementation_difficulty": "easy"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Regular grid access pattern, high parallelism, good memory coalescing",
+    "recommended_approach": "2D thread blocks with shared memory halo regions"
+  }}
+}}
+```
+
+---
+
+## Example 2: DFT Plane-Wave Operations (Fortran)
+
+### Code:
+```fortran
+! Apply nonlocal projectors to wavefunctions
+subroutine nonlop(cg, vnl_proj, natom, npw, nband, enl)
+  implicit none
+  integer, intent(in) :: natom, npw, nband
+  complex(dp), intent(in) :: cg(npw, nband)
+  complex(dp), intent(in) :: vnl_proj(npw, natom)
+  real(dp), intent(out) :: enl(nband)
+  
+  integer :: iband, iatom, ipw
+  complex(dp) :: proj_coef
+  
+  do iband = 1, nband
+    enl(iband) = 0.0_dp
+    do iatom = 1, natom
+      proj_coef = (0.0_dp, 0.0_dp)
+      ! Inner loop over plane waves - main hotspot
+      do ipw = 1, npw
+        proj_coef = proj_coef + conjg(vnl_proj(ipw, iatom)) * cg(ipw, iband)
+      end do
+      enl(iband) = enl(iband) + real(proj_coef * conjg(proj_coef))
+    end do
+  end do
+end subroutine
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner ipw loop (plane wave summation, lines 14-16)",
+      "estimated_time_percentage": "85%",
+      "reason": "O(nband * natom * npw) complex multiply-accumulate operations. For typical DFT calculations, npw can be 10,000+",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "compute",
+    "reasoning": "Complex multiply-add is 8 FLOPs per iteration. Memory access is streaming (good locality). Arithmetic intensity is moderate (~2-4 FLOPs/byte), making this compute-bound on modern CPUs."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "ipw loop",
+      "suggestion": "Use BLAS ZGEMV or ZGEMM for batched projection",
+      "expected_speedup": "2-5x",
+      "implementation_difficulty": "medium",
+      "details": "Reshape operations as matrix-vector or matrix-matrix multiply to leverage optimized BLAS"
+    }},
+    {{
+      "target": "iatom loop",
+      "suggestion": "Parallelize over atoms with OpenMP",
+      "expected_speedup": "Nx (N = cores)",
+      "implementation_difficulty": "easy",
+      "details": "!$omp parallel do reduction(+:enl) on atom loop"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Large npw provides massive parallelism. Projection can be cast as batched GEMM which GPUs excel at.",
+    "recommended_approach": "Use cuBLAS ZGEMM for projector application, or custom kernel with one thread per plane-wave"
+  }}
+}}
+```
+
+---
+
+## Example 3: 3D FFT Operations (Fortran)
+
+### Code:
+```fortran
+! 3D FFT for plane-wave DFT (real to complex)
+subroutine fourwf(ngfft, npw, ndat, cg, ur)
+  implicit none
+  integer, intent(in) :: ngfft(3), npw, ndat
+  complex(dp), intent(in) :: cg(npw, ndat)
+  real(dp), intent(out) :: ur(ngfft(1), ngfft(2), ngfft(3), ndat)
+  
+  integer :: idat, i1, i2, i3
+  complex(dp), allocatable :: work(:,:,:)
+  
+  allocate(work(ngfft(1), ngfft(2), ngfft(3)))
+  
+  do idat = 1, ndat
+    ! Scatter plane waves to 3D grid
+    call pw_to_grid(cg(:,idat), work, npw, ngfft)
+    
+    ! 3D FFT (main computation)
+    call fft_3d(work, ngfft, -1)  ! -1 = backward FFT
+    
+    ! Extract real part
+    do i3 = 1, ngfft(3)
+      do i2 = 1, ngfft(2)
+        do i1 = 1, ngfft(1)
+          ur(i1, i2, i3, idat) = real(work(i1, i2, i3))
+        end do
+      end do
+    end do
+  end do
+  
+  deallocate(work)
+end subroutine
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "fft_3d call (line 17)",
+      "estimated_time_percentage": "70%",
+      "reason": "3D FFT has O(N^3 log N) complexity where N = ngfft. For typical grids (64^3 to 256^3), this dominates",
+      "confidence": "high"
+    }},
+    {{
+      "location": "nested i1/i2/i3 loops (lines 20-25)",
+      "estimated_time_percentage": "15%",
+      "reason": "O(ngfft^3) memory copy operations per dataset",
+      "confidence": "medium"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "FFT is memory-bandwidth limited due to non-contiguous access patterns in transpose steps. Arithmetic intensity of FFT is O(log N) FLOPs per element, which is low."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "fft_3d",
+      "suggestion": "Use optimized FFT library (FFTW, MKL)",
+      "expected_speedup": "2-4x over naive implementation",
+      "implementation_difficulty": "easy",
+      "details": "FFTW with FFTW_MEASURE flag for auto-tuning"
+    }},
+    {{
+      "target": "idat loop",
+      "suggestion": "Batch multiple FFTs together",
+      "expected_speedup": "1.5-2x",
+      "implementation_difficulty": "medium",
+      "details": "Use FFTW guru interface or MKL batch FFT for better cache utilization"
+    }},
+    {{
+      "target": "extraction loops",
+      "suggestion": "Fuse with FFT or use in-place transform",
+      "expected_speedup": "1.2x",
+      "implementation_difficulty": "medium"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "cuFFT provides highly optimized 3D FFT. Batched FFTs further improve GPU utilization.",
+    "recommended_approach": "Use cuFFT with batched transforms, keep data on GPU between operations"
+  }}
+}}
+```
+
+---
+
+## Example 4: Sparse Matrix Operations (Fortran)
+
+### Code:
+```fortran
+! Sparse matrix-vector multiply in CSR format
+subroutine spmv_csr(nrows, rowptr, colind, values, x, y)
+  implicit none
+  integer, intent(in) :: nrows
+  integer, intent(in) :: rowptr(nrows+1), colind(*)
+  real(dp), intent(in) :: values(*), x(*)
+  real(dp), intent(out) :: y(nrows)
+  
+  integer :: i, j, jstart, jend
+  real(dp) :: sum
+  
+  do i = 1, nrows
+    sum = 0.0_dp
+    jstart = rowptr(i)
+    jend = rowptr(i+1) - 1
+    do j = jstart, jend
+      sum = sum + values(j) * x(colind(j))
+    end do
+    y(i) = sum
+  end do
+end subroutine
+```
+
+### Analysis:
+```json
+{{
+  "hotspots": [
+    {{
+      "location": "inner j loop (lines 14-16)",
+      "estimated_time_percentage": "90%",
+      "reason": "Indirect indexing x(colind(j)) causes random memory access for each non-zero element",
+      "confidence": "high"
+    }}
+  ],
+  "bottleneck_type": {{
+    "primary": "memory",
+    "reasoning": "Only 2 FLOPs (multiply-add) per memory access. Indirect indexing through colind causes cache misses. Arithmetic intensity ~0.25 FLOPs/byte, severely memory-bound."
+  }},
+  "optimization_suggestions": [
+    {{
+      "target": "i loop",
+      "suggestion": "OpenMP parallelization over rows",
+      "expected_speedup": "Nx (N = cores)",
+      "implementation_difficulty": "easy",
+      "details": "!$omp parallel do private(sum,jstart,jend,j)"
+    }},
+    {{
+      "target": "matrix storage",
+      "suggestion": "Use blocked formats (BCSR, SELL-C-sigma)",
+      "expected_speedup": "1.5-2x",
+      "implementation_difficulty": "hard",
+      "details": "Better vectorization and cache utilization with blocked storage"
+    }}
+  ],
+  "gpu_suitability": {{
+    "suitable": true,
+    "reasoning": "Many rows can be processed in parallel. Modern GPUs handle irregular access better with large parallelism.",
+    "recommended_approach": "Use cuSPARSE or implement CSR-Vector kernel with one warp per row"
+  }}
+}}
+```
+
+---
+
+## Analysis Guidelines
+
+When analyzing code, consider:
+
+1. **Language recognition**: 
+   - C/C++: `for` loops, pointers, `->` operator
+   - Fortran: `do` loops, array slicing, `intent` attributes, column-major arrays
+
+2. **Hotspot identification**: Look for nested loops, expensive operations (division, transcendentals, complex arithmetic), and high iteration counts
+
+3. **Bottleneck classification**: 
+   - Compute-bound: High FLOPs, optimized memory access, arithmetic intensity > 10
+   - Memory-bound: Indirect indexing, irregular access, arithmetic intensity < 1
+   - Mixed: 1-10 FLOPs/byte
+
+4. **DFT/Quantum chemistry patterns**:
+   - FFT operations → usually memory-bound
+   - Projector operations → usually compute-bound  
+   - Matrix diagonalization → compute-bound (BLAS/LAPACK)
+   - Exchange-correlation → compute-bound
+
+5. **GPU suitability**: Consider parallelism, memory patterns, and data transfer overhead
+
+---
+
+## Now Your Turn
+
+Analyze the following code using the same JSON format as the examples above.
+Output ONLY valid JSON, no markdown, no extra text.
+
+### Code to Analyze:
+```
+{code}
+```
+
+Provide your analysis in JSON format.
