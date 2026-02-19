@@ -1,0 +1,78 @@
+{
+  "code_name": "hpcg",
+  "prompt_type": "few_shot",
+  "timestamp": "2026-02-19T14:10:15.630256",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "forward sweep inner loop over nonzeros (first i-loop: j=0..currentNumberOfNonzeros-1)",
+      "estimated_time_percentage": "40-50%",
+      "reason": "Dominant work is sparse row traversal with indirect access xv[curCol] for each nonzero; executed for every row",
+      "confidence": "high"
+    },
+    {
+      "location": "backward sweep inner loop over nonzeros (second i-loop: j=0..currentNumberOfNonzeros-1)",
+      "estimated_time_percentage": "40-50%",
+      "reason": "Same sparse traversal cost as forward sweep; additionally suffers from limited parallelism due to Gauss-Seidel dependencies",
+      "confidence": "high"
+    },
+    {
+      "location": "ExchangeHalo(A,x) (MPI halo exchange)",
+      "estimated_time_percentage": "0-30%",
+      "reason": "Can be significant at scale depending on subdomain surface/volume ratio and network; also introduces synchronization between sweeps and other kernels",
+      "confidence": "medium"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "memory",
+    "reasoning": "Each nonzero performs ~2 FLOPs (mul+sub) but requires loading values[j], colind[j], and an indirect load xv[curCol] (often cache-miss prone). Arithmetic intensity is typically well below 1 FLOP/byte. Additionally, Gauss-Seidel has loop-carried dependencies that inhibit effective SIMD and threading, making latency/bandwidth and irregular access the limiting factors."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "sparse inner loops (both sweeps)",
+      "suggestion": "Use a storage format and ordering that improves locality (e.g., reorder unknowns with RCM/nested dissection; consider SELL-C-σ/BCSR for better vectorization)",
+      "expected_speedup": "1.2-2.0x",
+      "implementation_difficulty": "hard",
+      "details": "Reordering can increase reuse of xv and reduce cache/TLB misses; blocked formats can improve contiguous loads and enable partial SIMD on values/indices."
+    },
+    {
+      "target": "division by diagonal (xv[i] = sum/currentDiagonal)",
+      "suggestion": "Precompute and store inverse diagonal, replace division with multiplication",
+      "expected_speedup": "1.05-1.2x",
+      "implementation_difficulty": "easy",
+      "details": "Store invDiag[i] once; update becomes xv[i] = sum * invDiag[i]. Helps especially if currentNumberOfNonzeros is small."
+    },
+    {
+      "target": "pointer-chasing per row (A.matrixValues[i], A.mtxIndL[i], matrixDiagonal[i])",
+      "suggestion": "Flatten row storage into contiguous CSR-like arrays (rowptr/colind/values) and store diagonal index or diagonal separately",
+      "expected_speedup": "1.1-1.5x",
+      "implementation_difficulty": "medium",
+      "details": "Reduces indirections and improves prefetching; enables more predictable streaming through values/colind."
+    },
+    {
+      "target": "parallelism across rows",
+      "suggestion": "Use multi-color (graph coloring) or block Gauss-Seidel to expose OpenMP parallelism; alternatively switch to symmetric SOR/Jacobi-like smoother if algorithmically acceptable",
+      "expected_speedup": "2-10x (depends on colors/cores and problem structure)",
+      "implementation_difficulty": "hard",
+      "details": "Classic GS is inherently sequential within a sweep. Coloring allows parallel updates of independent sets at the cost of extra passes and potential convergence changes."
+    },
+    {
+      "target": "MPI halo exchange",
+      "suggestion": "Overlap communication with computation and reduce synchronization (nonblocking exchange; compute interior rows while halos in flight)",
+      "expected_speedup": "1.1-1.5x at scale (or more if comm-dominated)",
+      "implementation_difficulty": "medium",
+      "details": "Split rows into interior/boundary; post Irecv/Isend, compute interior, then wait and compute boundary."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": false,
+    "reasoning": "Symmetric Gauss-Seidel has strong data dependencies (forward/backward sweeps) that limit parallelism and make GPU utilization poor. The kernel is also dominated by irregular indirect memory accesses (xv[curCol]) and low arithmetic intensity. GPU implementations typically require coloring or level-scheduling, which adds overhead and can reduce convergence.",
+    "recommended_approach": "If GPU acceleration is required, use multi-color/level-scheduled GS or replace with a more GPU-friendly smoother (Jacobi, Chebyshev, or ILU variants designed for parallelism). Keep x and matrix resident on GPU and use a GPU-optimized sparse format (SELL/ELL/CSR with reordering)."
+  },
+  "elapsed_time": 20.00435733795166,
+  "total_tokens": 4771,
+  "cost": 0.02143225,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"forward sweep inner loop over nonzeros (first i-loop: j=0..currentNumberOfNonzeros-1)\",\n      \"estimated_time_percentage\": \"40-50%\",\n      \"reason\": \"Dominant work is sparse row traversal with indirect access xv[curCol] for each nonzero; executed for every row\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"backward sweep inner loop over nonzeros (second i-loop: j=0..currentNumberOfNonzeros-1)\",\n      \"estimated_time_percentage\": \"40-50%\",\n      \"reason\": \"Same sparse traversal cost as forward sweep; additionally suffers from limited parallelism due to Gauss-Seidel dependencies\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"ExchangeHalo(A,x) (MPI halo exchange)\",\n      \"estimated_time_percentage\": \"0-30%\",\n      \"reason\": \"Can be significant at scale depending on subdomain surface/volume ratio and network; also introduces synchronization between sweeps and other kernels\",\n      \"confidence\": \"medium\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"memory\",\n    \"reasoning\": \"Each nonzero performs ~2 FLOPs (mul+sub) but requires loading values[j], colind[j], and an indirect load xv[curCol] (often cache-miss prone). Arithmetic intensity is typically well below 1 FLOP/byte. Additionally, Gauss-Seidel has loop-carried dependencies that inhibit effective SIMD and threading, making latency/bandwidth and irregular access the limiting factors.\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"sparse inner loops (both sweeps)\",\n      \"suggestion\": \"Use a storage format and ordering that improves locality (e.g., reorder unknowns with RCM/nested dissection; consider SELL-C-σ/BCSR for better vectorization)\",\n      \"expected_speedup\": \"1.2-2.0x\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Reordering can increase reuse of xv and reduce cache/TLB misses; blocked formats can improve contiguous loads and enable partial SIMD on values/indices.\"\n    },\n    {\n      \"target\": \"division by diagonal (xv[i] = sum/currentDiagonal)\",\n      \"suggestion\": \"Precompute and store inverse diagonal, replace division with multiplication\",\n      \"expected_speedup\": \"1.05-1.2x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Store invDiag[i] once; update becomes xv[i] = sum * invDiag[i]. Helps especially if currentNumberOfNonzeros is small.\"\n    },\n    {\n      \"target\": \"pointer-chasing per row (A.matrixValues[i], A.mtxIndL[i], matrixDiagonal[i])\",\n      \"suggestion\": \"Flatten row storage into contiguous CSR-like arrays (rowptr/colind/values) and store diagonal index or diagonal separately\",\n      \"expected_speedup\": \"1.1-1.5x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Reduces indirections and improves prefetching; enables more predictable streaming through values/colind.\"\n    },\n    {\n      \"target\": \"parallelism across rows\",\n      \"suggestion\": \"Use multi-color (graph coloring) or block Gauss-Seidel to expose OpenMP parallelism; alternatively switch to symmetric SOR/Jacobi-like smoother if algorithmically acceptable\",\n      \"expected_speedup\": \"2-10x (depends on colors/cores and problem structure)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Classic GS is inherently sequential within a sweep. Coloring allows parallel updates of independent sets at the cost of extra passes and potential convergence changes.\"\n    },\n    {\n      \"target\": \"MPI halo exchange\",\n      \"suggestion\": \"Overlap communication with computation and reduce synchronization (nonblocking exchange; compute interior rows while halos in flight)\",\n      \"expected_speedup\": \"1.1-1.5x at scale (or more if comm-dominated)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Split rows into interior/boundary; post Irecv/Isend, compute interior, then wait and compute boundary.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": false,\n    \"reasoning\": \"Symmetric Gauss-Seidel has strong data dependencies (forward/backward sweeps) that limit parallelism and make GPU utilization poor. The kernel is also dominated by irregular indirect memory accesses (xv[curCol]) and low arithmetic intensity. GPU implementations typically require coloring or level-scheduling, which adds overhead and can reduce convergence.\",\n    \"recommended_approach\": \"If GPU acceleration is required, use multi-color/level-scheduled GS or replace with a more GPU-friendly smoother (Jacobi, Chebyshev, or ILU variants designed for parallelism). Keep x and matrix resident on GPU and use a GPU-optimized sparse format (SELL/ELL/CSR with reordering).\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

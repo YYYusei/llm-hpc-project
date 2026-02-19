@@ -1,0 +1,72 @@
+{
+  "code_name": "hpcg",
+  "prompt_type": "zero_shot",
+  "timestamp": "2026-02-19T14:08:00.717778",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "ExchangeHalo(A, x) in ComputeSPMV_ref (before main loop)",
+      "estimated_time_percentage": "10-60% (depends strongly on MPI rank count, network, and subdomain surface/volume ratio)",
+      "reason": "Per-call halo exchange can dominate at scale due to latency/bandwidth costs and synchronization; also may incur packing/unpacking overhead and MPI progress delays",
+      "confidence": "medium"
+    },
+    {
+      "location": "Outer SpMV loop: for (i=0; i<nrow; i++) with inner j loop in ComputeSPMV_ref",
+      "estimated_time_percentage": "40-90% (when communication is not dominant)",
+      "reason": "Sparse matrix-vector multiply performs low FLOPs per byte; inner loop does indirect loads xv[cur_inds[j]] causing poor cache reuse, limited vectorization, and high memory bandwidth pressure",
+      "confidence": "high"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "memory",
+    "reasoning": "The inner SpMV kernel has very low arithmetic intensity (one multiply-add per nonzero but multiple memory accesses: matrix value, column index, and indirect x load). Performance is typically limited by memory bandwidth and latency from irregular gathers, not by floating-point throughput. At large MPI scale, communication can become co-primary, but the compute portion remains memory-bound."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "Outer SpMV loop (i/j loops) in ComputeSPMV_ref",
+      "suggestion": "Improve data locality and reduce memory traffic via matrix reordering and x-vector locality (e.g., RCM/space-filling curve ordering) and NUMA-first-touch placement",
+      "expected_speedup": "1.1x-1.5x (problem- and architecture-dependent)",
+      "implementation_difficulty": "medium",
+      "details": "Reorder rows/columns to increase spatial/temporal locality of xv accesses (reduce cache/TLB misses). Ensure x.values and y.values are first-touched in the same OpenMP parallel layout used in the kernel to keep pages local on NUMA systems. Pin threads and use static scheduling to preserve locality."
+    },
+    {
+      "target": "Outer SpMV loop (i/j loops) in ComputeSPMV_ref",
+      "suggestion": "Tune OpenMP parallelization: use static scheduling, thread pinning, and avoid oversubscription; consider chunk sizes to balance load",
+      "expected_speedup": "1.05x-1.3x",
+      "implementation_difficulty": "easy",
+      "details": "Use OMP_PROC_BIND/OMP_PLACES (or runtime pinning) and prefer '#pragma omp parallel for schedule(static)' to reduce scheduling overhead and improve cache locality. If row nnz varies, test 'schedule(guided,chunk)' to reduce imbalance while keeping overhead low."
+    },
+    {
+      "target": "Outer SpMV loop (i/j loops) in ComputeSPMV_ref",
+      "suggestion": "Enable/encourage vectorization and reduce gather cost where possible (compiler flags, restrict/assume-aligned, prefetch hints)",
+      "expected_speedup": "1.0x-1.2x (often limited by gathers)",
+      "implementation_difficulty": "medium",
+      "details": "Compile with aggressive optimization and architecture flags (e.g., -O3 -march=native). Where allowed outside the reference kernel, ensure arrays are aligned and consider adding compiler-specific alignment assumptions. Software prefetch of xv[cur_inds[j+P]] may help on some CPUs, but benefits are workload-dependent."
+    },
+    {
+      "target": "ExchangeHalo(A, x) in ComputeSPMV_ref",
+      "suggestion": "Overlap communication with computation by splitting SpMV into interior and boundary rows and using nonblocking MPI",
+      "expected_speedup": "1.1x-2.0x at scale (when halo exchange is significant)",
+      "implementation_difficulty": "hard",
+      "details": "Initiate MPI_Irecv/Isend for halo data, compute rows that only depend on local x (interior) while messages are in flight, then MPI_Wait and compute boundary rows. Reduce packing overhead by using persistent communication and precomputed pack lists; aggregate messages to reduce latency."
+    },
+    {
+      "target": "ExchangeHalo(A, x) in ComputeSPMV_ref",
+      "suggestion": "Reduce communication volume and frequency (process topology, larger subdomains, message aggregation)",
+      "expected_speedup": "1.1x-1.5x (strong-scaling regimes)",
+      "implementation_difficulty": "medium",
+      "details": "Use rank mapping aligned with network topology, increase local problem size per rank to improve surface/volume ratio, and aggregate halo exchanges into fewer larger messages. If multiple kernels use the same halo, reuse exchanged data when valid."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": true,
+    "reasoning": "SpMV is a common GPU kernel but remains memory-bound; performance depends heavily on sparsity structure and achieving coalesced accesses. The indirect x gathers and per-row variable nnz reduce efficiency, yet GPUs can still outperform CPUs if the matrix format and data movement are optimized and communication is overlapped.",
+    "recommended_approach": "Use a GPU-friendly sparse format (SELL-C-σ, HYB, or CSR with row grouping) and keep x/y and matrix data resident on the device. Perform halo exchange with GPU-aware MPI (or staged copies) and overlap with interior-row SpMV using CUDA/HIP streams. Consider using vendor libraries (cuSPARSE/rocSPARSE) if the format matches, otherwise implement a custom kernel with warp-level row processing and reordering to improve memory coalescing."
+  },
+  "elapsed_time": 24.612420558929443,
+  "total_tokens": 2043,
+  "cost": 0.01864275,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"ExchangeHalo(A, x) in ComputeSPMV_ref (before main loop)\",\n      \"estimated_time_percentage\": \"10-60% (depends strongly on MPI rank count, network, and subdomain surface/volume ratio)\",\n      \"reason\": \"Per-call halo exchange can dominate at scale due to latency/bandwidth costs and synchronization; also may incur packing/unpacking overhead and MPI progress delays\",\n      \"confidence\": \"medium\"\n    },\n    {\n      \"location\": \"Outer SpMV loop: for (i=0; i<nrow; i++) with inner j loop in ComputeSPMV_ref\",\n      \"estimated_time_percentage\": \"40-90% (when communication is not dominant)\",\n      \"reason\": \"Sparse matrix-vector multiply performs low FLOPs per byte; inner loop does indirect loads xv[cur_inds[j]] causing poor cache reuse, limited vectorization, and high memory bandwidth pressure\",\n      \"confidence\": \"high\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"memory\",\n    \"reasoning\": \"The inner SpMV kernel has very low arithmetic intensity (one multiply-add per nonzero but multiple memory accesses: matrix value, column index, and indirect x load). Performance is typically limited by memory bandwidth and latency from irregular gathers, not by floating-point throughput. At large MPI scale, communication can become co-primary, but the compute portion remains memory-bound.\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"Outer SpMV loop (i/j loops) in ComputeSPMV_ref\",\n      \"suggestion\": \"Improve data locality and reduce memory traffic via matrix reordering and x-vector locality (e.g., RCM/space-filling curve ordering) and NUMA-first-touch placement\",\n      \"expected_speedup\": \"1.1x-1.5x (problem- and architecture-dependent)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Reorder rows/columns to increase spatial/temporal locality of xv accesses (reduce cache/TLB misses). Ensure x.values and y.values are first-touched in the same OpenMP parallel layout used in the kernel to keep pages local on NUMA systems. Pin threads and use static scheduling to preserve locality.\"\n    },\n    {\n      \"target\": \"Outer SpMV loop (i/j loops) in ComputeSPMV_ref\",\n      \"suggestion\": \"Tune OpenMP parallelization: use static scheduling, thread pinning, and avoid oversubscription; consider chunk sizes to balance load\",\n      \"expected_speedup\": \"1.05x-1.3x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Use OMP_PROC_BIND/OMP_PLACES (or runtime pinning) and prefer '#pragma omp parallel for schedule(static)' to reduce scheduling overhead and improve cache locality. If row nnz varies, test 'schedule(guided,chunk)' to reduce imbalance while keeping overhead low.\"\n    },\n    {\n      \"target\": \"Outer SpMV loop (i/j loops) in ComputeSPMV_ref\",\n      \"suggestion\": \"Enable/encourage vectorization and reduce gather cost where possible (compiler flags, restrict/assume-aligned, prefetch hints)\",\n      \"expected_speedup\": \"1.0x-1.2x (often limited by gathers)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Compile with aggressive optimization and architecture flags (e.g., -O3 -march=native). Where allowed outside the reference kernel, ensure arrays are aligned and consider adding compiler-specific alignment assumptions. Software prefetch of xv[cur_inds[j+P]] may help on some CPUs, but benefits are workload-dependent.\"\n    },\n    {\n      \"target\": \"ExchangeHalo(A, x) in ComputeSPMV_ref\",\n      \"suggestion\": \"Overlap communication with computation by splitting SpMV into interior and boundary rows and using nonblocking MPI\",\n      \"expected_speedup\": \"1.1x-2.0x at scale (when halo exchange is significant)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Initiate MPI_Irecv/Isend for halo data, compute rows that only depend on local x (interior) while messages are in flight, then MPI_Wait and compute boundary rows. Reduce packing overhead by using persistent communication and precomputed pack lists; aggregate messages to reduce latency.\"\n    },\n    {\n      \"target\": \"ExchangeHalo(A, x) in ComputeSPMV_ref\",\n      \"suggestion\": \"Reduce communication volume and frequency (process topology, larger subdomains, message aggregation)\",\n      \"expected_speedup\": \"1.1x-1.5x (strong-scaling regimes)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Use rank mapping aligned with network topology, increase local problem size per rank to improve surface/volume ratio, and aggregate halo exchanges into fewer larger messages. If multiple kernels use the same halo, reuse exchanged data when valid.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": true,\n    \"reasoning\": \"SpMV is a common GPU kernel but remains memory-bound; performance depends heavily on sparsity structure and achieving coalesced accesses. The indirect x gathers and per-row variable nnz reduce efficiency, yet GPUs can still outperform CPUs if the matrix format and data movement are optimized and communication is overlapped.\",\n    \"recommended_approach\": \"Use a GPU-friendly sparse format (SELL-C-σ, HYB, or CSR with row grouping) and keep x/y and matrix data resident on the device. Perform halo exchange with GPU-aware MPI (or staged copies) and overlap with interior-row SpMV using CUDA/HIP streams. Consider using vendor libraries (cuSPARSE/rocSPARSE) if the format matches, otherwise implement a custom kernel with warp-level row processing and reordering to improve memory coalescing.\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

@@ -1,0 +1,78 @@
+{
+  "code_name": "hpcg",
+  "prompt_type": "zero_shot",
+  "timestamp": "2026-02-19T14:58:33.409412",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "ComputeSPMV_ref: ExchangeHalo(A,x) (around lines 44-46)",
+      "estimated_time_percentage": "10-60% (depends strongly on MPI rank count, network, and subdomain surface/volume ratio)",
+      "reason": "Halo exchange moves off-process x entries needed for the SpMV; at scale this can dominate due to latency/bandwidth and synchronization, and it is on the critical path before the compute loop",
+      "confidence": "medium"
+    },
+    {
+      "location": "ComputeSPMV_ref: outer loop over rows i=0..nrow-1 (around lines 53-67)",
+      "estimated_time_percentage": "40-90% (when communication is not dominant)",
+      "reason": "This is the core SpMV kernel; it performs indirect gathers from x (xv[cur_inds[j]]) and streams matrix values/indices, leading to low arithmetic intensity and high memory traffic",
+      "confidence": "high"
+    },
+    {
+      "location": "ComputeSPMV_ref: inner loop over nonzeros j=0..cur_nnz-1 (around lines 61-63)",
+      "estimated_time_percentage": "35-85% (subset of the outer loop time)",
+      "reason": "Per-nonzero multiply-add with irregular memory access to x; performance limited by cache/TLB misses and memory bandwidth rather than FLOPs",
+      "confidence": "high"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "memory",
+    "reasoning": "The SpMV inner loop has very low compute per byte (one multiply-add per loading matrix value, index, and an indirect x element), and the indirect access pattern reduces cache reuse and prefetch effectiveness. On a single node this is typically memory-bandwidth/latency bound. With MPI enabled, communication can become dominant at scale, but the kernel itself remains memory-bound."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "ComputeSPMV_ref: outer/inner SpMV loops",
+      "suggestion": "Improve data locality by reordering rows/columns (graph/RCM or space-filling curve) to increase cache reuse of x and reduce TLB misses",
+      "expected_speedup": "1.1x-1.5x (problem- and architecture-dependent)",
+      "implementation_difficulty": "hard",
+      "details": "Apply a permutation to the matrix and vectors so that cur_inds[j] accesses are more localized. For structured HPCG-like stencils, ensure numbering preserves spatial locality. This reduces random gathers from xv and can improve effective bandwidth."
+    },
+    {
+      "target": "ComputeSPMV_ref: outer/inner SpMV loops",
+      "suggestion": "NUMA-aware first-touch and thread pinning; ensure x/y and matrix row pointers are allocated/initialized in parallel with the same OpenMP schedule used in SpMV",
+      "expected_speedup": "1.1x-1.4x on multi-socket systems",
+      "implementation_difficulty": "easy",
+      "details": "Initialize x.values, y.values, and per-row matrix arrays in a parallel region using the same static partitioning as the SpMV loop. Pin threads (OMP_PROC_BIND=true) and use a static schedule to keep memory local to the socket."
+    },
+    {
+      "target": "ComputeSPMV_ref: outer loop over rows",
+      "suggestion": "Use OpenMP scheduling tuned for load balance and locality (static for uniform nnz/row; guided/dynamic if nnz varies) and consider chunk sizes to reduce overhead",
+      "expected_speedup": "1.05x-1.2x",
+      "implementation_difficulty": "easy",
+      "details": "If cur_nnz is nearly constant (typical for HPCG), use schedule(static, large_chunk) to reduce scheduling overhead and improve locality. If irregular, use guided with a moderate chunk to balance without excessive overhead."
+    },
+    {
+      "target": "ComputeSPMV_ref: inner loop over nonzeros",
+      "suggestion": "Enable compiler optimizations and vectorization-friendly flags; use restrict/assume-aligned where possible and consider software prefetch for xv[cur_inds[j]]",
+      "expected_speedup": "1.05x-1.2x",
+      "implementation_difficulty": "medium",
+      "details": "Build with -O3 -march=native (or equivalent) and LTO if appropriate. If you control surrounding code, annotate pointers as non-aliasing and aligned. For some CPUs, adding prefetch of xv[cur_inds[j+P]] can help, but benefits are workload/CPU-specific and must be tuned."
+    },
+    {
+      "target": "ComputeSPMV_ref: ExchangeHalo(A,x)",
+      "suggestion": "Overlap communication with computation by splitting SpMV into local-only rows first, then wait for halo and compute boundary rows (nonblocking MPI)",
+      "expected_speedup": "1.1x-2.0x at scale (when comm is significant)",
+      "implementation_difficulty": "hard",
+      "details": "Initiate nonblocking halo exchange (MPI_Isend/Irecv) for external x entries, compute rows that depend only on local x while messages are in flight, then MPI_Waitall and compute remaining rows. Requires identifying which rows touch external columns."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": true,
+    "reasoning": "SpMV is a common GPU kernel and can benefit from high memory bandwidth, but performance is limited by irregular gathers and low arithmetic intensity. The halo exchange adds complexity; multi-GPU scaling depends on efficient GPU-aware MPI and overlap.",
+    "recommended_approach": "Port the SpMV loop to GPU using a sparse format suited to the matrix (CSR/SELL-C-sigma for better coalescing). Keep x and y resident on device; perform halo exchange with GPU-aware MPI (or stage through pinned host memory) and overlap with interior-row SpMV using CUDA/HIP streams. Consider reordering to improve locality and using fused kernels if allowed outside the reference path."
+  },
+  "elapsed_time": 27.346204042434692,
+  "total_tokens": 2110,
+  "cost": 0.01958075,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"ComputeSPMV_ref: ExchangeHalo(A,x) (around lines 44-46)\",\n      \"estimated_time_percentage\": \"10-60% (depends strongly on MPI rank count, network, and subdomain surface/volume ratio)\",\n      \"reason\": \"Halo exchange moves off-process x entries needed for the SpMV; at scale this can dominate due to latency/bandwidth and synchronization, and it is on the critical path before the compute loop\",\n      \"confidence\": \"medium\"\n    },\n    {\n      \"location\": \"ComputeSPMV_ref: outer loop over rows i=0..nrow-1 (around lines 53-67)\",\n      \"estimated_time_percentage\": \"40-90% (when communication is not dominant)\",\n      \"reason\": \"This is the core SpMV kernel; it performs indirect gathers from x (xv[cur_inds[j]]) and streams matrix values/indices, leading to low arithmetic intensity and high memory traffic\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"ComputeSPMV_ref: inner loop over nonzeros j=0..cur_nnz-1 (around lines 61-63)\",\n      \"estimated_time_percentage\": \"35-85% (subset of the outer loop time)\",\n      \"reason\": \"Per-nonzero multiply-add with irregular memory access to x; performance limited by cache/TLB misses and memory bandwidth rather than FLOPs\",\n      \"confidence\": \"high\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"memory\",\n    \"reasoning\": \"The SpMV inner loop has very low compute per byte (one multiply-add per loading matrix value, index, and an indirect x element), and the indirect access pattern reduces cache reuse and prefetch effectiveness. On a single node this is typically memory-bandwidth/latency bound. With MPI enabled, communication can become dominant at scale, but the kernel itself remains memory-bound.\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"ComputeSPMV_ref: outer/inner SpMV loops\",\n      \"suggestion\": \"Improve data locality by reordering rows/columns (graph/RCM or space-filling curve) to increase cache reuse of x and reduce TLB misses\",\n      \"expected_speedup\": \"1.1x-1.5x (problem- and architecture-dependent)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Apply a permutation to the matrix and vectors so that cur_inds[j] accesses are more localized. For structured HPCG-like stencils, ensure numbering preserves spatial locality. This reduces random gathers from xv and can improve effective bandwidth.\"\n    },\n    {\n      \"target\": \"ComputeSPMV_ref: outer/inner SpMV loops\",\n      \"suggestion\": \"NUMA-aware first-touch and thread pinning; ensure x/y and matrix row pointers are allocated/initialized in parallel with the same OpenMP schedule used in SpMV\",\n      \"expected_speedup\": \"1.1x-1.4x on multi-socket systems\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Initialize x.values, y.values, and per-row matrix arrays in a parallel region using the same static partitioning as the SpMV loop. Pin threads (OMP_PROC_BIND=true) and use a static schedule to keep memory local to the socket.\"\n    },\n    {\n      \"target\": \"ComputeSPMV_ref: outer loop over rows\",\n      \"suggestion\": \"Use OpenMP scheduling tuned for load balance and locality (static for uniform nnz/row; guided/dynamic if nnz varies) and consider chunk sizes to reduce overhead\",\n      \"expected_speedup\": \"1.05x-1.2x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"If cur_nnz is nearly constant (typical for HPCG), use schedule(static, large_chunk) to reduce scheduling overhead and improve locality. If irregular, use guided with a moderate chunk to balance without excessive overhead.\"\n    },\n    {\n      \"target\": \"ComputeSPMV_ref: inner loop over nonzeros\",\n      \"suggestion\": \"Enable compiler optimizations and vectorization-friendly flags; use restrict/assume-aligned where possible and consider software prefetch for xv[cur_inds[j]]\",\n      \"expected_speedup\": \"1.05x-1.2x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Build with -O3 -march=native (or equivalent) and LTO if appropriate. If you control surrounding code, annotate pointers as non-aliasing and aligned. For some CPUs, adding prefetch of xv[cur_inds[j+P]] can help, but benefits are workload/CPU-specific and must be tuned.\"\n    },\n    {\n      \"target\": \"ComputeSPMV_ref: ExchangeHalo(A,x)\",\n      \"suggestion\": \"Overlap communication with computation by splitting SpMV into local-only rows first, then wait for halo and compute boundary rows (nonblocking MPI)\",\n      \"expected_speedup\": \"1.1x-2.0x at scale (when comm is significant)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Initiate nonblocking halo exchange (MPI_Isend/Irecv) for external x entries, compute rows that depend only on local x while messages are in flight, then MPI_Waitall and compute remaining rows. Requires identifying which rows touch external columns.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": true,\n    \"reasoning\": \"SpMV is a common GPU kernel and can benefit from high memory bandwidth, but performance is limited by irregular gathers and low arithmetic intensity. The halo exchange adds complexity; multi-GPU scaling depends on efficient GPU-aware MPI and overlap.\",\n    \"recommended_approach\": \"Port the SpMV loop to GPU using a sparse format suited to the matrix (CSR/SELL-C-sigma for better coalescing). Keep x and y resident on device; perform halo exchange with GPU-aware MPI (or stage through pinned host memory) and overlap with interior-row SpMV using CUDA/HIP streams. Consider reordering to improve locality and using fused kernels if allowed outside the reference path.\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

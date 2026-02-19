@@ -29,8 +29,8 @@ class LLMResponse:
     def cost(self) -> float:
         """估算 API 调用成本 (USD)"""
         # GPT-4o 价格: $2.5/1M input, $10/1M output
-        input_cost = self.prompt_tokens * 2.5 / 1_000_000
-        output_cost = self.completion_tokens * 10 / 1_000_000
+        input_cost = self.prompt_tokens * 1.75 / 1_000_000
+        output_cost = self.completion_tokens * 14 / 1_000_000
         return input_cost + output_cost
 
 
@@ -40,7 +40,7 @@ class LLMClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o",
+        model: str = "gpt-5.2",
         temperature: float = 0,
         max_tokens: int = 4096,
         timeout: int = 120
@@ -103,7 +103,7 @@ class LLMClient:
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
-                max_tokens=self.max_tokens
+                max_completion_tokens=self.max_tokens
             )
         except Exception as e:
             logger.error(f"API request failed: {e}")

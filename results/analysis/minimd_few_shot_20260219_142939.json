@@ -1,0 +1,98 @@
+{
+  "code_name": "minimd",
+  "prompt_type": "few_shot",
+  "timestamp": "2026-02-19T14:30:45.569170",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "Neighbor loop in compute_halfneigh (inner k-loop over numneighs, force/energy/virial update)",
+      "estimated_time_percentage": "60-85%",
+      "reason": "Dominant O(nlocal * numneighs) pairwise Lennard-Jones evaluation with division and multiple multiplies per neighbor; includes indirect loads x[j*PAD+*] and type-dependent parameter lookups",
+      "confidence": "high"
+    },
+    {
+      "location": "Neighbor loop in compute_fullneigh (inner k-loop with SIMD reduction)",
+      "estimated_time_percentage": "60-85%",
+      "reason": "Same pairwise LJ kernel; full neighbor list avoids fj updates but doubles pair evaluations vs half-neigh, so still dominates runtime",
+      "confidence": "high"
+    },
+    {
+      "location": "Threaded half-neighbor version: atomic updates to f[j*PAD+0..2] and f[i*PAD+0..2] (inside k-loop and after loop)",
+      "estimated_time_percentage": "10-40%",
+      "reason": "High-frequency OpenMP atomics in the innermost loop cause serialization, cache-line ping-pong, and inhibit vectorization; cost grows with thread count and neighbor count",
+      "confidence": "high"
+    },
+    {
+      "location": "Force zeroing loops over nall/nlocal (f array initialization)",
+      "estimated_time_percentage": "5-15%",
+      "reason": "Streaming memory bandwidth kernel writing 3 components per atom each timestep; can become noticeable when pair kernel is optimized or for small neighbor counts",
+      "confidence": "medium"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "mixed",
+    "reasoning": "The LJ pair kernel has moderate arithmetic intensity (several dozen FLOPs including a division per neighbor) but also performs irregular/indirect memory accesses (neighbor list, x[j], type[j], parameter tables) and includes a branch on cutoff. On CPUs this often lands in the mixed regime: compute-limited when vectorized and well-cached, memory/latency-limited when neighbor access is irregular or when atomics/branching dominate. The threaded half-neigh path is frequently synchronization/latency bound due to atomics."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "compute_halfneigh_threaded inner k-loop",
+      "suggestion": "Eliminate or reduce OpenMP atomics via force buffering (thread-private force arrays) or coloring/partitioning",
+      "expected_speedup": "1.5-4x (threaded path, depending on contention)",
+      "implementation_difficulty": "hard",
+      "details": "Accumulate fj into per-thread buffers (e.g., f_thread[tid][atom][3]) then reduce at end, or use spatial/graph coloring so each thread updates disjoint j sets. This restores vectorization opportunities and reduces cache-line contention."
+    },
+    {
+      "target": "compute_fullneigh and compute_halfneigh inner k-loop",
+      "suggestion": "Improve SIMD efficiency: use structure-of-arrays (SoA) for positions/forces and align/pad for vector loads; keep USE_SIMD but ensure compiler can generate masked vector code",
+      "expected_speedup": "1.2-2.5x",
+      "implementation_difficulty": "medium",
+      "details": "Current AoS with PAD stride can still vectorize but often yields gather-like patterns for x[j]. SoA (x[], y[], z[]) improves cache and enables better prefetching. Consider explicit intrinsics or compiler directives for alignment and restrict qualifiers."
+    },
+    {
+      "target": "cutoff branch in inner loop",
+      "suggestion": "Reduce branch cost using neighbor list pruning and/or branchless masking",
+      "expected_speedup": "1.1-1.5x",
+      "implementation_difficulty": "medium",
+      "details": "Ensure neighbor lists contain only within-cutoff pairs (skin-based rebuild) so the rsq<cutforcesq test is mostly true, or use vector masks to avoid scalar branch mispredicts in SIMD loops."
+    },
+    {
+      "target": "parameter lookups (cutforcesq/epsilon/sigma6 indexed by type_ij)",
+      "suggestion": "Cache per-i type-dependent parameters or precompute per-neighbor parameter arrays",
+      "expected_speedup": "1.05-1.3x",
+      "implementation_difficulty": "medium",
+      "details": "For small ntypes, keep epsilon/sigma6/cutforcesq in cache; consider loading epsilon[type_ij], sigma6[type_ij], cutforcesq[type_ij] into locals early. If type_j varies widely, precompute neighbor-type_ij arrays during neighbor build to reduce multiplies and improve locality."
+    },
+    {
+      "target": "division sr2 = 1.0/rsq",
+      "suggestion": "Use reciprocal approximation (fast-math) where acceptable, or leverage hardware reciprocal + Newton refinement",
+      "expected_speedup": "1.05-1.3x",
+      "implementation_difficulty": "easy",
+      "details": "If physics tolerates, enable compiler flags for reciprocal approximations; otherwise consider vector reciprocal with one refinement step for SIMD."
+    },
+    {
+      "target": "force zeroing loops",
+      "suggestion": "Parallelize and vectorize initialization; consider memset-like bulk stores and first-touch NUMA placement",
+      "expected_speedup": "1.1-1.5x (for the zeroing portion)",
+      "implementation_difficulty": "easy",
+      "details": "Use OpenMP parallel for with static scheduling; ensure f is aligned and contiguous; on NUMA systems, initialize in parallel to place pages local to threads."
+    },
+    {
+      "target": "OpenMP scheduling in OMPFORSCHEDULE loops",
+      "suggestion": "Tune scheduling (static vs guided) and chunk size to reduce overhead and improve locality",
+      "expected_speedup": "1.05-1.2x",
+      "implementation_difficulty": "easy",
+      "details": "Static scheduling often works best for uniform neighbor counts; guided/dynamic can help load imbalance but increases overhead and may worsen locality."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": true,
+    "reasoning": "The LJ pairwise kernel is a classic GPU workload with massive parallelism over atoms/pairs. However, performance depends heavily on neighbor-list layout, memory coalescing for x/type, and avoiding atomic contention on force updates. Half-neighbor with Newton's 3rd law typically requires atomics on GPU; full-neighbor avoids atomics but doubles work. Many GPU MD codes use full-neighbor or specialized schemes (warp-level reductions, per-block force accumulation) to manage this tradeoff.",
+    "recommended_approach": "Use a GPU-friendly neighbor list (cell lists, sorted by cell) and either (a) full-neighbor evaluation with per-atom accumulation (no atomics) or (b) half-neighbor with atomic adds but with spatial sorting to reduce contention. Keep positions/types/parameters on device; fuse energy/virial accumulation with force kernel using block reductions, and reduce globally at the end."
+  },
+  "elapsed_time": 28.903884887695312,
+  "total_tokens": 8895,
+  "cost": 0.0345415,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"Neighbor loop in compute_halfneigh (inner k-loop over numneighs, force/energy/virial update)\",\n      \"estimated_time_percentage\": \"60-85%\",\n      \"reason\": \"Dominant O(nlocal * numneighs) pairwise Lennard-Jones evaluation with division and multiple multiplies per neighbor; includes indirect loads x[j*PAD+*] and type-dependent parameter lookups\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"Neighbor loop in compute_fullneigh (inner k-loop with SIMD reduction)\",\n      \"estimated_time_percentage\": \"60-85%\",\n      \"reason\": \"Same pairwise LJ kernel; full neighbor list avoids fj updates but doubles pair evaluations vs half-neigh, so still dominates runtime\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"Threaded half-neighbor version: atomic updates to f[j*PAD+0..2] and f[i*PAD+0..2] (inside k-loop and after loop)\",\n      \"estimated_time_percentage\": \"10-40%\",\n      \"reason\": \"High-frequency OpenMP atomics in the innermost loop cause serialization, cache-line ping-pong, and inhibit vectorization; cost grows with thread count and neighbor count\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"Force zeroing loops over nall/nlocal (f array initialization)\",\n      \"estimated_time_percentage\": \"5-15%\",\n      \"reason\": \"Streaming memory bandwidth kernel writing 3 components per atom each timestep; can become noticeable when pair kernel is optimized or for small neighbor counts\",\n      \"confidence\": \"medium\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"mixed\",\n    \"reasoning\": \"The LJ pair kernel has moderate arithmetic intensity (several dozen FLOPs including a division per neighbor) but also performs irregular/indirect memory accesses (neighbor list, x[j], type[j], parameter tables) and includes a branch on cutoff. On CPUs this often lands in the mixed regime: compute-limited when vectorized and well-cached, memory/latency-limited when neighbor access is irregular or when atomics/branching dominate. The threaded half-neigh path is frequently synchronization/latency bound due to atomics.\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"compute_halfneigh_threaded inner k-loop\",\n      \"suggestion\": \"Eliminate or reduce OpenMP atomics via force buffering (thread-private force arrays) or coloring/partitioning\",\n      \"expected_speedup\": \"1.5-4x (threaded path, depending on contention)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Accumulate fj into per-thread buffers (e.g., f_thread[tid][atom][3]) then reduce at end, or use spatial/graph coloring so each thread updates disjoint j sets. This restores vectorization opportunities and reduces cache-line contention.\"\n    },\n    {\n      \"target\": \"compute_fullneigh and compute_halfneigh inner k-loop\",\n      \"suggestion\": \"Improve SIMD efficiency: use structure-of-arrays (SoA) for positions/forces and align/pad for vector loads; keep USE_SIMD but ensure compiler can generate masked vector code\",\n      \"expected_speedup\": \"1.2-2.5x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Current AoS with PAD stride can still vectorize but often yields gather-like patterns for x[j]. SoA (x[], y[], z[]) improves cache and enables better prefetching. Consider explicit intrinsics or compiler directives for alignment and restrict qualifiers.\"\n    },\n    {\n      \"target\": \"cutoff branch in inner loop\",\n      \"suggestion\": \"Reduce branch cost using neighbor list pruning and/or branchless masking\",\n      \"expected_speedup\": \"1.1-1.5x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Ensure neighbor lists contain only within-cutoff pairs (skin-based rebuild) so the rsq<cutforcesq test is mostly true, or use vector masks to avoid scalar branch mispredicts in SIMD loops.\"\n    },\n    {\n      \"target\": \"parameter lookups (cutforcesq/epsilon/sigma6 indexed by type_ij)\",\n      \"suggestion\": \"Cache per-i type-dependent parameters or precompute per-neighbor parameter arrays\",\n      \"expected_speedup\": \"1.05-1.3x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"For small ntypes, keep epsilon/sigma6/cutforcesq in cache; consider loading epsilon[type_ij], sigma6[type_ij], cutforcesq[type_ij] into locals early. If type_j varies widely, precompute neighbor-type_ij arrays during neighbor build to reduce multiplies and improve locality.\"\n    },\n    {\n      \"target\": \"division sr2 = 1.0/rsq\",\n      \"suggestion\": \"Use reciprocal approximation (fast-math) where acceptable, or leverage hardware reciprocal + Newton refinement\",\n      \"expected_speedup\": \"1.05-1.3x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"If physics tolerates, enable compiler flags for reciprocal approximations; otherwise consider vector reciprocal with one refinement step for SIMD.\"\n    },\n    {\n      \"target\": \"force zeroing loops\",\n      \"suggestion\": \"Parallelize and vectorize initialization; consider memset-like bulk stores and first-touch NUMA placement\",\n      \"expected_speedup\": \"1.1-1.5x (for the zeroing portion)\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Use OpenMP parallel for with static scheduling; ensure f is aligned and contiguous; on NUMA systems, initialize in parallel to place pages local to threads.\"\n    },\n    {\n      \"target\": \"OpenMP scheduling in OMPFORSCHEDULE loops\",\n      \"suggestion\": \"Tune scheduling (static vs guided) and chunk size to reduce overhead and improve locality\",\n      \"expected_speedup\": \"1.05-1.2x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Static scheduling often works best for uniform neighbor counts; guided/dynamic can help load imbalance but increases overhead and may worsen locality.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": true,\n    \"reasoning\": \"The LJ pairwise kernel is a classic GPU workload with massive parallelism over atoms/pairs. However, performance depends heavily on neighbor-list layout, memory coalescing for x/type, and avoiding atomic contention on force updates. Half-neighbor with Newton's 3rd law typically requires atomics on GPU; full-neighbor avoids atomics but doubles work. Many GPU MD codes use full-neighbor or specialized schemes (warp-level reductions, per-block force accumulation) to manage this tradeoff.\",\n    \"recommended_approach\": \"Use a GPU-friendly neighbor list (cell lists, sorted by cell) and either (a) full-neighbor evaluation with per-atom accumulation (no atomics) or (b) half-neighbor with atomic adds but with spatial sorting to reduce contention. Keep positions/types/parameters on device; fuse energy/virial accumulation with force kernel using block reductions, and reduce globally at the end.\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

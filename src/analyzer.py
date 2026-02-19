@@ -314,7 +314,7 @@ class HPCAnalyzer:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-4o",
+        model: str = "gpt-5.2",
         prompts_dir: str = "prompts"
     ):
         """

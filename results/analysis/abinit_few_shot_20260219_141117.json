@@ -1,0 +1,97 @@
+{
+  "code_name": "abinit",
+  "prompt_type": "few_shot",
+  "timestamp": "2026-02-19T14:12:38.506507",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "Projection of wavefunctions onto nonlocal projectors: call opernla_ylm / opernla_ylm_mv inside atom-type/block loops",
+      "estimated_time_percentage": "35-55%",
+      "reason": "Dominant scaling with number of plane waves and projectors: O(npwin * nlmn * nincat * nspinor * ndat). This is the expensive <p|c> accumulation using Ylm form factors and structure factors (ph3d).",
+      "confidence": "high"
+    },
+    {
+      "location": "Application/back-projection to reciprocal-space output: call opernlb_ylm / opernlb_ylm_mv inside atom-type/block loops (signs==2 path)",
+      "estimated_time_percentage": "25-45%",
+      "reason": "Computes |out> += sum_i |p_i> * coeff_i (and derivatives). Similar scaling to projection but on npwout; heavy streaming over plane waves with additional phase factors.",
+      "confidence": "high"
+    },
+    {
+      "location": "Contraction of projector coefficients with Dij/Sij: call opernlc_ylm",
+      "estimated_time_percentage": "10-25%",
+      "reason": "Per-atom (or per-block) dense small-matrix operations over nlmn and spin channels: O(nincat * nspinor * nlmn^2) plus derivative bookkeeping. Can be significant for large nlmn (PAW).",
+      "confidence": "medium"
+    },
+    {
+      "location": "Phase-factor preparation: call ph1d3d for kgin/kgout when nloalg(2)<=0",
+      "estimated_time_percentage": "5-20%",
+      "reason": "Builds ph3d arrays for each atom block and plane wave: O(npw * nincat). Memory traffic heavy; can become noticeable when projector work is optimized (MV/BLAS) or when many small blocks are used.",
+      "confidence": "medium"
+    },
+    {
+      "location": "Frequent allocate/zero/free of large temporaries inside ia3..ia4 block loop (gx/gxfac/dgxdt/... arrays)",
+      "estimated_time_percentage": "3-15%",
+      "reason": "Repeated ABI_MALLOC + full-array initialization to zero for arrays sized ~O(cplex*nlmn*nincat*nspinor) and derivative variants. Overhead grows when blocks are small and called many times (many types/atoms/bands).",
+      "confidence": "medium"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "mixed",
+    "reasoning": "The core kernels (opernla/opernlb) are streaming over plane waves with moderate arithmetic (Ylm evaluation, complex phase multiplies, dot-products), often memory-bandwidth limited on CPUs unless recast as GEMM/blocked MV. The contraction (opernlc/opernld) is more compute-heavy (small dense algebra) but typically smaller overall. Overall behavior depends strongly on npw vs nlmn and on whether MV/BLAS paths are used (nloalg(1))."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "opernla_ylm/opernlb_ylm selection (nloalg(1))",
+      "suggestion": "Prefer matrix-vector/matrix-matrix formulations (mv or mv-dgemv) and batch over bands (ndat) to use BLAS-3 (DGEMM/ZGEMM) rather than repeated GEMV-like operations",
+      "expected_speedup": "1.5-4x (CPU), larger if many bands are batched",
+      "implementation_difficulty": "medium",
+      "details": "The code already has mv and mv-dgemv variants. The biggest gain usually comes from turning many independent projections into a single GEMM: P^H * C where P is (npw x nproj) and C is (npw x nbatch). Ensure leading dimensions/contiguity and choose block sizes to keep P in cache."
+    },
+    {
+      "target": "Temporary allocations and zeroing inside atom-block loop",
+      "suggestion": "Introduce workspace reuse (persistent buffers) and avoid full zero-initialization when kernels overwrite all entries",
+      "expected_speedup": "1.1-1.5x (can be higher for small systems or many calls)",
+      "implementation_difficulty": "medium",
+      "details": "Allocate gx/gxfac/dgxdt/... once per itypat (or once per call) at maximum needed sizes and reuse for each ia3..ia4 block. Replace gx(:)=0 with targeted initialization or rely on kernels to set outputs. This reduces allocator overhead and memory bandwidth spent on memset-like operations."
+    },
+    {
+      "target": "Phase-factor generation (ph1d3d) and ph3d storage",
+      "suggestion": "Cache/reuse ph3d across repeated calls and/or increase matblk/mincat to reduce recomputation frequency; consider computing phases on-the-fly inside kernels to reduce memory traffic",
+      "expected_speedup": "1.1-2x depending on call frequency and nloalg(2)",
+      "implementation_difficulty": "hard",
+      "details": "ph3d arrays are large (2*npw*matblk) and expensive to fill. If the same k-point and atom positions are reused across bands, compute once and reuse. Alternatively, fuse phase computation with projection to trade FLOPs for reduced memory footprint."
+    },
+    {
+      "target": "Parallelism over atoms/blocks and spinors",
+      "suggestion": "Thread parallelize the ia3..ia4 block loop and/or ispinor loop with OpenMP; ensure thread-private workspaces and avoid false sharing in vectout/enlout reductions",
+      "expected_speedup": "Up to ~Ncores (limited by memory bandwidth)",
+      "implementation_difficulty": "medium",
+      "details": "The block loop is naturally parallel if each thread accumulates into private partial vectout/enlout and reduces at the end (or uses atomic adds carefully). For signs==2, accumulation into vectout can cause contention; use per-thread buffers or block partitioning of G-vectors."
+    },
+    {
+      "target": "Data layout and contiguity for BLAS and SIMD",
+      "suggestion": "Ensure contiguous leading dimensions for ffnlin/ffnlout slices and projector coefficient arrays; align and pad nlmn to SIMD width; minimize strided access in (cplex, nlmn, nincat, nspinor) tensors",
+      "expected_speedup": "1.1-1.8x",
+      "implementation_difficulty": "medium",
+      "details": "Fortran is column-major; current shapes put cplex as fastest index, then nlmn. Verify that inner loops in kernels iterate over the first index for unit stride. Consider storing gx as (nlmn, cplex, ...) if kernels vectorize better over nlmn."
+    },
+    {
+      "target": "MPI reductions and communication overlap",
+      "suggestion": "Reduce frequency/volume of xmpi_sum calls and overlap reductions with computation when possible",
+      "expected_speedup": "0-20% (depends on MPI topology and problem size)",
+      "implementation_difficulty": "medium",
+      "details": "Current reductions occur at the end for spinor parallelism. If this routine is called many times, consider aggregating reductions at a higher level or using nonblocking collectives if supported."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": true,
+    "reasoning": "The dominant work is large, regular, embarrassingly parallel over plane waves, atoms (blocks), projectors, and bands. Projection/back-projection can be expressed as batched GEMM/GEMV with predictable memory access. Main challenges are managing phase factors (ph3d) and minimizing host-device transfers across repeated calls.",
+    "recommended_approach": "Keep vectin/vectout, ffnl*, and phase data resident on GPU; implement opernla/opernlb as batched GEMM (or custom kernels with one thread per (G, projector) tile). Fuse phase multiplication with projector application. Use cuBLAS for GEMM-heavy paths and custom kernels for Ylm/phase evaluation; accumulate per-block results with block-level reductions to avoid global atomics."
+  },
+  "elapsed_time": 36.25673508644104,
+  "total_tokens": 27162,
+  "cost": 0.0694365,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"Projection of wavefunctions onto nonlocal projectors: call opernla_ylm / opernla_ylm_mv inside atom-type/block loops\",\n      \"estimated_time_percentage\": \"35-55%\",\n      \"reason\": \"Dominant scaling with number of plane waves and projectors: O(npwin * nlmn * nincat * nspinor * ndat). This is the expensive <p|c> accumulation using Ylm form factors and structure factors (ph3d).\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"Application/back-projection to reciprocal-space output: call opernlb_ylm / opernlb_ylm_mv inside atom-type/block loops (signs==2 path)\",\n      \"estimated_time_percentage\": \"25-45%\",\n      \"reason\": \"Computes |out> += sum_i |p_i> * coeff_i (and derivatives). Similar scaling to projection but on npwout; heavy streaming over plane waves with additional phase factors.\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"Contraction of projector coefficients with Dij/Sij: call opernlc_ylm\",\n      \"estimated_time_percentage\": \"10-25%\",\n      \"reason\": \"Per-atom (or per-block) dense small-matrix operations over nlmn and spin channels: O(nincat * nspinor * nlmn^2) plus derivative bookkeeping. Can be significant for large nlmn (PAW).\",\n      \"confidence\": \"medium\"\n    },\n    {\n      \"location\": \"Phase-factor preparation: call ph1d3d for kgin/kgout when nloalg(2)<=0\",\n      \"estimated_time_percentage\": \"5-20%\",\n      \"reason\": \"Builds ph3d arrays for each atom block and plane wave: O(npw * nincat). Memory traffic heavy; can become noticeable when projector work is optimized (MV/BLAS) or when many small blocks are used.\",\n      \"confidence\": \"medium\"\n    },\n    {\n      \"location\": \"Frequent allocate/zero/free of large temporaries inside ia3..ia4 block loop (gx/gxfac/dgxdt/... arrays)\",\n      \"estimated_time_percentage\": \"3-15%\",\n      \"reason\": \"Repeated ABI_MALLOC + full-array initialization to zero for arrays sized ~O(cplex*nlmn*nincat*nspinor) and derivative variants. Overhead grows when blocks are small and called many times (many types/atoms/bands).\",\n      \"confidence\": \"medium\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"mixed\",\n    \"reasoning\": \"The core kernels (opernla/opernlb) are streaming over plane waves with moderate arithmetic (Ylm evaluation, complex phase multiplies, dot-products), often memory-bandwidth limited on CPUs unless recast as GEMM/blocked MV. The contraction (opernlc/opernld) is more compute-heavy (small dense algebra) but typically smaller overall. Overall behavior depends strongly on npw vs nlmn and on whether MV/BLAS paths are used (nloalg(1)).\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"opernla_ylm/opernlb_ylm selection (nloalg(1))\",\n      \"suggestion\": \"Prefer matrix-vector/matrix-matrix formulations (mv or mv-dgemv) and batch over bands (ndat) to use BLAS-3 (DGEMM/ZGEMM) rather than repeated GEMV-like operations\",\n      \"expected_speedup\": \"1.5-4x (CPU), larger if many bands are batched\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"The code already has mv and mv-dgemv variants. The biggest gain usually comes from turning many independent projections into a single GEMM: P^H * C where P is (npw x nproj) and C is (npw x nbatch). Ensure leading dimensions/contiguity and choose block sizes to keep P in cache.\"\n    },\n    {\n      \"target\": \"Temporary allocations and zeroing inside atom-block loop\",\n      \"suggestion\": \"Introduce workspace reuse (persistent buffers) and avoid full zero-initialization when kernels overwrite all entries\",\n      \"expected_speedup\": \"1.1-1.5x (can be higher for small systems or many calls)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Allocate gx/gxfac/dgxdt/... once per itypat (or once per call) at maximum needed sizes and reuse for each ia3..ia4 block. Replace gx(:)=0 with targeted initialization or rely on kernels to set outputs. This reduces allocator overhead and memory bandwidth spent on memset-like operations.\"\n    },\n    {\n      \"target\": \"Phase-factor generation (ph1d3d) and ph3d storage\",\n      \"suggestion\": \"Cache/reuse ph3d across repeated calls and/or increase matblk/mincat to reduce recomputation frequency; consider computing phases on-the-fly inside kernels to reduce memory traffic\",\n      \"expected_speedup\": \"1.1-2x depending on call frequency and nloalg(2)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"ph3d arrays are large (2*npw*matblk) and expensive to fill. If the same k-point and atom positions are reused across bands, compute once and reuse. Alternatively, fuse phase computation with projection to trade FLOPs for reduced memory footprint.\"\n    },\n    {\n      \"target\": \"Parallelism over atoms/blocks and spinors\",\n      \"suggestion\": \"Thread parallelize the ia3..ia4 block loop and/or ispinor loop with OpenMP; ensure thread-private workspaces and avoid false sharing in vectout/enlout reductions\",\n      \"expected_speedup\": \"Up to ~Ncores (limited by memory bandwidth)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"The block loop is naturally parallel if each thread accumulates into private partial vectout/enlout and reduces at the end (or uses atomic adds carefully). For signs==2, accumulation into vectout can cause contention; use per-thread buffers or block partitioning of G-vectors.\"\n    },\n    {\n      \"target\": \"Data layout and contiguity for BLAS and SIMD\",\n      \"suggestion\": \"Ensure contiguous leading dimensions for ffnlin/ffnlout slices and projector coefficient arrays; align and pad nlmn to SIMD width; minimize strided access in (cplex, nlmn, nincat, nspinor) tensors\",\n      \"expected_speedup\": \"1.1-1.8x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Fortran is column-major; current shapes put cplex as fastest index, then nlmn. Verify that inner loops in kernels iterate over the first index for unit stride. Consider storing gx as (nlmn, cplex, ...) if kernels vectorize better over nlmn.\"\n    },\n    {\n      \"target\": \"MPI reductions and communication overlap\",\n      \"suggestion\": \"Reduce frequency/volume of xmpi_sum calls and overlap reductions with computation when possible\",\n      \"expected_speedup\": \"0-20% (depends on MPI topology and problem size)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Current reductions occur at the end for spinor parallelism. If this routine is called many times, consider aggregating reductions at a higher level or using nonblocking collectives if supported.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": true,\n    \"reasoning\": \"The dominant work is large, regular, embarrassingly parallel over plane waves, atoms (blocks), projectors, and bands. Projection/back-projection can be expressed as batched GEMM/GEMV with predictable memory access. Main challenges are managing phase factors (ph3d) and minimizing host-device transfers across repeated calls.\",\n    \"recommended_approach\": \"Keep vectin/vectout, ffnl*, and phase data resident on GPU; implement opernla/opernlb as batched GEMM (or custom kernels with one thread per (G, projector) tile). Fuse phase multiplication with projector application. Use cuBLAS for GEMM-heavy paths and custom kernels for Ylm/phase evaluation; accumulate per-block results with block-level reductions to avoid global atomics.\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

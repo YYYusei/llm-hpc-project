@@ -1,0 +1,78 @@
+{
+  "code_name": "hpcg",
+  "prompt_type": "few_shot",
+  "timestamp": "2026-02-19T15:03:31.712728",
+  "model": "gpt-5.2",
+  "hotspots": [
+    {
+      "location": "forward sweep inner j-loop (SpMV-like accumulation), lines: first i-loop body, j=0..currentNumberOfNonzeros-1",
+      "estimated_time_percentage": "40-50%",
+      "reason": "Dominant work is the per-nonzero multiply-add with indirect access xv[curCol]. Total work scales with total NNZ; each iteration performs a load of values[j], colIndices[j], and a gather load of xv[curCol].",
+      "confidence": "high"
+    },
+    {
+      "location": "backward sweep inner j-loop (SpMV-like accumulation), lines: second i-loop body, j=0..currentNumberOfNonzeros-1",
+      "estimated_time_percentage": "40-50%",
+      "reason": "Same cost structure as forward sweep; additionally suffers from limited parallelism due to Gauss-Seidel dependencies, but still spends most cycles in the indirect gather and multiply-add.",
+      "confidence": "high"
+    },
+    {
+      "location": "ExchangeHalo(A,x) (MPI halo exchange) when MPI enabled",
+      "estimated_time_percentage": "0-30%",
+      "reason": "Communication and synchronization overhead can be significant at scale and for small local problem sizes; may dominate if computation per rank is low or network latency/bandwidth is limiting.",
+      "confidence": "medium"
+    }
+  ],
+  "bottleneck_type": {
+    "primary": "memory",
+    "reasoning": "Each nonzero does ~2 FLOPs (mul+sub) plus indirect gather from xv[curCol] and streaming loads of currentValues/currentColIndices. Arithmetic intensity is very low (typically <0.2-0.3 FLOPs/byte once index and cache-miss costs are included). Irregular access to xv limits cache reuse and prefetching; division per row is minor compared to memory stalls."
+  },
+  "optimization_suggestions": [
+    {
+      "target": "inner j-loops in both sweeps",
+      "suggestion": "Improve data layout / sparse format for better locality and vectorization (e.g., SELL-C-σ, BCSR, or reorder rows/columns to increase spatial locality of xv gathers)",
+      "expected_speedup": "1.2-2.0x",
+      "implementation_difficulty": "hard",
+      "details": "HPCG’s reference uses per-row arrays and indirect gathers; formats that group similar row lengths and improve contiguous access can increase effective bandwidth and enable partial SIMD."
+    },
+    {
+      "target": "inner j-loops",
+      "suggestion": "Software prefetching and restrict/const correctness to help compiler; hoist invariants and reduce pointer chasing",
+      "expected_speedup": "1.05-1.2x",
+      "implementation_difficulty": "medium",
+      "details": "Prefetch xv for upcoming curCol values (limited benefit due to irregularity). Ensure currentValues/currentColIndices are aligned/contiguous; mark pointers restrict where legal to reduce aliasing pessimism."
+    },
+    {
+      "target": "algorithmic parallelism",
+      "suggestion": "Use multicolor (graph coloring) or block Gauss-Seidel to expose parallelism; alternatively switch to a more parallel smoother (Jacobi/Chebyshev) if allowed",
+      "expected_speedup": "1.5x to Nx (depending on colors/blocks and cores)",
+      "implementation_difficulty": "hard",
+      "details": "Classic forward/backward GS is inherently sequential within a sweep. Coloring enables parallel updates of independent sets at the cost of extra passes and potential convergence changes."
+    },
+    {
+      "target": "MPI halo exchange",
+      "suggestion": "Overlap communication with computation and reduce synchronization; aggregate messages and use neighborhood collectives where appropriate",
+      "expected_speedup": "1.1-1.5x (communication-dominated regimes)",
+      "implementation_difficulty": "medium",
+      "details": "Initiate nonblocking halo exchange, compute rows that do not depend on halo first, then wait and finish boundary rows. Ensure packing is contiguous and minimize small messages."
+    },
+    {
+      "target": "division per row (xv[i] = sum/currentDiagonal)",
+      "suggestion": "Precompute and store inverse diagonal to replace division with multiplication",
+      "expected_speedup": "1.02-1.1x",
+      "implementation_difficulty": "easy",
+      "details": "Division is relatively expensive but typically not dominant; still a low-effort improvement, especially if rows are short."
+    }
+  ],
+  "gpu_suitability": {
+    "suitable": false,
+    "reasoning": "Symmetric Gauss-Seidel has strong data dependencies (forward/backward sweeps) that limit parallelism and make efficient GPU execution difficult. The inner work resembles SpMV with irregular gathers, which is bandwidth-bound and sensitive to format; without coloring/blocking, GPU occupancy and throughput will be poor.",
+    "recommended_approach": "If GPU is required, use multicolor/level-scheduling GS or switch to a GPU-friendly smoother (Jacobi/Chebyshev). Use a GPU-optimized sparse format (SELL-C-σ/ELL/blocked) and keep x/r/A resident on device; overlap halo exchange with computation using CUDA-aware MPI."
+  },
+  "elapsed_time": 22.18273138999939,
+  "total_tokens": 4827,
+  "cost": 0.02221625,
+  "raw_response": "{\n  \"hotspots\": [\n    {\n      \"location\": \"forward sweep inner j-loop (SpMV-like accumulation), lines: first i-loop body, j=0..currentNumberOfNonzeros-1\",\n      \"estimated_time_percentage\": \"40-50%\",\n      \"reason\": \"Dominant work is the per-nonzero multiply-add with indirect access xv[curCol]. Total work scales with total NNZ; each iteration performs a load of values[j], colIndices[j], and a gather load of xv[curCol].\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"backward sweep inner j-loop (SpMV-like accumulation), lines: second i-loop body, j=0..currentNumberOfNonzeros-1\",\n      \"estimated_time_percentage\": \"40-50%\",\n      \"reason\": \"Same cost structure as forward sweep; additionally suffers from limited parallelism due to Gauss-Seidel dependencies, but still spends most cycles in the indirect gather and multiply-add.\",\n      \"confidence\": \"high\"\n    },\n    {\n      \"location\": \"ExchangeHalo(A,x) (MPI halo exchange) when MPI enabled\",\n      \"estimated_time_percentage\": \"0-30%\",\n      \"reason\": \"Communication and synchronization overhead can be significant at scale and for small local problem sizes; may dominate if computation per rank is low or network latency/bandwidth is limiting.\",\n      \"confidence\": \"medium\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"memory\",\n    \"reasoning\": \"Each nonzero does ~2 FLOPs (mul+sub) plus indirect gather from xv[curCol] and streaming loads of currentValues/currentColIndices. Arithmetic intensity is very low (typically <0.2-0.3 FLOPs/byte once index and cache-miss costs are included). Irregular access to xv limits cache reuse and prefetching; division per row is minor compared to memory stalls.\"\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"inner j-loops in both sweeps\",\n      \"suggestion\": \"Improve data layout / sparse format for better locality and vectorization (e.g., SELL-C-σ, BCSR, or reorder rows/columns to increase spatial locality of xv gathers)\",\n      \"expected_speedup\": \"1.2-2.0x\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"HPCG’s reference uses per-row arrays and indirect gathers; formats that group similar row lengths and improve contiguous access can increase effective bandwidth and enable partial SIMD.\"\n    },\n    {\n      \"target\": \"inner j-loops\",\n      \"suggestion\": \"Software prefetching and restrict/const correctness to help compiler; hoist invariants and reduce pointer chasing\",\n      \"expected_speedup\": \"1.05-1.2x\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Prefetch xv for upcoming curCol values (limited benefit due to irregularity). Ensure currentValues/currentColIndices are aligned/contiguous; mark pointers restrict where legal to reduce aliasing pessimism.\"\n    },\n    {\n      \"target\": \"algorithmic parallelism\",\n      \"suggestion\": \"Use multicolor (graph coloring) or block Gauss-Seidel to expose parallelism; alternatively switch to a more parallel smoother (Jacobi/Chebyshev) if allowed\",\n      \"expected_speedup\": \"1.5x to Nx (depending on colors/blocks and cores)\",\n      \"implementation_difficulty\": \"hard\",\n      \"details\": \"Classic forward/backward GS is inherently sequential within a sweep. Coloring enables parallel updates of independent sets at the cost of extra passes and potential convergence changes.\"\n    },\n    {\n      \"target\": \"MPI halo exchange\",\n      \"suggestion\": \"Overlap communication with computation and reduce synchronization; aggregate messages and use neighborhood collectives where appropriate\",\n      \"expected_speedup\": \"1.1-1.5x (communication-dominated regimes)\",\n      \"implementation_difficulty\": \"medium\",\n      \"details\": \"Initiate nonblocking halo exchange, compute rows that do not depend on halo first, then wait and finish boundary rows. Ensure packing is contiguous and minimize small messages.\"\n    },\n    {\n      \"target\": \"division per row (xv[i] = sum/currentDiagonal)\",\n      \"suggestion\": \"Precompute and store inverse diagonal to replace division with multiplication\",\n      \"expected_speedup\": \"1.02-1.1x\",\n      \"implementation_difficulty\": \"easy\",\n      \"details\": \"Division is relatively expensive but typically not dominant; still a low-effort improvement, especially if rows are short.\"\n    }\n  ],\n  \"gpu_suitability\": {\n    \"suitable\": false,\n    \"reasoning\": \"Symmetric Gauss-Seidel has strong data dependencies (forward/backward sweeps) that limit parallelism and make efficient GPU execution difficult. The inner work resembles SpMV with irregular gathers, which is bandwidth-bound and sensitive to format; without coloring/blocking, GPU occupancy and throughput will be poor.\",\n    \"recommended_approach\": \"If GPU is required, use multicolor/level-scheduling GS or switch to a GPU-friendly smoother (Jacobi/Chebyshev). Use a GPU-optimized sparse format (SELL-C-σ/ELL/blocked) and keep x/r/A resident on device; overlap halo exchange with computation using CUDA-aware MPI.\"\n  }\n}",
+  "performance_metrics": {},
+  "evaluation": null
+}

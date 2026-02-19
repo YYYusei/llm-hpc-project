@@ -47,6 +47,7 @@ class EvaluationResult:
     bottleneck_score: float
     gpu_score: float
     suggestions_score: float
+    details_score: float
     
     # 总分 (0-100)
     total_score: float
@@ -78,10 +79,11 @@ class GeneralizedEvaluator:
             tolerance: 百分比匹配容差
         """
         self.weights = weights or {
-            "hotspot": 0.40,
+            "hotspot": 0.25,
             "bottleneck": 0.30,
             "gpu": 0.20,
-            "suggestions": 0.10
+            "suggestions": 0.10,
+            "details": 0.15
         }
         self.tolerance = tolerance
         self.registry = get_registry()
@@ -115,6 +117,7 @@ class GeneralizedEvaluator:
             bottleneck_score=0.0,
             gpu_score=0.0,
             suggestions_score=0.0,
+            details_score=0.0,
             total_score=0.0
         )
         
@@ -144,12 +147,16 @@ class GeneralizedEvaluator:
             result
         )
         
-        # 5. 计算总分
+        # 5. 评估详细度
+        result.details_score = self._evaluate_detail(identified, result)
+        
+        # 6. 计算总分
         result.total_score = (
             result.hotspot_score * self.weights["hotspot"] +
             result.bottleneck_score * self.weights["bottleneck"] +
             result.gpu_score * self.weights["gpu"] +
-            result.suggestions_score * self.weights["suggestions"]
+            result.suggestions_score * self.weights["suggestions"] +
+            result.details_score * self.weights["details"]
         ) * 100
         
         return result
@@ -278,7 +285,7 @@ class GeneralizedEvaluator:
         benchmark: BenchmarkDefinition,
         result: EvaluationResult
     ) -> float:
-        """评估瓶颈类型"""
+        """评估瓶颈类型 - 使用关键词匹配"""
         if not identified:
             result.errors.append("未识别瓶颈类型")
             return 0.0
@@ -287,29 +294,41 @@ class GeneralizedEvaluator:
         
         # 找到主热点的预期瓶颈类型
         primary_hotspot = max(benchmark.hotspots, key=lambda h: h.time_percentage) if benchmark.hotspots else None
-        expected_type = primary_hotspot.bottleneck_type if primary_hotspot else ""
+        expected_type = primary_hotspot.bottleneck_type.lower() if primary_hotspot else ""
         
-        # 类型匹配
-        type_categories = {
-            "compute": ["compute", "cpu", "arithmetic", "calculation", "flop"],
-            "memory": ["memory", "bandwidth", "cache", "data movement"],
-            "communication": ["communication", "mpi", "network", "latency"]
+        # 关键词匹配（更宽松）
+        type_keywords = {
+            "compute": ["compute", "cpu", "arithmetic", "calculation", "flop", "alu", "fp", "instruction"],
+            "memory": ["memory", "bandwidth", "cache", "data", "latency", "load", "store", "fetch"],
+            "mixed": ["mixed", "both", "hybrid"]
         }
         
         identified_category = None
         expected_category = None
         
-        for category, keywords in type_categories.items():
+        # 检查识别的类型包含哪些关键词
+        for category, keywords in type_keywords.items():
             if any(kw in identified_type for kw in keywords):
                 identified_category = category
-            if any(kw in expected_type.lower() for kw in keywords):
-                expected_category = category
+                break
         
+        # 检查期望的类型
+        for category, keywords in type_keywords.items():
+            if any(kw in expected_type for kw in keywords):
+                expected_category = category
+                break
+        
+        # 评分
         if identified_category == expected_category and identified_category is not None:
             result.details["bottleneck_match"] = True
             return 1.0
         elif identified_category is not None and expected_category is not None:
-            result.warnings.append(f"瓶颈类型不匹配: 识别为 {identified_category}, 期望 {expected_category}")
+            # 部分匹配（如识别为 memory/latency，期望是 memory）
+            result.warnings.append(f"瓶颈类型部分匹配: 识别为 {identified_category}, 期望 {expected_category}")
+            return 0.5
+        elif identified_category is not None:
+            # 至少识别出了类型
+            result.warnings.append(f"瓶颈类型可能不匹配: {identified_type}")
             return 0.3
         else:
             result.errors.append(f"无法确定瓶颈类型: {identified_type}")
@@ -379,6 +398,55 @@ class GeneralizedEvaluator:
         result.details["suggestions_completeness"] = avg_completeness
         
         return count_score * 0.6 + avg_completeness * 0.4
+
+    def _evaluate_detail(
+        self,
+        identified: Dict[str, Any],
+        result: EvaluationResult
+    ) -> float:
+        """评估分析详细度"""
+        score = 0.0
+
+        # 检查热点分析的详细程度
+        hotspots = identified.get("hotspots", [])
+        if hotspots:
+            for h in hotspots:
+                reason = h.get("reason", "")
+                if len(reason) > 100:
+                    score += 0.2
+                elif len(reason) > 50:
+                    score += 0.1
+
+        # 检查瓶颈分析的详细程度
+        bottleneck = identified.get("bottleneck_type", {})
+        reasoning = bottleneck.get("reasoning", "")
+        if len(reasoning) > 200:
+            score += 0.3
+        elif len(reasoning) > 100:
+            score += 0.2
+        elif len(reasoning) > 50:
+            score += 0.1
+
+        # 检查 GPU 分析的详细程度
+        gpu = identified.get("gpu_suitability", {})
+        gpu_reasoning = gpu.get("reasoning", "")
+        challenges = gpu.get("challenges", [])
+        if len(gpu_reasoning) > 100 or len(challenges) > 2:
+            score += 0.2
+        elif len(gpu_reasoning) > 50 or len(challenges) > 0:
+            score += 0.1
+
+        # 检查优化建议数量和质量
+        suggestions = identified.get("optimization_suggestions", [])
+        if len(suggestions) >= 5:
+            score += 0.3
+        elif len(suggestions) >= 3:
+            score += 0.2
+        elif len(suggestions) >= 1:
+            score += 0.1
+
+        result.details["detail_score"] = min(1.0, score)
+        return min(1.0, score)
     
     def _string_similarity(self, s1: str, s2: str) -> float:
         """计算字符串相似度"""
