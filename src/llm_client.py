@@ -40,7 +40,7 @@ class LLMClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model: str = "gpt-5.2",
+        model: str = "gpt-4o",
         temperature: float = 0,
         max_tokens: int = 4096,
         timeout: int = 120
