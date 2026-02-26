@@ -1,13 +1,3 @@
-"""
-VTune Profiling 数据解析与集成模块
-
-支持:
-1. 解析 VTune CSV/文本报告
-2. 提取热点函数和时间占比
-3. 生成 ground truth 数据
-4. 集成到 LLM 分析流程
-"""
-
 import os
 import re
 import csv
