@@ -7,7 +7,7 @@ __global__ void optimized_kernel_gpt_5_2(int nlocal, int ntypes,
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nlocal) return;
 
-    // Vectorized loads/stores for x and f (double4)
+    // Vectorized position/force access (double4)
     const double4* __restrict__ x4 = reinterpret_cast<const double4*>(x);
     double4* __restrict__ f4 = reinterpret_cast<double4*>(f);
 
@@ -26,109 +26,35 @@ __global__ void optimized_kernel_gpt_5_2(int nlocal, int ntypes,
     int k = 0;
 
     // Unroll by 4
-#pragma unroll 4
     for (; k + 3 < nneigh; k += 4) {
-        // ---- neighbor 0
-        {
-            const int j = ldg_int(neighbors + (base + k + 0));
-            const double4 xj4 = x4[j];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int j = ldg_int(neighbors + (base + k + u));
 
+            const double4 xj4 = x4[j];
             const double delx = xtmp - xj4.x;
             const double dely = ytmp - xj4.y;
             const double delz = ztmp - xj4.z;
 
             const double rsq = fma(delx, delx, fma(dely, dely, delz * delz));
 
-            const int type_ij = type_i * ntypes + ldg_int(type + j);
-            const double cutsq = ldg_double(cutforcesq + type_ij);
+            const int type_j = ldg_int(type + j);
+            const int type_ij = type_i * ntypes + type_j;
 
+            const double cutsq = ldg_double(cutforcesq + type_ij);
             if (rsq < cutsq) {
-                const double sr2 = 1.0 / rsq;
-                const double sr6 = (sr2 * sr2 * sr2) * ldg_double(sigma6 + type_ij);
+                const double inv_rsq = 1.0 / rsq;
+                const double inv_r4  = inv_rsq * inv_rsq;
+                const double inv_r6  = inv_r4 * inv_rsq;
+
+                const double s6  = ldg_double(sigma6 + type_ij);
+                const double sr6 = inv_r6 * s6;
+
                 const double eps = ldg_double(epsilon + type_ij);
 
-                const double force = (48.0 * eps) * (sr6 * (sr6 - 0.5)) * sr2;
-
-                fix = fma(delx, force, fix);
-                fiy = fma(dely, force, fiy);
-                fiz = fma(delz, force, fiz);
-            }
-        }
-
-        // ---- neighbor 1
-        {
-            const int j = ldg_int(neighbors + (base + k + 1));
-            const double4 xj4 = x4[j];
-
-            const double delx = xtmp - xj4.x;
-            const double dely = ytmp - xj4.y;
-            const double delz = ztmp - xj4.z;
-
-            const double rsq = fma(delx, delx, fma(dely, dely, delz * delz));
-
-            const int type_ij = type_i * ntypes + ldg_int(type + j);
-            const double cutsq = ldg_double(cutforcesq + type_ij);
-
-            if (rsq < cutsq) {
-                const double sr2 = 1.0 / rsq;
-                const double sr6 = (sr2 * sr2 * sr2) * ldg_double(sigma6 + type_ij);
-                const double eps = ldg_double(epsilon + type_ij);
-
-                const double force = (48.0 * eps) * (sr6 * (sr6 - 0.5)) * sr2;
-
-                fix = fma(delx, force, fix);
-                fiy = fma(dely, force, fiy);
-                fiz = fma(delz, force, fiz);
-            }
-        }
-
-        // ---- neighbor 2
-        {
-            const int j = ldg_int(neighbors + (base + k + 2));
-            const double4 xj4 = x4[j];
-
-            const double delx = xtmp - xj4.x;
-            const double dely = ytmp - xj4.y;
-            const double delz = ztmp - xj4.z;
-
-            const double rsq = fma(delx, delx, fma(dely, dely, delz * delz));
-
-            const int type_ij = type_i * ntypes + ldg_int(type + j);
-            const double cutsq = ldg_double(cutforcesq + type_ij);
-
-            if (rsq < cutsq) {
-                const double sr2 = 1.0 / rsq;
-                const double sr6 = (sr2 * sr2 * sr2) * ldg_double(sigma6 + type_ij);
-                const double eps = ldg_double(epsilon + type_ij);
-
-                const double force = (48.0 * eps) * (sr6 * (sr6 - 0.5)) * sr2;
-
-                fix = fma(delx, force, fix);
-                fiy = fma(dely, force, fiy);
-                fiz = fma(delz, force, fiz);
-            }
-        }
-
-        // ---- neighbor 3
-        {
-            const int j = ldg_int(neighbors + (base + k + 3));
-            const double4 xj4 = x4[j];
-
-            const double delx = xtmp - xj4.x;
-            const double dely = ytmp - xj4.y;
-            const double delz = ztmp - xj4.z;
-
-            const double rsq = fma(delx, delx, fma(dely, dely, delz * delz));
-
-            const int type_ij = type_i * ntypes + ldg_int(type + j);
-            const double cutsq = ldg_double(cutforcesq + type_ij);
-
-            if (rsq < cutsq) {
-                const double sr2 = 1.0 / rsq;
-                const double sr6 = (sr2 * sr2 * sr2) * ldg_double(sigma6 + type_ij);
-                const double eps = ldg_double(epsilon + type_ij);
-
-                const double force = (48.0 * eps) * (sr6 * (sr6 - 0.5)) * sr2;
+                // force = 48 * eps * sr6 * (sr6 - 0.5) * inv_rsq
+                const double t = sr6 - 0.5;
+                const double force = (48.0 * eps) * (sr6 * t) * inv_rsq;
 
                 fix = fma(delx, force, fix);
                 fiy = fma(dely, force, fiy);
@@ -137,26 +63,33 @@ __global__ void optimized_kernel_gpt_5_2(int nlocal, int ntypes,
         }
     }
 
-    // Remainder loop
+    // Remainder
     for (; k < nneigh; ++k) {
         const int j = ldg_int(neighbors + (base + k));
-        const double4 xj4 = x4[j];
 
+        const double4 xj4 = x4[j];
         const double delx = xtmp - xj4.x;
         const double dely = ytmp - xj4.y;
         const double delz = ztmp - xj4.z;
 
         const double rsq = fma(delx, delx, fma(dely, dely, delz * delz));
 
-        const int type_ij = type_i * ntypes + ldg_int(type + j);
-        const double cutsq = ldg_double(cutforcesq + type_ij);
+        const int type_j = ldg_int(type + j);
+        const int type_ij = type_i * ntypes + type_j;
 
+        const double cutsq = ldg_double(cutforcesq + type_ij);
         if (rsq < cutsq) {
-            const double sr2 = 1.0 / rsq;
-            const double sr6 = (sr2 * sr2 * sr2) * ldg_double(sigma6 + type_ij);
+            const double inv_rsq = 1.0 / rsq;
+            const double inv_r4  = inv_rsq * inv_rsq;
+            const double inv_r6  = inv_r4 * inv_rsq;
+
+            const double s6  = ldg_double(sigma6 + type_ij);
+            const double sr6 = inv_r6 * s6;
+
             const double eps = ldg_double(epsilon + type_ij);
 
-            const double force = (48.0 * eps) * (sr6 * (sr6 - 0.5)) * sr2;
+            const double t = sr6 - 0.5;
+            const double force = (48.0 * eps) * (sr6 * t) * inv_rsq;
 
             fix = fma(delx, force, fix);
             fiy = fma(dely, force, fiy);
@@ -164,7 +97,7 @@ __global__ void optimized_kernel_gpt_5_2(int nlocal, int ntypes,
         }
     }
 
-    // Vectorized store (preserve w component)
+    // Store (keep w component unchanged if present)
     double4 fi4 = f4[i];
     fi4.x = fix;
     fi4.y = fiy;

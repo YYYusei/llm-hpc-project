@@ -6,7 +6,6 @@ __global__ void spmv_kernel_gpt_4o(const double* __restrict__ values,
                                    const int nrow, 
                                    const int max_nnz) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
-    
     if (row < nrow) {
         double sum = 0.0;
         int row_start = row * max_nnz;
