@@ -7,14 +7,27 @@
 主要研究问题：
 1. LLM 能否准确识别 HPC 代码的性能瓶颈？
 2. 不同 prompt 策略对分析准确率的影响？
-3. LLM 能否辅助将 CPU 热点代码转换为 GPU 代码？
-4. **[新增]** 级联分析方案能否提高分析准确性？
+3. LLM 能否生成高质量的 GPU 优化代码？
+4. 级联分析方案能否提高分析准确性？
+5. **[新增]** 直接生成 vs 完整流程，哪种方法更好？
 
-## 🆕 最新进展 (2026-02-24)
+## 🆕 最新进展 (2026-02-27)
+
+### 三个 GPU Kernel 全部完成
+
+| Kernel | 类型 | 最佳方法 | 加速比 | 难度 |
+|--------|------|----------|--------|------|
+| miniMD LJ Force | 分子动力学 | 直接生成 | **14.34x** | 中等 |
+| HPCG SPMV | 稀疏矩阵 | 直接生成 | **10.30x** | 简单 |
+| HPCG SYMGS | 迭代求解 | 完整流程 | **5.61x** | 困难 |
+
+### 关键发现
+
+1. **简单并行代码**: 直接生成更好（SPMV: 10.30x vs 完整流程 6.18x）
+2. **复杂依赖代码**: 完整流程必须（SYMGS: 0.02x → 5.61x）
+3. **过度分析可能有害**: SPMV 完整流程因错误假设数据格式而失败
 
 ### 级联分析方案 (Cascaded Pipeline)
-
-利用不同 LLM 的互补优势，通过两阶段验证提高分析准确性：
 ```
 源代码 ──→ [Stage 1: GPT-4o] ──→ [Stage 2: GPT-5.2] ──→ 最终结果
             快速初筛              深度验证+优化建议
@@ -26,19 +39,19 @@
 |------|------------------|-------------------|------|
 | miniMD | compute | memory/latency + sync | ❌ 修正 |
 | HPCG SPMV | memory | memory | ✅ 确认 |
-| HPCG SYMGS | memory | memory | ✅ 确认 |
+| HPCG SYMGS | memory | memory + dependency | ✅ 确认 |
 | Abinit | compute | memory + allocation | ❌ 修正 |
 
 - **瓶颈修正率**: 50% (2/4)
-- **优化建议提升**: 2.1x (平均 2.75 → 5.75 条)
-- **修正准确性**: 100%
+- **优化建议提升**: 67% (平均 3 → 5 条)
 
-### CUDA 代码生成
+### 完整流程对比实验
 
-| 模型 | 首次成功 | 加速比 | 误差 | 花费 |
-|------|----------|--------|------|------|
-| GPT-4o | ✅ | **11.72x** | 3.98e-13 | $0.009 |
-| GPT-5.2 | ✅ | **11.58x** | 7.28e-12 | $0.027 |
+| Kernel | 直接生成 | 完整流程 | 差异 | 推荐 |
+|--------|----------|----------|------|------|
+| miniMD | 14.34x | 15.59x | +8.7% | 直接生成 (性价比) |
+| SPMV | **10.30x** | 6.18x ❌ | -40% | **直接生成** |
+| SYMGS | 0.02x ❌ | **5.61x** | +28000% | **完整流程** |
 
 ## 支持的基准程序
 
@@ -46,10 +59,8 @@
 |------|------|------|----------|----------|
 | miniMD | 分子动力学 | C++ | ForceLJ::compute | memory/sync |
 | HPCG SPMV | 稀疏矩阵向量乘 | C++ | ComputeSPMV_ref | memory |
-| HPCG SYMGS | 对称高斯-赛德尔 | C++ | ComputeSYMGS_ref | memory |
+| HPCG SYMGS | 对称高斯-赛德尔 | C++ | ComputeSYMGS_ref | memory + dependency |
 | Abinit | DFT 计算 | Fortran | nonlop_ylm | memory/allocation |
-
-其中 miniMD 和 HPCG 做完整分析 + GPU 转换，Abinit 仅做 LLM 分析对比。
 
 ## 快速开始
 
@@ -87,216 +98,146 @@ python test_abinit.py        # Abinit
 # 级联分析（所有程序）
 python test_cascaded.py
 
-# CUDA 优化代码生成
-python test_cuda_optimization_full.py
-```
+# CUDA 代码生成
+python test_cuda_optimization_full.py  # miniMD
+python test_cuda_spmv.py               # SPMV
+python test_cuda_symgs.py              # SYMGS (直接生成)
+python test_cuda_symgs_v2.py           # SYMGS (策略提示)
+python test_cuda_symgs_full_pipeline.py # SYMGS (完整流程)
 
+# 完整流程对比
+python test_full_pipeline_all.py       # miniMD + SPMV 完整流程
 ## 项目结构
 ```
 llm-hpc-project/
 ├── src/
-│   ├── analyzer.py              # LLM 性能分析
-│   ├── benchmark_config.py      # 基准程序配置（支持4个程序）
+│   ├── analyzer.py              # LLM 性能分析器
+│   ├── benchmark_config.py      # 基准程序配置
+│   ├── cascaded_pipeline.py     # 级联分析流水线
+│   ├── analysis_pipeline.py     # 端到端分析流水线
 │   ├── generalized_evaluator.py # 通用评估器
 │   ├── vtune_integration.py     # VTune 数据解析
-│   ├── analysis_pipeline.py     # 端到端流水线
-│   ├── cascaded_pipeline.py     # 🆕 级联分析流水线
 │   ├── converter.py             # GPU 转换
-│   └── llm_client.py            # OpenAI API 封装
+│   ├── llm_client.py            # OpenAI API 封装
+│   ├── main.py                  # 主程序入口
+│   └── utils.py                 # 工具函数
 │
 ├── prompts/
-│   ├── zero_shot.txt            # 无示例
-│   ├── few_shot.txt             # 带示例（原版）
-│   ├── few_shot_v2.txt          # 带示例（泛化版）
-│   └── contextual.txt           # 带 profiling 数据
+│   ├── zero_shot.txt            # 无示例 prompt
+│   ├── few_shot_v3.txt          # 带示例 (stencil + sparse matrix)
+│   └── contextual.txt           # 带 VTune 数据的 prompt
 │
-├── configs/
-│   ├── config.yaml              # 基础配置
-│   └── config_v2.yaml           # 支持4个程序的配置
-│
-├── benchmarks/                  # 待分析的代码
+├── benchmarks/                  # 待分析的 HPC 代码
 │   ├── minimd/
 │   ├── hpcg/
 │   └── abinit/
 │
-├── results/
+├── configs/                     # 配置文件
+│   └── config.yaml
+│
+├── results/                     # 测试结果
 │   ├── analysis/                # LLM 分析结果
+│   ├── cascaded/                # 级联分析结果
+│   ├── cuda_optimization/       # miniMD CUDA 结果
+│   ├── cuda_spmv/               # SPMV CUDA 结果
+│   ├── cuda_symgs/              # SYMGS V1 结果
+│   ├── cuda_symgs_v2/           # SYMGS V2 (策略提示)
+│   ├── cuda_symgs_pipeline/     # SYMGS 完整流程结果
+│   ├── full_pipeline_comparison/ # 完整流程对比结果
+│   ├── vtune/                   # VTune 工作流验证
 │   ├── evaluation/              # 评估结果
-│   ├── vtune/                   # VTune 数据
-│   ├── reports/                 # 汇总报告
-│   ├── cascaded/                # 🆕 级联分析结果
-│   └── cuda_optimization/       # 🆕 CUDA 生成结果
+│   └── reports/                 # 汇总报告
 │
-├── test_cascaded.py             # 🆕 级联分析测试
-├── test_cuda_optimization_full.py # 🆕 CUDA 完整测试
+├── docs/
+│   ├── case_studies.md          # 7 个 Case Study
+│   ├── daily_log_20260224.md    # 开发日志
+│   └── daily_log_20260226.md    # 开发日志
 │
-└── docs/
-    ├── IMPROVEMENT_NOTES.md     # 改进说明
-    └── daily_log_20260224.md    # 🆕 开发日志
+├── gpu_conversion/              # GPU 转换相关
+├── scripts/                     # 辅助脚本
+├── tests/                       # 单元测试
+├── logs/                        # 运行日志
+│
+├── test_cascaded.py             # 级联分析测试
+├── test_cuda_optimization_full.py # miniMD CUDA 测试
+├── test_cuda_spmv.py            # SPMV CUDA 测试
+├── test_cuda_symgs.py           # SYMGS V1 (直接生成)
+├── test_cuda_symgs_v2.py        # SYMGS V2 (策略提示)
+├── test_cuda_symgs_full_pipeline.py # SYMGS 完整流程
+├── test_full_pipeline_all.py    # 完整流程对比测试
+├── test_vtune_workflow.py       # VTune 工作流验证
+├── test_api.py                  # miniMD 单程序分析
+├── test_hpcg.py                 # HPCG SPMV 分析
+├── test_hpcg_symgs.py           # HPCG SYMGS 分析
+├── test_abinit.py               # Abinit 分析
+├── test_local.py                # 本地测试 (不调用 API)
+│
+├── README.md
+├── requirements.txt
+├── setup.py
+├── Dockerfile
+└── .gitignore
 ```
 
-## 使用方法
+## Case Studies
 
-### 方法1：使用集成流水线
-```python
-from analysis_pipeline import IntegratedAnalysisPipeline
+本项目包含 7 个详细的 Case Study，见 `docs/case_studies.md`：
 
-pipeline = IntegratedAnalysisPipeline()
+| # | 案例 | 类型 | 关键发现 |
+|---|------|------|----------|
+| 1 | miniMD → CUDA | ✅ 成功 | 14.34x 加速，GPT-4o 更优 |
+| 2 | SPMV → CUDA | ✅ 成功 | 10.30x 加速，GPT-5.2 更优 |
+| 3 | miniMD 级联修正 | ⚠️ 部分正确 | compute → memory/sync |
+| 4 | GPT-4o SPMV 参数错误 | ❌ 失败 | 参数顺序不匹配 |
+| 5 | Abinit 级联修正 | ⚠️ 部分正确 | compute → memory/allocation |
+| 6 | SYMGS 数据依赖 | ✅ 成功 | 完整流程 5.61x，直接生成 0.02x |
+| 7 | 完整流程对比 | 🔬 实验 | 简单代码直接生成更好 |
 
-# 使用手动输入的 VTune 数据
-results = pipeline.run_with_manual_vtune_data(
-    code_path='benchmarks/minimd/force_lj.cpp',
-    benchmark_name='minimd',
-    hotspots=[
-        {"name": "ForceLJ::compute", "time": 3.685, "percentage": 73.7},
-        {"name": "Neighbor::build", "time": 0.859, "percentage": 17.2},
-    ],
-    total_time=5.0,
-    cpu_utilization=9.5
-)
+## 最佳实践
 
-print(f"最佳 prompt: {results['summary']['best_prompt_type']}")
-print(f"最高分: {results['summary']['best_score']}")
-```
-
-### 方法2：使用 VTune 报告文件
-```python
-results = pipeline.run_with_vtune_report(
-    code_path='benchmarks/minimd/force_lj.cpp',
-    vtune_report_path='vtune_hotspots.csv',
-    benchmark_name='minimd'
-)
-```
-
-### 方法3：使用预定义配置
-```python
-results = pipeline.run_with_config(
-    code_path='benchmarks/minimd/force_lj.cpp',
-    benchmark_name='minimd'
-)
-```
-
-### 方法4：级联分析 🆕
-```python
-from src.cascaded_pipeline import CascadedAnalysisPipeline
-
-pipeline = CascadedAnalysisPipeline()
-result = pipeline.analyze(
-    code_path='benchmarks/minimd/force_lj.cpp',
-    benchmark_name='minimd'
-)
-
-print(f"Stage 1 瓶颈: {result['stage1']['bottleneck_type']}")
-print(f"Stage 2 验证: {result['stage2']['verification']}")
-print(f"优化建议: {result['stage2']['optimizations']}")
-```
-
-### 方法5：CUDA 代码生成测试 🆕
-```python
-from test_cuda_optimization_full import CUDAOptimizationTester
-
-tester = CUDAOptimizationTester()
-results = tester.run_full_test()
-
-# 自动测试 GPT-4o 和 GPT-5.2
-# 编译失败会让 GPT-5.2 修复
-# 输出 CPU vs GPU 加速比
-```
-
-### 快捷函数
-```python
-from analysis_pipeline import run_minimd_analysis, run_hpcg_analysis
-
-results = run_minimd_analysis()
-results = run_hpcg_analysis()
-```
-
-## 实验结果
-
-### miniMD 单模型分析 (2026-02-17)
-
-| Prompt | 分数 | 热点数 | 花费 |
-|--------|------|--------|------|
-| zero_shot | 91.71 | 4 | $0.018 |
-| few_shot | **96.17** | 4 | $0.022 |
-| contextual | 93.09 | 1 | $0.019 |
-
-### HPCG 单模型分析 (2026-02-17)
-
-| Prompt | 分数 | 热点数 | 花费 |
-|--------|------|--------|------|
-| zero_shot | **85.20** | 2 | $0.006 |
-| few_shot | 82.40 | 1 | $0.009 |
-| contextual | 82.20 | 1 | $0.009 |
-
-### 多模型对比 (2026-02-24) 🆕
-
-| 指标 | GPT-4o | GPT-5.2 |
-|------|--------|---------|
-| 瓶颈判断准确率 | **100%** (4/4) | 50% (2/4) |
-| 优化建议数量 | 2-3 条 | **5-7 条** |
-| 分析详细度 | 中等 | **高** |
-| 响应时间 | **~10s** | ~35s |
-| 成本 | **$0.02** | $0.04 |
-
-### 级联方案效果 🆕
-
-| 指标 | 单模型 | 级联方案 |
-|------|--------|----------|
-| 瓶颈准确率 | 50-100% | **100%** |
-| 优化建议 | 2-3 条 | **5-7 条** |
-| 验证机制 | ❌ | ✅ |
-| 成本 | $0.02-0.04 | $0.08 |
-
-### CUDA 生成性能 🆕
-
-测试环境: RTX 3060, CUDA 12.6, 100K 原子
-
-| 模型 | CPU (ms) | GPU (ms) | 加速比 | 正确性 |
-|------|----------|----------|--------|--------|
-| GPT-4o | 17.00 | 1.45 | **11.72x** | ✅ (err: 3.98e-13) |
-| GPT-5.2 | 16.85 | 1.45 | **11.58x** | ✅ (err: 7.28e-12) |
-
-## 关键发现 🆕
-
-1. **级联方案有效**: GPT-5.2 修正了 50% 的 GPT-4o 瓶颈判断错误
-2. **模型互补**: GPT-4o 快速准确，GPT-5.2 深入详细
-3. **CUDA 生成可行**: 两个模型都能生成 ~11.7x 加速的正确代码
-4. **GPT-5.2 知识盲区**: 错误使用 `__ldg()` 于 `double4` 类型
-
-## VTune 使用
-```bash
-# 运行热点分析
-vtune -collect hotspots -result-dir vtune_result -- ./minimd < in.lj
-
-# 导出 CSV
-vtune -report hotspots -result-dir vtune_result -format csv -report-output hotspots.csv
-```
-
-支持的 VTune 报告格式：CSV、TXT、JSON
-
-## 配置说明
-
-`configs/config_v2.yaml` 包含4个基准程序的配置：
-```yaml
-# 完整分析 + GPU 转换
-primary_benchmarks:
-  - minimd
-  - hpcg
-
-# 仅 LLM 分析
-secondary_benchmarks:
-  - abinit
-  - cp2k
-```
+| 场景 | 推荐方法 | 原因 |
+|------|----------|------|
+| 简单并行，无依赖 | **直接生成** | 更快、更便宜、更可靠 |
+| 复杂依赖（如 GS） | **完整流程** | 需要分析才能找到正确策略 |
+| 数据格式复杂 | **明确指定格式** | 避免 LLM 错误假设 |
+| 首次失败 | **修复机制** | GPT-5.2 修复成功率高 |
 
 ## 成本估算
 
-| 任务 | GPT-4o | GPT-5.2 | 级联 |
-|------|--------|---------|------|
-| 单程序分析 | $0.02 | $0.04 | $0.08 |
-| 4 程序完整测试 | $0.08 | $0.15 | $0.31 |
-| CUDA 生成 | $0.01 | $0.03 | - |
+| 任务 | 花费 |
+|------|------|
+| 单程序级联分析 | $0.07 |
+| 简单 CUDA 直接生成 | $0.01-0.02 |
+| 复杂 CUDA 完整流程 | $0.04-0.09 |
+| 代码修复 | $0.01 |
+| **项目总计** | **~$0.70** |
+
+## 实验结果汇总
+
+### CUDA 生成性能
+
+| Kernel | 模型 | 方法 | 加速比 | 误差 |
+|--------|------|------|--------|------|
+| miniMD | GPT-4o | 直接 | **14.34x** | 3.98e-13 |
+| miniMD | GPT-5.2 | 完整 | 15.59x | 1.16e-10 |
+| SPMV | GPT-5.2 | 直接 | **10.30x** | 7.11e-15 |
+| SYMGS | GPT-5.2 | 完整 | **5.61x** | 3.42e-02 |
+
+### 级联分析效果
+
+| 指标 | 结果 |
+|------|------|
+| 瓶颈修正率 | 50% (2/4) |
+| 优化建议提升 | 67% |
+| 修正准确性 | 100% |
+
+## 论文贡献
+
+1. **提出级联分析方案**: 两阶段 LLM 分析，修正率 50%
+2. **验证 LLM CUDA 生成能力**: 三个 kernel 达到 5-15x 加速
+3. **发现方法适用边界**: 简单并行 → 直接生成，复杂依赖 → 完整流程
+4. **识别 LLM 局限性**: 不能自动发明并行化策略，可能错误假设数据格式
+5. **提供最佳实践指南**: 根据代码特性选择合适方法
 
 ## 许可证
 
