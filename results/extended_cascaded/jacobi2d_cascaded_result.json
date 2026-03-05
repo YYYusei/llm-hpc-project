@@ -1,0 +1,127 @@
+{
+  "program": "jacobi2d",
+  "source": "benchmarks/jacobi2d/jacobi2d.c",
+  "timestamp": "2026-03-05T17:18:45.187342",
+  "stage1": {
+    "model": "gpt-4o",
+    "bottleneck_type": "memory",
+    "hotspot_count": 2,
+    "gpu_suitable": true,
+    "eval_score": 81.5,
+    "cost": 0.009835
+  },
+  "stage2": {
+    "model": "gpt-5.2",
+    "bottleneck_corrected": false,
+    "corrected_type": "N/A",
+    "validation_reasoning": "判断为 memory-bound 基本正确：5-point stencil 每点约 5 次读 + 1 次写，计算量很低，且 N=4096 时工作集约 2*4096^2*8≈256MB，远超 LLC，时间主要由内存带宽决定。需要补充的是：在现代 CPU 上，实际从 DRAM 的字节数可能低于“5 loads”直算（行缓存/硬件预取会复用 north/south/center 行数据），但整体仍是带宽受限；另外每个 time step 做两次 sweep（A->B, B->A）使得带宽压力翻倍，热点 45%+45% 也符合这一点。",
+    "num_optimizations": 6,
+    "cost": 0.045547250000000004
+  },
+  "total_cost": 0.05538225000000001,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel() forward sweep loop at line 54",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop performs the main computation of the Jacobi method, iterating over the grid and performing memory-intensive operations.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel() backward sweep loop at line 66",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop mirrors the forward sweep, performing similar memory-intensive operations on the grid.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code is memory-bound due to the high memory traffic relative to the number of floating-point operations. The arithmetic intensity is low (0.10 FLOPs/byte), indicating that the performance is limited by memory bandwidth rather than computational power."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi method is highly suitable for GPU execution due to its regular memory access patterns and lack of data dependencies within each iteration, allowing for efficient parallelization.",
+        "recommended_approach": "Port the jacobi_kernel function to GPU using CUDA or OpenCL, leveraging the GPU's high memory bandwidth and parallel processing capabilities to accelerate the computation."
+      },
+      "cost": 0.009835
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "判断为 memory-bound 基本正确：5-point stencil 每点约 5 次读 + 1 次写，计算量很低，且 N=4096 时工作集约 2*4096^2*8≈256MB，远超 LLC，时间主要由内存带宽决定。需要补充的是：在现代 CPU 上，实际从 DRAM 的字节数可能低于“5 loads”直算（行缓存/硬件预取会复用 north/south/center 行数据），但整体仍是带宽受限；另外每个 time step 做两次 sweep（A->B, B->A）使得带宽压力翻倍，热点 45%+45% 也符合这一点。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "forward sweep (A->B) 与 backward sweep (B->A) 的内存带宽占用",
+          "technique": "时间步融合（time-step fusion / temporal blocking, 2 steps at a time）以提升时间复用，减少写回/读回次数",
+          "code_changes": "将 t 循环按 2 个 time step 融合：在一个外层块内先算 B=f(A)，再立刻算 A=f(B)，并对 i/j 做小块(tile)以让 B 的 tile 尽量留在缓存中再被第二次 sweep 读取。示意：\n- 外层：for (t=0; t<tsteps; t+=2)\n- 对 i/j 做分块：for (ii=1; ii<n-1; ii+=Ti) for (jj=1; jj<n-1; jj+=Tj)\n- 在 tile 内先写 B(tile)，紧接着读 B(tile) 写 A(tile)\n注意：第二步计算 A 需要 B 的 north/south 行，因此 tile 需要 halo（至少上下各 1 行、左右各 1 列），实现时可扩大 tile 计算范围或在 tile 边界做额外处理。",
+          "expected_speedup": "1.2x-1.8x（取决于 LLC 容量、tile 选择、NUMA/带宽；若 B tile 能显著命中缓存，收益更高）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "forward/backward sweep 的单核效率与向量化",
+          "technique": "显式向量化/编译器友好化：restrict + 对齐 + 指针行缓存 + FMA + 常量提取",
+          "code_changes": "1) 函数签名与指针：\n- void jacobi_kernel(int tsteps,int n, double* __restrict A, double* __restrict B)\n2) 分离行指针减少乘法与地址计算：\n- for i: double* __restrict Bi=B+i*n; const double* __restrict Ai=A+i*n; const double* __restrict Aim=A+(i-1)*n; const double* __restrict Aip=A+(i+1)*n;\n- 内层 j：Bi[j]=0.2*(Ai[j]+Ai[j-1]+Ai[j+1]+Aip[j]+Aim[j]);\n3) 常量：const double c=0.2;\n4) 对齐分配：使用 aligned_alloc/posix_memalign(64)；并可加编译指示：#pragma omp simd 或 #pragma clang loop vectorize(enable)\n5) 编译选项：-O3 -march=native -ffast-math（若允许）\n这些改动让编译器更稳定地产生 AVX2/AVX-512 向量代码并减少地址生成开销。",
+          "expected_speedup": "1.1x-1.4x（通常受限于带宽，更多是接近带宽上限与降低前端/AGU开销）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "forward/backward sweep 的多核扩展与带宽利用",
+          "technique": "OpenMP 并行 + 合理调度 + NUMA first-touch",
+          "code_changes": "1) 初始化与主循环并行：\n- init_array 使用 #pragma omp parallel for collapse(2) 以 first-touch 绑定 NUMA\n2) kernel：\n- #pragma omp parallel for schedule(static) 置于 i 循环（不要 collapse(2) 以保持连续行、利于预取）\n3) 线程绑定：运行时 OMP_PROC_BIND=close, OMP_PLACES=cores；双路 NUMA 用 numactl --interleave=all 或 first-touch\n示意：\n#pragma omp parallel for schedule(static)\nfor (i=1;i<n-1;i++) { ... }\n",
+          "expected_speedup": "按内存带宽扩展：典型 4-8 核可达 3x-6x；到 16-64 核后趋于饱和（受平台峰值带宽限制）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "减少不必要的内存流量（写分配/写回）",
+          "technique": "Non-temporal store（流式写）用于写 B/A，避免写分配污染缓存（在不做时间阻塞时尤其有效）",
+          "code_changes": "在不做 tile/融合、且写入数组短期不会被复用的情况下，可对写目标使用流式写：\n- 使用编译器内建：_mm_stream_pd / _mm512_stream_pd（需手写 intrinsics 并保证对齐与整倍数）\n- 或依赖编译器：#pragma vector nontemporal(Bi)\n注意：这里每个 time step 写出的 B 会在下一 sweep 立刻被读，因此“是否适合 nontemporal”取决于缓存是否能容纳 B 的工作集；对 N=4096（单数组 128MB）通常放不下 LLC，nontemporal 往往仍有收益（减少 RFO），但可能降低下一 sweep 的命中率，需要实测对比。",
+          "expected_speedup": "1.05x-1.25x（平台相关，带宽越紧张收益越明显）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "forward/backward sweep 的缓存命中与 TLB 压力",
+          "technique": "二维分块（spatial blocking）+ 大页（HugePages）",
+          "code_changes": "1) i/j 分块：Ti 取 32~128 行，Tj 取 256~1024（按 LLC/预取器调参），保持内层 j 连续。\n2) 使用 Transparent Huge Pages 或显式 hugepage（madvise(MADV_HUGEPAGE) / hugetlbfs）降低 TLB miss。\n分块示意：\nfor (ii=1; ii<n-1; ii+=Ti)\n  for (jj=1; jj<n-1; jj+=Tj)\n    for (i=ii; i<min(ii+Ti,n-1); ++i)\n      for (j=jj; j<min(jj+Tj,n-1); ++j) ...\n",
+          "expected_speedup": "1.05x-1.3x（若原本已被硬件预取很好覆盖则收益较小；TLB/NUMA 问题明显时收益更大）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "整体迭代结构（两次 sweep 的重复代码与额外开销）",
+          "technique": "指针交换（ping-pong swap）替代第二个 sweep（算法层面改变：每步只做一次 stencil）",
+          "code_changes": "将每个 time step 只计算一次：B=f(A)，然后 swap(A,B)。最终若需要结果在 A，可在结束时判断奇偶步数再拷贝/交换指针。\n伪码：\nfor t in [0..tsteps): compute B from A; swap(A,B);\n注意：这会把“每步两次更新”改为“每步一次更新”，与当前代码的数学迭代次数不等价（当前每个 t 做了两次 Jacobi 更新）。若要保持等价，需要把 tsteps 翻倍或重新定义迭代次数。",
+          "expected_speedup": "若允许改变迭代定义：接近 2.0x（直接少做一半工作）；若需保持等价则无净收益",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "二维网格并行：每个线程负责一个 (i,j) 内点更新。每个 time step 启动一个 kernel 计算 dst=f(src)，然后交换指针。为减少全局内存访问，使用 shared memory 做 2D tile（含 halo）缓存 src 的局部块：blockDim=(Bx,By)，shared 大小 (Bx+2)*(By+2)。线程协作加载 tile+halo，同步后计算并写回 dst。可选：一次 kernel 内做 2-step time fusion（需要额外 shared/寄存器与更复杂 halo 处理），或使用 CUDA Graphs 降低 500 次迭代的 launch 开销。",
+        "data_layout": "保持行主序 1D 展平（A[i*n+j]）。确保 n 为对齐友好的倍数（4096 已很好）。建议使用 pitch/对齐分配（cudaMallocPitch 可选）以改善对齐与合并访问；但对连续行主序访问，普通 cudaMalloc 通常已足够。若做 shared tile，按 [y][x] 存放并避免 bank conflict（必要时对 shared 行做 padding）。",
+        "challenges": [
+          "迭代次数多（500）导致 kernel launch 开销与同步开销：可用 CUDA Graphs 或在一个 kernel 内做多步（time fusion）但会增加寄存器/共享内存压力与 halo 复杂度。",
+          "内存带宽瓶颈依旧存在：需要通过 shared memory tile、合并访问、尽量减少全局读写（time fusion/半精度不适用时）来接近峰值带宽。",
+          "双精度吞吐与带宽比：该算子主要受带宽限制，但仍需确保使用 LDG/只读缓存路径（或依赖 L2）与足够 occupancy 来隐藏延迟。",
+          "边界处理与 halo：block 边界需要加载 halo，需小心越界与分支；可通过扩大网格并在 kernel 内 if(i>0&&i<n-1...) 处理，或单独处理边界。"
+        ],
+        "expected_speedup": "相对单核 CPU：通常 10x-50x（取决于 CPU 带宽/核数与 GPU 带宽）。相对已带宽饱和的多核 CPU（如双路服务器）：常见 2x-6x。若实现 shared tile +（可选）2-step 融合并接近 GPU HBM 峰值带宽，上限主要由带宽比决定。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.10 FLOPs/byte（按每点 5 FLOPs，5 读+1写=48B 估算）。更现实的 DRAM 视角：由于行复用与预取，north/south/center 行在 i 扫描时可部分驻留缓存，单点从 DRAM 的有效字节可能低于 48B，但仍远低于使其 compute-bound 所需的强度，因此总体仍是带宽受限。",
+        "cache_behavior": "访问模式为行主序、内层 j 连续，硬件预取友好。对固定 i：Ai[j-1],Ai[j],Ai[j+1] 在同一/相邻 cache line；Aim/Aip 为相邻两行，随 j 线性推进。主要问题是工作集过大（单数组 128MB），跨 i 扫描时无法在 LLC 中保留足够多的 B 供下一 sweep 复用，导致 A->B 后 B->A 基本再次从内存读取。若做时间步融合/分块，可让 B 的 tile 在 LLC 中被第二次 sweep 复用，显著降低 DRAM 流量。另一个潜在问题是写分配（RFO）导致写入前先读入 cache line，增加带宽；可用 non-temporal store 或确保写入行很快被读（融合）来缓解。",
+        "data_dependencies": [
+          "单个 sweep 内：各网格点更新彼此独立（读旧数组 A/B，写新数组 B/A），无 loop-carried RAW 依赖，适合 SIMD/多线程/GPU。",
+          "跨 sweep/跨 time step：存在 true dependency：B(t)=f(A(t))，A(t+1)=f(B(t))（当前实现每个 t 做两次更新）。边界点不更新（i/j=0,n-1），作为固定边界条件。"
+        ]
+      },
+      "cost": 0.045547250000000004
+    },
+    "total_cost": 0.05538225000000001
+  }
+}

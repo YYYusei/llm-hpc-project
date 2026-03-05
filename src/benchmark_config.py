@@ -82,7 +82,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
                     r"forcelj", r"force_lj", r"compute",
                     r"compute_original", r"compute_halfneigh", r"compute_fullneigh"
                 ],
-                time_percentage=73.7,
+                time_percentage=75.0,  # VTune: 3.487s / 4.650s
                 bottleneck_type="compute",
                 loop_keywords=["k-loop", "inner loop", "neighbor loop", "for.*numneigh"],
                 memory_patterns=["neighbor list", "indirect indexing"]
@@ -90,7 +90,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
             HotspotDefinition(
                 name="Neighbor::build",
                 location_patterns=[r"neighbor", r"neigh", r"build"],
-                time_percentage=17.2,
+                time_percentage=17.9,  # VTune: 0.834s / 4.650s
                 bottleneck_type="memory",
                 loop_keywords=["bin loop", "atom loop"],
                 memory_patterns=["binning", "cell list"]
@@ -117,7 +117,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
             HotspotDefinition(
                 name="ComputeSYMGS_ref",
                 location_patterns=[r"symgs", r"computesymgs", r"gauss.*seidel"],
-                time_percentage=67.3,
+                time_percentage=67.7,  # VTune: 47.480s / 70.138s
                 bottleneck_type="memory",
                 loop_keywords=["forward sweep", "backward sweep", "row loop"],
                 memory_patterns=["sparse matrix", "indirect indexing", "sequential dependency"]
@@ -125,7 +125,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
             HotspotDefinition(
                 name="ComputeSPMV_ref",
                 location_patterns=[r"spmv", r"computespmv", r"sparse.*matrix.*vector"],
-                time_percentage=27.7,
+                time_percentage=27.2,  # VTune: 19.071s / 70.138s
                 bottleneck_type="memory",
                 loop_keywords=["j-loop", "inner loop", "column loop"],
                 memory_patterns=["CSR format", "indirect indexing", "irregular access"]
@@ -133,7 +133,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
             HotspotDefinition(
                 name="ComputeDotProduct_ref",
                 location_patterns=[r"dot", r"ddot", r"dotproduct"],
-                time_percentage=2.0,
+                time_percentage=2.0,  # VTune: 1.392s / 70.138s
                 bottleneck_type="memory",
                 loop_keywords=["reduction loop"],
                 memory_patterns=["streaming access", "reduction"]
@@ -150,45 +150,83 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
     ),
     
     # -------- Abinit --------
+    # Updated 2026-03-05 based on actual VTune profiling (si_big.abi, ecut=40, 8x8x8 kgrid)
+    # Previous config was based on literature estimates and was incorrect:
+    #   - nonlop was assumed to be 40% but does not appear in top hotspots
+    #   - Actual hotspots are FFT functions (sg_ffty, sg_fftpx, fftrisc)
     "abinit": BenchmarkDefinition(
         name="abinit",
         full_name="ABINIT - First-principles DFT Code",
         language="fortran",
         domain="dft",
-        hotspot_files=["nonlop.F90", "fourwf.F90", "vtowfk.F90"],
+        hotspot_files=["m_fft.F90", "sg_fft.F90", "m_mkffkg.F90", "m_nonlop_ylm.F90"],
         hotspots=[
             HotspotDefinition(
-                name="nonlop",
-                location_patterns=[r"nonlop", r"non.*local", r"projector"],
-                time_percentage=40.0,  # 典型值，需要根据实际profiling调整
+                name="sg_ffty",
+                location_patterns=[
+                    r"sg_ffty", r"sg_fft", r"fft.*y",
+                    r"fourier.*transform"
+                ],
+                time_percentage=40.7,  # VTune: 3.991s / 9.799s
                 bottleneck_type="compute",
-                loop_keywords=["projector loop", "atom loop", "band loop"],
-                memory_patterns=["projector coefficients", "wave function"]
+                loop_keywords=["fft loop", "butterfly", "radix", "y-direction"],
+                memory_patterns=["stride access", "complex multiply", "twiddle factors"]
             ),
             HotspotDefinition(
-                name="fourwf",
-                location_patterns=[r"fourwf", r"fft", r"fourier"],
-                time_percentage=30.0,
-                bottleneck_type="memory",
-                loop_keywords=["fft loop", "plane wave loop"],
-                memory_patterns=["3D FFT", "real-to-complex", "transposition"]
+                name="sg_fftpx",
+                location_patterns=[
+                    r"sg_fftpx", r"fftpx", r"fft.*px",
+                    r"fft.*x"
+                ],
+                time_percentage=15.8,  # VTune: 1.550s / 9.799s
+                bottleneck_type="compute",
+                loop_keywords=["fft loop", "x-direction", "plane"],
+                memory_patterns=["stride access", "complex multiply"]
             ),
             HotspotDefinition(
-                name="vtowfk",
-                location_patterns=[r"vtowfk", r"hamiltonian", r"diagonalization"],
-                time_percentage=15.0,
+                name="fftrisc_one_nothreadsafe",
+                location_patterns=[
+                    r"fftrisc", r"fft.*risc", r"fft.*dispatch",
+                    r"fft.*one"
+                ],
+                time_percentage=11.2,  # VTune: 1.101s / 9.799s
                 bottleneck_type="compute",
-                loop_keywords=["eigenvalue loop", "band loop"],
-                memory_patterns=["dense matrix", "BLAS calls"]
+                loop_keywords=["fft dispatch", "fft scheduler"],
+                memory_patterns=["work array", "buffer management"]
+            ),
+            HotspotDefinition(
+                name="dfpt_mkffkg",
+                location_patterns=[
+                    r"mkffkg", r"dfpt_mkffkg", r"ffkg",
+                    r"kernel.*generation"
+                ],
+                time_percentage=6.4,  # VTune: 0.632s / 9.799s
+                bottleneck_type="compute",
+                loop_keywords=["kernel loop", "plane wave loop", "g-vector"],
+                memory_patterns=["reciprocal space", "form factors"]
+            ),
+            HotspotDefinition(
+                name="zgemm",
+                location_patterns=[r"zgemm", r"blas.*gemm", r"matrix.*multiply"],
+                time_percentage=3.9,  # VTune: 0.385s / 9.799s (from libblas)
+                bottleneck_type="compute",
+                loop_keywords=["matrix multiply", "gemm"],
+                memory_patterns=["dense matrix", "BLAS level 3"]
             )
         ],
         gpu_suitable=True,
-        gpu_notes="FFT and nonlocal projector operations benefit from GPU; requires GPU-accelerated FFT library",
-        function_keywords=["nonlop", "fourwf", "vtowfk", "getghc", "lobpcg"],
-        structure_keywords=["plane wave", "projector", "pseudopotential", "kpoint", "band"],
+        gpu_notes="FFT operations dominate (~68% of runtime). GPU acceleration via cuFFT "
+                  "is the most effective approach. The sg_ffty and sg_fftpx functions "
+                  "implement custom radix FFT kernels that could be replaced by cuFFT calls. "
+                  "zgemm can be accelerated via cuBLAS.",
+        function_keywords=["sg_ffty", "sg_fftpx", "fftrisc", "mkffkg", "zgemm",
+                           "fourwf", "nonlop", "getghc"],
+        structure_keywords=["plane wave", "FFT", "fourier", "reciprocal space",
+                            "pseudopotential", "kpoint", "band", "radix"],
         profiling_template={
-            "source": "gprof",
-            "metrics": ["nonlop_time", "fourwf_time", "vtowfk_time", "mpi_time"]
+            "source": "vtune",
+            "metrics": ["sg_ffty_time", "sg_fftpx_time", "fftrisc_time",
+                        "mkffkg_time", "zgemm_time"]
         }
     ),
     

@@ -1,0 +1,247 @@
+{
+  "timestamp": "2026-03-05T17:59:45.375184",
+  "experiment": "Abinit FFT cuFFT replacement analysis (Plan B)",
+  "stage1": {
+    "model": "gpt-4o",
+    "result": {
+      "hotspots": [
+        {
+          "location": "sg_ffty",
+          "estimated_time_percentage": "40.7%",
+          "reason": "This function is responsible for the FFT in the y-direction, which is a major part of the 3D FFT operation. The nested loops and complex arithmetic operations contribute to its high execution time."
+        },
+        {
+          "location": "sg_fftpx",
+          "estimated_time_percentage": "15.8%",
+          "reason": "This function handles the FFT in the x-direction with zero-padding, which adds additional computational overhead due to the padding operations and the need to handle larger data sizes."
+        },
+        {
+          "location": "fftrisc_one_nothreadsafe",
+          "estimated_time_percentage": "11.2%",
+          "reason": "This function acts as a dispatcher for wavefunction FFTs, indicating it is called frequently and involves significant data manipulation and transformation."
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "mixed",
+        "reasoning": "The FFT operations are typically both compute-bound and memory-bound. The compute-bound aspect arises from the complex arithmetic operations, while the memory-bound aspect is due to the large data movements required for the FFT operations, especially in 3D transforms."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "FFT operations are highly parallelizable and can benefit from the massive parallelism offered by GPUs. The regular data access patterns and the potential for using optimized libraries make it a good candidate for GPU acceleration.",
+        "recommended_approach": "library_replacement",
+        "challenges": [
+          "Efficient data transfer between CPU and GPU",
+          "Handling of zero-padding efficiently on the GPU",
+          "Ensuring numerical accuracy and stability"
+        ]
+      },
+      "optimization_suggestions": [
+        {
+          "target": "sg_ffty and sg_fftpx",
+          "suggestion": "Use an optimized FFT library such as Intel MKL or cuFFT for GPU acceleration.",
+          "expected_speedup": "2x-5x",
+          "implementation_difficulty": "medium"
+        },
+        {
+          "target": "fftrisc_one_nothreadsafe",
+          "suggestion": "Parallelize the function using OpenMP or convert it to use GPU kernels if possible.",
+          "expected_speedup": "1.5x-3x",
+          "implementation_difficulty": "high"
+        },
+        {
+          "target": "Overall FFT operations",
+          "suggestion": "Optimize data layout to improve cache utilization and reduce memory bandwidth bottlenecks.",
+          "expected_speedup": "1.2x-1.5x",
+          "implementation_difficulty": "medium"
+        }
+      ]
+    },
+    "raw_response": "```json\n{\n  \"hotspots\": [\n    {\n      \"location\": \"sg_ffty\",\n      \"estimated_time_percentage\": \"40.7%\",\n      \"reason\": \"This function is responsible for the FFT in the y-direction, which is a major part of the 3D FFT operation. The nested loops and complex arithmetic operations contribute to its high execution time.\"\n    },\n    {\n      \"location\": \"sg_fftpx\",\n      \"estimated_time_percentage\": \"15.8%\",\n      \"reason\": \"This function handles the FFT in the x-direction with zero-padding, which adds additional computational overhead due to the padding operations and the need to handle larger data sizes.\"\n    },\n    {\n      \"location\": \"fftrisc_one_nothreadsafe\",\n      \"estimated_time_percentage\": \"11.2%\",\n      \"reason\": \"This function acts as a dispatcher for wavefunction FFTs, indicating it is called frequently and involves significant data manipulation and transformation.\"\n    }\n  ],\n  \"bottleneck_type\": {\n    \"primary\": \"mixed\",\n    \"reasoning\": \"The FFT operations are typically both compute-bound and memory-bound. The compute-bound aspect arises from the complex arithmetic operations, while the memory-bound aspect is due to the large data movements required for the FFT operations, especially in 3D transforms.\"\n  },\n  \"gpu_suitability\": {\n    \"suitable\": true,\n    \"reasoning\": \"FFT operations are highly parallelizable and can benefit from the massive parallelism offered by GPUs. The regular data access patterns and the potential for using optimized libraries make it a good candidate for GPU acceleration.\",\n    \"recommended_approach\": \"library_replacement\",\n    \"challenges\": [\n      \"Efficient data transfer between CPU and GPU\",\n      \"Handling of zero-padding efficiently on the GPU\",\n      \"Ensuring numerical accuracy and stability\"\n    ]\n  },\n  \"optimization_suggestions\": [\n    {\n      \"target\": \"sg_ffty and sg_fftpx\",\n      \"suggestion\": \"Use an optimized FFT library such as Intel MKL or cuFFT for GPU acceleration.\",\n      \"expected_speedup\": \"2x-5x\",\n      \"implementation_difficulty\": \"medium\"\n    },\n    {\n      \"target\": \"fftrisc_one_nothreadsafe\",\n      \"suggestion\": \"Parallelize the function using OpenMP or convert it to use GPU kernels if possible.\",\n      \"expected_speedup\": \"1.5x-3x\",\n      \"implementation_difficulty\": \"high\"\n    },\n    {\n      \"target\": \"Overall FFT operations\",\n      \"suggestion\": \"Optimize data layout to improve cache utilization and reduce memory bandwidth bottlenecks.\",\n      \"expected_speedup\": \"1.2x-1.5x\",\n      \"implementation_difficulty\": \"medium\"\n    }\n  ]\n}\n```",
+    "cost": 0.0138215
+  },
+  "stage2": {
+    "model": "gpt-5.2",
+    "result": {
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The VTune profile shows sg_ffty (40.7%) and sg_fftpx (15.8%) dominating runtime, and both are core stages of ABINIT’s custom 3D mixed-radix FFT (Goedecker). fftrisc_one_nothreadsafe (11.2%) is a high-frequency dispatcher that performs packing/unpacking and calls the FFT kernels repeatedly. Together these account for ~68% of total CPU time, consistent with FFT-heavy plane-wave DFT workloads. The bottleneck is correctly classified as mixed compute/memory: FFT arithmetic is substantial, but the dominant cost in these routines is also strided memory access and repeated data movement (especially in y-direction transforms and x-direction padding/packing). This makes them strong candidates for cuFFT replacement, provided data layout and packing are handled efficiently on GPU."
+      },
+      "cufft_replacement_strategy": {
+        "feasibility": "high",
+        "approach": "Replace the custom 1D staged transforms (sg_ffty, sg_fftpx, and the internal fft_cc_one_nothreadsafe path used by sg_fft_cc) with a single cuFFT 3D complex-to-complex transform executed on GPU, and move the surrounding packing/unpacking (G-space <-> real-space grid, zero-padding, gbound handling) to GPU kernels. Use persistent cuFFT plans (cufftPlanMany or cufftMakePlanMany64) and persistent device buffers across SCF iterations and k-points. Batch transforms over ndat (and optionally over bands/spinors if available at call sites) to amortize plan and launch overhead. Use CUDA streams to overlap packing kernels, cuFFT execution, and any unavoidable transfers.",
+        "data_layout_changes": {
+          "current_format": "Fortran arrays store complex values as real(dp) with explicit real/imag planes: arr(2, nd1*nd2*nd3*ndat) in sg_fft_cc, and z(2,nd1,nd2,nd3) / zbr(2,nd1,nd2,nd3) in sg_ffty/sg_fftpx. In memory this is interleaved by the first dimension (real then imag) for each grid point, i.e., equivalent to an array of complex(dp) with contiguous complex numbers, but expressed as real(dp) with leading dimension 2.",
+          "required_format": "cuFFT expects complex arrays as cufftDoubleComplex (two doubles per element) for Z2Z. The existing Fortran layout z(2,...) is already compatible with an interleaved complex representation if passed as a contiguous buffer of length 2*N doubles. The key requirement is to ensure contiguity and correct strides for batched transforms (ndat) and any sub-volume transforms (if using PlanMany).",
+          "conversion_needed": false,
+          "conversion_code_sketch": "Pseudo-code (conceptual) showing that no element-wise conversion is required, only reinterpretation and correct leading dimensions/strides:\n\n! Fortran side: z is real(dp) z(2,nd1,nd2,nd3)\n! Device pointer d_z points to same interleaved layout.\n! Treat d_z as cufftDoubleComplex* with N=nd1*nd2*nd3 elements.\n\n// C/CUDA side\ncufftDoubleComplex* d_zc = (cufftDoubleComplex*)d_z; // reinterpret\n\n// If ndat batching: layout is [idat][grid] contiguous\ncufftDoubleComplex* d_batch = (cufftDoubleComplex*)d_arr; // arr(2, N*ndat)\n\n// No per-element pack/unpack needed unless ABINIT uses non-contiguous subranges (n1i..n1, n3i..n3) or gbound-based sparse packing; those should be handled by GPU kernels, not host conversion."
+        },
+        "api_mapping": [
+          {
+            "original_function": "sg_fft_cc (calls fft_cc_one_nothreadsafe per idat)",
+            "cufft_replacement": "cufftPlanMany (or cufftMakePlanMany64) + cufftExecZ2Z batched over ndat",
+            "notes": "sg_fft_cc is the cleanest entry point: it already loops over idat and passes contiguous slabs arr(1,start). Replace the per-idat call with a single batched 3D Z2Z plan: rank=3, n=[nd3,nd2,nd1] (note Fortran column-major; see stride notes below). Use inembed/onembed to match actual allocated sizes (nd1,nd2,nd3) and set batch=ndat. Use CUFFT_FORWARD/CUFFT_INVERSE based on isign mapping. Apply ABINIT’s normalization convention explicitly with a GPU scaling kernel after inverse (cuFFT does not normalize)."
+          },
+          {
+            "original_function": "sg_ffty (y-direction 1D transforms with mixed radix)",
+            "cufft_replacement": "Eliminate as a separate stage; covered by a single 3D cufftExecZ2Z",
+            "notes": "sg_ffty exists because the custom FFT decomposes 3D into staged 1D transforms with cache blocking. cuFFT’s 3D plan will internally choose an efficient decomposition and use shared memory/transpose strategies. If ABINIT’s algorithm relies on intermediate layouts (zbr scratch), keep zbr as a device scratch buffer only if needed for packing/unpacking; do not replicate the staged algorithm on GPU unless forced by data sparsity constraints."
+          },
+          {
+            "original_function": "sg_fftpx (x-direction transforms with zero-padding and gbound handling)",
+            "cufft_replacement": "GPU packing kernel(s) + 3D cufftExecZ2Z on padded grid",
+            "notes": "sg_fftpx’s main non-FFT work is (1) selecting active G-vectors via gbound and (2) zero-padding into the full FFT grid. With cuFFT you typically transform the full dense grid. Strategy: implement a GPU kernel that scatters sparse plane-wave coefficients into a dense complex grid (zero-fill elsewhere), then run 3D cuFFT, then gather back if needed. If ABINIT already maintains dense grids for some paths, prefer those to avoid scatter/gather overhead."
+          },
+          {
+            "original_function": "fftrisc_one_nothreadsafe (dispatcher for wavefunction FFTs)",
+            "cufft_replacement": "Refactor to: (A) device-side scatter (G->grid) + (B) cufftExecZ2Z + (C) device-side gather (grid->G) depending on option",
+            "notes": "fftrisc_one_nothreadsafe likely handles multiple modes (option 0..3) controlling whether it produces fofr (real-space) and/or fofgout (reciprocal-space). Map each option to a sequence of GPU kernels + cuFFT. Keep kg_kin/kg_kout and gbound arrays on device to avoid per-call transfers. This function is also a good place to introduce batching over ndat and possibly over bands if the call site allows."
+          }
+        ],
+        "memory_management": {
+          "host_to_device": "Allocate persistent device buffers for the dense FFT grid (size nd1*nd2*nd3*ndat complex) and for any sparse plane-wave coefficient arrays (npw*ndat complex). Transfer static metadata once: gboundin/out, kg_kin/kout, ngfft, and any index maps. For each SCF iteration/k-point, transfer only the changing coefficients (fofgin) if they are produced on CPU; ideally, move upstream producers to GPU to keep fofgin resident. Use pinned host memory (cudaHostAlloc or Fortran pinned via ISO_C_BINDING wrappers) and cudaMemcpyAsync in a dedicated stream.",
+          "device_to_host": "Avoid D2H transfers inside the SCF loop. Only copy back final quantities needed on CPU (e.g., energies, small reductions). If fofr/fofgout are consumed by subsequent GPU kernels, keep them on device. If ABINIT requires fofr on CPU for legacy code paths, batch and copy asynchronously, but expect this to limit speedup.",
+          "persistent_allocation": "Yes. Create a per-(grid shape, ndat, precision) plan cache: cufftHandle plan_fwd, plan_inv. Allocate d_grid, d_coeff_in/out, and d_work (if using cufftSetWorkArea) once per MPI rank/GPU and reuse across k-points and SCF iterations. Also reuse CUDA streams and events.",
+          "estimated_transfer_overhead": "For the 45^3 grid: N=91,125 complex. One dense grid is ~91,125 * 16 B ≈ 1.46 MB. For ndat transforms, scale linearly. If you transfer dense grids each call, PCIe overhead can dominate (e.g., 1.46 MB per transform * many calls). Therefore the strategy must minimize transfers by keeping data resident and only transferring sparse coefficients (npw) or small outputs. With pinned memory and PCIe4, a few MB per call is still non-trivial given high call counts; with NVLink it is less severe but still avoidable."
+        },
+        "batch_optimization": {
+          "can_batch": true,
+          "batch_dimension": "Primary: ndat (already explicit in sg_fft_cc/sg_fftrisc). Secondary (if accessible at higher level): batch over bands (nband) and/or spinor components by stacking multiple independent 3D grids in memory and setting batch accordingly.",
+          "expected_benefit": "Batched cuFFT amortizes kernel launch overhead and improves GPU occupancy, especially for smallish grids like 45^3. It also reduces plan management overhead and enables better overlap of scatter/gather kernels with FFT execution across streams. For ABINIT’s many repeated FFTs per k-point and SCF iteration, batching is often the difference between modest and strong speedups."
+        },
+        "expected_speedup": {
+          "fft_only": "3x-10x (vs single-core CPU baseline) depending on how much of the current time is in arithmetic vs packing/strides; for small 45^3 grids, expect the lower end unless batching is used aggressively.",
+          "overall": "1.8x-3.5x for the full run if FFT-related ~68% is accelerated substantially and transfers are minimized; higher if additional surrounding operations (packing, reductions, BLAS) are also moved to GPU.",
+          "limiting_factors": [
+            "Host-device transfers if data is not kept resident across FFT calls",
+            "Scatter/gather overhead for sparse G-vector packing (gbound/kg_k*)",
+            "Small FFT size (45^3) leading to lower cuFFT efficiency unless batched",
+            "Plan creation overhead if not cached",
+            "Normalization/scaling and any required transpositions if data layout mismatches",
+            "MPI domain decomposition (if FFTs are distributed) requiring GPU-aware MPI and/or NCCL for all-to-all (not shown in snippet but common in ABINIT)"
+          ]
+        }
+      },
+      "alternative_approaches": [
+        {
+          "name": "Use cuFFT 1D/2D staged transforms to mimic Goedecker flow",
+          "description": "Replace sg_ffty and sg_fftpx individually with cufftPlanMany rank=1 transforms along specific dimensions, keeping intermediate buffers similar to z/zbr and preserving some of the existing control flow.",
+          "pros": [
+            "Less invasive refactor of surrounding code",
+            "Easier to validate intermediate states against CPU implementation"
+          ],
+          "cons": [
+            "Likely slower than a single 3D plan due to extra global memory traffic and transposes",
+            "More complex stride/embed setup; higher risk of mistakes",
+            "Harder to reach high performance on GPU"
+          ]
+        },
+        {
+          "name": "Hybrid: keep sparse packing on CPU, only dense 3D FFT on GPU",
+          "description": "CPU builds dense grid (including zero-padding), copies to GPU, runs cuFFT, copies back.",
+          "pros": [
+            "Fastest path to a working prototype",
+            "Minimal changes to gbound/kg logic"
+          ],
+          "cons": [
+            "Transfers and CPU packing likely erase much of the benefit",
+            "Does not address fftrisc_one_nothreadsafe overhead"
+          ]
+        },
+        {
+          "name": "Use NVIDIA cuFFTMp (multi-GPU distributed FFT) if ABINIT uses distributed FFTs",
+          "description": "If ABINIT’s production runs distribute FFT grids across MPI ranks, use cuFFTMp to perform distributed 3D FFTs with GPU-aware communication.",
+          "pros": [
+            "Scales across multiple GPUs; avoids CPU-based MPI all-to-all bottlenecks",
+            "Best long-term path for large systems"
+          ],
+          "cons": [
+            "Higher integration complexity",
+            "Requires GPU-aware MPI and careful communicator/topology setup",
+            "Overkill for the small 45^3 test but important for real workloads"
+          ]
+        }
+      ],
+      "implementation_plan": [
+        {
+          "step": 1,
+          "task": "Identify the highest-level call site that owns the full dense grid (nd1,nd2,nd3) and ndat batching (likely sg_fft_cc / sg_fftrisc call chain). Decide the minimal interface to offload: (A) dense-grid FFT only, or (B) full fftrisc path including packing.",
+          "estimated_effort": "6-10 hours",
+          "priority": "high"
+        },
+        {
+          "step": 2,
+          "task": "Implement a cuFFT plan cache keyed by (nd1,nd2,nd3,ndat,precision). Use cufftCreate + cufftSetAutoAllocation(false) + cufftMakePlanMany64 to query workSize, allocate d_work once, then cufftSetWorkArea. Create forward and inverse plans.",
+          "estimated_effort": "8-14 hours",
+          "priority": "high"
+        },
+        {
+          "step": 3,
+          "task": "Implement sg_fft_cc GPU path: allocate d_arr/d_ftarr (or in-place), copy arr to device (prototype), run cufftExecZ2Z batched, copy back. Add a GPU scaling kernel for inverse normalization to match ABINIT conventions.",
+          "estimated_effort": "10-18 hours",
+          "priority": "high"
+        },
+        {
+          "step": 4,
+          "task": "Eliminate per-idat loop by using batch=ndat in cufftPlanMany. Validate correctness vs CPU for multiple isign values and random complex inputs; add unit tests comparing max/relative error.",
+          "estimated_effort": "6-12 hours",
+          "priority": "high"
+        },
+        {
+          "step": 5,
+          "task": "Move fftrisc_one_nothreadsafe packing/unpacking to GPU: create device copies of kg_kin/kg_kout and gbound arrays; write CUDA kernels to scatter fofgin -> dense grid (zero-fill) and gather dense grid -> fofgout. Keep dense grid resident and reuse across options 0..3.",
+          "estimated_effort": "20-40 hours",
+          "priority": "high"
+        },
+        {
+          "step": 6,
+          "task": "Introduce stream-based overlap: scatter kernel (stream A) -> cuFFT (stream A) -> gather kernel (stream A), while concurrently preparing next batch (stream B) if call structure allows. Use cudaEvent for dependencies.",
+          "estimated_effort": "12-24 hours",
+          "priority": "medium"
+        },
+        {
+          "step": 7,
+          "task": "Optimize batching beyond ndat: if wavefunctions are processed band-by-band, refactor to process multiple bands per call (increase batch) to improve cuFFT efficiency for 45^3 grids.",
+          "estimated_effort": "16-32 hours",
+          "priority": "medium"
+        },
+        {
+          "step": 8,
+          "task": "Productionize: persistent device memory across SCF iterations/k-points, pinned host buffers, error handling, and fallback to CPU FFT when GPU unavailable. Add performance counters and NVTX ranges for profiling.",
+          "estimated_effort": "12-20 hours",
+          "priority": "medium"
+        }
+      ],
+      "risks_and_challenges": [
+        {
+          "risk": "Incorrect dimension/stride mapping due to Fortran column-major layout and ABINIT’s use of subranges (n1i..n1, n3i..n3) and scratch buffers (zbr).",
+          "mitigation": "Prefer a single dense 3D cuFFT on the full allocated grid (nd1,nd2,nd3) to avoid tricky strided sub-transforms. When subranges are required, handle them with explicit GPU pack/unpack kernels into a contiguous dense buffer before cuFFT. Validate with small deterministic tests and compare against CPU bitwise where possible (or tight tolerances)."
+        },
+        {
+          "risk": "Performance loss from scatter/gather of sparse G-vectors (gbound/kg) dominating runtime for small grids.",
+          "mitigation": "Keep index arrays on device; fuse zero-fill + scatter in one kernel; use coalesced writes by sorting/structuring kg indices if possible; batch many wavefunctions (bands) and ndat together; consider using texture/read-only cache for index reads. Profile with Nsight Compute to ensure memory throughput is acceptable."
+        },
+        {
+          "risk": "cuFFT plan overhead and workspace allocation overhead if plans are recreated frequently.",
+          "mitigation": "Implement a plan cache and persistent work area. Never create/destroy plans inside inner SCF/k-point loops. Use cufftSetStream to bind plans to streams without recreating."
+        },
+        {
+          "risk": "Normalization/sign convention mismatch between ABINIT’s FFT and cuFFT (cuFFT is unnormalized; sign conventions may differ).",
+          "mitigation": "Document ABINIT’s convention (forward/inverse definitions and scaling). Apply explicit scaling kernel (1/N) on inverse or forward as needed. Verify with known transforms (delta function, single plane wave) and energy conservation checks."
+        },
+        {
+          "risk": "Thread-safety and MPI+OpenMP interactions (current code has *_nothreadsafe).",
+          "mitigation": "Use one cuFFT plan per GPU per host thread/stream or protect plan use with a mutex if shared. Prefer a design where each MPI rank owns one GPU and uses a small number of streams. If OpenMP is used, ensure each thread does not concurrently call the same cufftHandle unless explicitly managed."
+        },
+        {
+          "risk": "ABINIT build/integration complexity (Fortran + CUDA, ISO_C_BINDING, multiple precisions).",
+          "mitigation": "Create a small C/CUDA wrapper library exposing C bindings callable from Fortran (ISO_C_BINDING). Provide both DP (Z2Z) and SP (C2C) paths if needed. Add configure-time detection and runtime selection."
+        }
+      ]
+    },
+    "raw_response": "```json\n{\n  \"validation\": {\n    \"bottleneck_correct\": true,\n    \"corrected_bottleneck\": \"\",\n    \"reasoning\": \"The VTune profile shows sg_ffty (40.7%) and sg_fftpx (15.8%) dominating runtime, and both are core stages of ABINIT’s custom 3D mixed-radix FFT (Goedecker). fftrisc_one_nothreadsafe (11.2%) is a high-frequency dispatcher that performs packing/unpacking and calls the FFT kernels repeatedly. Together these account for ~68% of total CPU time, consistent with FFT-heavy plane-wave DFT workloads. The bottleneck is correctly classified as mixed compute/memory: FFT arithmetic is substantial, but the dominant cost in these routines is also strided memory access and repeated data movement (especially in y-direction transforms and x-direction padding/packing). This makes them strong candidates for cuFFT replacement, provided data layout and packing are handled efficiently on GPU.\"\n  },\n  \"cufft_replacement_strategy\": {\n    \"feasibility\": \"high\",\n    \"approach\": \"Replace the custom 1D staged transforms (sg_ffty, sg_fftpx, and the internal fft_cc_one_nothreadsafe path used by sg_fft_cc) with a single cuFFT 3D complex-to-complex transform executed on GPU, and move the surrounding packing/unpacking (G-space <-> real-space grid, zero-padding, gbound handling) to GPU kernels. Use persistent cuFFT plans (cufftPlanMany or cufftMakePlanMany64) and persistent device buffers across SCF iterations and k-points. Batch transforms over ndat (and optionally over bands/spinors if available at call sites) to amortize plan and launch overhead. Use CUDA streams to overlap packing kernels, cuFFT execution, and any unavoidable transfers.\",\n    \"data_layout_changes\": {\n      \"current_format\": \"Fortran arrays store complex values as real(dp) with explicit real/imag planes: arr(2, nd1*nd2*nd3*ndat) in sg_fft_cc, and z(2,nd1,nd2,nd3) / zbr(2,nd1,nd2,nd3) in sg_ffty/sg_fftpx. In memory this is interleaved by the first dimension (real then imag) for each grid point, i.e., equivalent to an array of complex(dp) with contiguous complex numbers, but expressed as real(dp) with leading dimension 2.\",\n      \"required_format\": \"cuFFT expects complex arrays as cufftDoubleComplex (two doubles per element) for Z2Z. The existing Fortran layout z(2,...) is already compatible with an interleaved complex representation if passed as a contiguous buffer of length 2*N doubles. The key requirement is to ensure contiguity and correct strides for batched transforms (ndat) and any sub-volume transforms (if using PlanMany).\",\n      \"conversion_needed\": false,\n      \"conversion_code_sketch\": \"Pseudo-code (conceptual) showing that no element-wise conversion is required, only reinterpretation and correct leading dimensions/strides:\\n\\n! Fortran side: z is real(dp) z(2,nd1,nd2,nd3)\\n! Device pointer d_z points to same interleaved layout.\\n! Treat d_z as cufftDoubleComplex* with N=nd1*nd2*nd3 elements.\\n\\n// C/CUDA side\\ncufftDoubleComplex* d_zc = (cufftDoubleComplex*)d_z; // reinterpret\\n\\n// If ndat batching: layout is [idat][grid] contiguous\\ncufftDoubleComplex* d_batch = (cufftDoubleComplex*)d_arr; // arr(2, N*ndat)\\n\\n// No per-element pack/unpack needed unless ABINIT uses non-contiguous subranges (n1i..n1, n3i..n3) or gbound-based sparse packing; those should be handled by GPU kernels, not host conversion.\"\n    },\n    \"api_mapping\": [\n      {\n        \"original_function\": \"sg_fft_cc (calls fft_cc_one_nothreadsafe per idat)\",\n        \"cufft_replacement\": \"cufftPlanMany (or cufftMakePlanMany64) + cufftExecZ2Z batched over ndat\",\n        \"notes\": \"sg_fft_cc is the cleanest entry point: it already loops over idat and passes contiguous slabs arr(1,start). Replace the per-idat call with a single batched 3D Z2Z plan: rank=3, n=[nd3,nd2,nd1] (note Fortran column-major; see stride notes below). Use inembed/onembed to match actual allocated sizes (nd1,nd2,nd3) and set batch=ndat. Use CUFFT_FORWARD/CUFFT_INVERSE based on isign mapping. Apply ABINIT’s normalization convention explicitly with a GPU scaling kernel after inverse (cuFFT does not normalize).\"\n      },\n      {\n        \"original_function\": \"sg_ffty (y-direction 1D transforms with mixed radix)\",\n        \"cufft_replacement\": \"Eliminate as a separate stage; covered by a single 3D cufftExecZ2Z\",\n        \"notes\": \"sg_ffty exists because the custom FFT decomposes 3D into staged 1D transforms with cache blocking. cuFFT’s 3D plan will internally choose an efficient decomposition and use shared memory/transpose strategies. If ABINIT’s algorithm relies on intermediate layouts (zbr scratch), keep zbr as a device scratch buffer only if needed for packing/unpacking; do not replicate the staged algorithm on GPU unless forced by data sparsity constraints.\"\n      },\n      {\n        \"original_function\": \"sg_fftpx (x-direction transforms with zero-padding and gbound handling)\",\n        \"cufft_replacement\": \"GPU packing kernel(s) + 3D cufftExecZ2Z on padded grid\",\n        \"notes\": \"sg_fftpx’s main non-FFT work is (1) selecting active G-vectors via gbound and (2) zero-padding into the full FFT grid. With cuFFT you typically transform the full dense grid. Strategy: implement a GPU kernel that scatters sparse plane-wave coefficients into a dense complex grid (zero-fill elsewhere), then run 3D cuFFT, then gather back if needed. If ABINIT already maintains dense grids for some paths, prefer those to avoid scatter/gather overhead.\"\n      },\n      {\n        \"original_function\": \"fftrisc_one_nothreadsafe (dispatcher for wavefunction FFTs)\",\n        \"cufft_replacement\": \"Refactor to: (A) device-side scatter (G->grid) + (B) cufftExecZ2Z + (C) device-side gather (grid->G) depending on option\",\n        \"notes\": \"fftrisc_one_nothreadsafe likely handles multiple modes (option 0..3) controlling whether it produces fofr (real-space) and/or fofgout (reciprocal-space). Map each option to a sequence of GPU kernels + cuFFT. Keep kg_kin/kg_kout and gbound arrays on device to avoid per-call transfers. This function is also a good place to introduce batching over ndat and possibly over bands if the call site allows.\"\n      }\n    ],\n    \"memory_management\": {\n      \"host_to_device\": \"Allocate persistent device buffers for the dense FFT grid (size nd1*nd2*nd3*ndat complex) and for any sparse plane-wave coefficient arrays (npw*ndat complex). Transfer static metadata once: gboundin/out, kg_kin/kout, ngfft, and any index maps. For each SCF iteration/k-point, transfer only the changing coefficients (fofgin) if they are produced on CPU; ideally, move upstream producers to GPU to keep fofgin resident. Use pinned host memory (cudaHostAlloc or Fortran pinned via ISO_C_BINDING wrappers) and cudaMemcpyAsync in a dedicated stream.\",\n      \"device_to_host\": \"Avoid D2H transfers inside the SCF loop. Only copy back final quantities needed on CPU (e.g., energies, small reductions). If fofr/fofgout are consumed by subsequent GPU kernels, keep them on device. If ABINIT requires fofr on CPU for legacy code paths, batch and copy asynchronously, but expect this to limit speedup.\",\n      \"persistent_allocation\": \"Yes. Create a per-(grid shape, ndat, precision) plan cache: cufftHandle plan_fwd, plan_inv. Allocate d_grid, d_coeff_in/out, and d_work (if using cufftSetWorkArea) once per MPI rank/GPU and reuse across k-points and SCF iterations. Also reuse CUDA streams and events.\",\n      \"estimated_transfer_overhead\": \"For the 45^3 grid: N=91,125 complex. One dense grid is ~91,125 * 16 B ≈ 1.46 MB. For ndat transforms, scale linearly. If you transfer dense grids each call, PCIe overhead can dominate (e.g., 1.46 MB per transform * many calls). Therefore the strategy must minimize transfers by keeping data resident and only transferring sparse coefficients (npw) or small outputs. With pinned memory and PCIe4, a few MB per call is still non-trivial given high call counts; with NVLink it is less severe but still avoidable.\"\n    },\n    \"batch_optimization\": {\n      \"can_batch\": true,\n      \"batch_dimension\": \"Primary: ndat (already explicit in sg_fft_cc/sg_fftrisc). Secondary (if accessible at higher level): batch over bands (nband) and/or spinor components by stacking multiple independent 3D grids in memory and setting batch accordingly.\",\n      \"expected_benefit\": \"Batched cuFFT amortizes kernel launch overhead and improves GPU occupancy, especially for smallish grids like 45^3. It also reduces plan management overhead and enables better overlap of scatter/gather kernels with FFT execution across streams. For ABINIT’s many repeated FFTs per k-point and SCF iteration, batching is often the difference between modest and strong speedups.\"\n    },\n    \"expected_speedup\": {\n      \"fft_only\": \"3x-10x (vs single-core CPU baseline) depending on how much of the current time is in arithmetic vs packing/strides; for small 45^3 grids, expect the lower end unless batching is used aggressively.\",\n      \"overall\": \"1.8x-3.5x for the full run if FFT-related ~68% is accelerated substantially and transfers are minimized; higher if additional surrounding operations (packing, reductions, BLAS) are also moved to GPU.\",\n      \"limiting_factors\": [\n        \"Host-device transfers if data is not kept resident across FFT calls\",\n        \"Scatter/gather overhead for sparse G-vector packing (gbound/kg_k*)\",\n        \"Small FFT size (45^3) leading to lower cuFFT efficiency unless batched\",\n        \"Plan creation overhead if not cached\",\n        \"Normalization/scaling and any required transpositions if data layout mismatches\",\n        \"MPI domain decomposition (if FFTs are distributed) requiring GPU-aware MPI and/or NCCL for all-to-all (not shown in snippet but common in ABINIT)\"\n      ]\n    }\n  },\n  \"alternative_approaches\": [\n    {\n      \"name\": \"Use cuFFT 1D/2D staged transforms to mimic Goedecker flow\",\n      \"description\": \"Replace sg_ffty and sg_fftpx individually with cufftPlanMany rank=1 transforms along specific dimensions, keeping intermediate buffers similar to z/zbr and preserving some of the existing control flow.\",\n      \"pros\": [\n        \"Less invasive refactor of surrounding code\",\n        \"Easier to validate intermediate states against CPU implementation\"\n      ],\n      \"cons\": [\n        \"Likely slower than a single 3D plan due to extra global memory traffic and transposes\",\n        \"More complex stride/embed setup; higher risk of mistakes\",\n        \"Harder to reach high performance on GPU\"\n      ]\n    },\n    {\n      \"name\": \"Hybrid: keep sparse packing on CPU, only dense 3D FFT on GPU\",\n      \"description\": \"CPU builds dense grid (including zero-padding), copies to GPU, runs cuFFT, copies back.\",\n      \"pros\": [\n        \"Fastest path to a working prototype\",\n        \"Minimal changes to gbound/kg logic\"\n      ],\n      \"cons\": [\n        \"Transfers and CPU packing likely erase much of the benefit\",\n        \"Does not address fftrisc_one_nothreadsafe overhead\"\n      ]\n    },\n    {\n      \"name\": \"Use NVIDIA cuFFTMp (multi-GPU distributed FFT) if ABINIT uses distributed FFTs\",\n      \"description\": \"If ABINIT’s production runs distribute FFT grids across MPI ranks, use cuFFTMp to perform distributed 3D FFTs with GPU-aware communication.\",\n      \"pros\": [\n        \"Scales across multiple GPUs; avoids CPU-based MPI all-to-all bottlenecks\",\n        \"Best long-term path for large systems\"\n      ],\n      \"cons\": [\n        \"Higher integration complexity\",\n        \"Requires GPU-aware MPI and careful communicator/topology setup\",\n        \"Overkill for the small 45^3 test but important for real workloads\"\n      ]\n    }\n  ],\n  \"implementation_plan\": [\n    {\n      \"step\": 1,\n      \"task\": \"Identify the highest-level call site that owns the full dense grid (nd1,nd2,nd3) and ndat batching (likely sg_fft_cc / sg_fftrisc call chain). Decide the minimal interface to offload: (A) dense-grid FFT only, or (B) full fftrisc path including packing.\",\n      \"estimated_effort\": \"6-10 hours\",\n      \"priority\": \"high\"\n    },\n    {\n      \"step\": 2,\n      \"task\": \"Implement a cuFFT plan cache keyed by (nd1,nd2,nd3,ndat,precision). Use cufftCreate + cufftSetAutoAllocation(false) + cufftMakePlanMany64 to query workSize, allocate d_work once, then cufftSetWorkArea. Create forward and inverse plans.\",\n      \"estimated_effort\": \"8-14 hours\",\n      \"priority\": \"high\"\n    },\n    {\n      \"step\": 3,\n      \"task\": \"Implement sg_fft_cc GPU path: allocate d_arr/d_ftarr (or in-place), copy arr to device (prototype), run cufftExecZ2Z batched, copy back. Add a GPU scaling kernel for inverse normalization to match ABINIT conventions.\",\n      \"estimated_effort\": \"10-18 hours\",\n      \"priority\": \"high\"\n    },\n    {\n      \"step\": 4,\n      \"task\": \"Eliminate per-idat loop by using batch=ndat in cufftPlanMany. Validate correctness vs CPU for multiple isign values and random complex inputs; add unit tests comparing max/relative error.\",\n      \"estimated_effort\": \"6-12 hours\",\n      \"priority\": \"high\"\n    },\n    {\n      \"step\": 5,\n      \"task\": \"Move fftrisc_one_nothreadsafe packing/unpacking to GPU: create device copies of kg_kin/kg_kout and gbound arrays; write CUDA kernels to scatter fofgin -> dense grid (zero-fill) and gather dense grid -> fofgout. Keep dense grid resident and reuse across options 0..3.\",\n      \"estimated_effort\": \"20-40 hours\",\n      \"priority\": \"high\"\n    },\n    {\n      \"step\": 6,\n      \"task\": \"Introduce stream-based overlap: scatter kernel (stream A) -> cuFFT (stream A) -> gather kernel (stream A), while concurrently preparing next batch (stream B) if call structure allows. Use cudaEvent for dependencies.\",\n      \"estimated_effort\": \"12-24 hours\",\n      \"priority\": \"medium\"\n    },\n    {\n      \"step\": 7,\n      \"task\": \"Optimize batching beyond ndat: if wavefunctions are processed band-by-band, refactor to process multiple bands per call (increase batch) to improve cuFFT efficiency for 45^3 grids.\",\n      \"estimated_effort\": \"16-32 hours\",\n      \"priority\": \"medium\"\n    },\n    {\n      \"step\": 8,\n      \"task\": \"Productionize: persistent device memory across SCF iterations/k-points, pinned host buffers, error handling, and fallback to CPU FFT when GPU unavailable. Add performance counters and NVTX ranges for profiling.\",\n      \"estimated_effort\": \"12-20 hours\",\n      \"priority\": \"medium\"\n    }\n  ],\n  \"risks_and_challenges\": [\n    {\n      \"risk\": \"Incorrect dimension/stride mapping due to Fortran column-major layout and ABINIT’s use of subranges (n1i..n1, n3i..n3) and scratch buffers (zbr).\",\n      \"mitigation\": \"Prefer a single dense 3D cuFFT on the full allocated grid (nd1,nd2,nd3) to avoid tricky strided sub-transforms. When subranges are required, handle them with explicit GPU pack/unpack kernels into a contiguous dense buffer before cuFFT. Validate with small deterministic tests and compare against CPU bitwise where possible (or tight tolerances).\"\n    },\n    {\n      \"risk\": \"Performance loss from scatter/gather of sparse G-vectors (gbound/kg) dominating runtime for small grids.\",\n      \"mitigation\": \"Keep index arrays on device; fuse zero-fill + scatter in one kernel; use coalesced writes by sorting/structuring kg indices if possible; batch many wavefunctions (bands) and ndat together; consider using texture/read-only cache for index reads. Profile with Nsight Compute to ensure memory throughput is acceptable.\"\n    },\n    {\n      \"risk\": \"cuFFT plan overhead and workspace allocation overhead if plans are recreated frequently.\",\n      \"mitigation\": \"Implement a plan cache and persistent work area. Never create/destroy plans inside inner SCF/k-point loops. Use cufftSetStream to bind plans to streams without recreating.\"\n    },\n    {\n      \"risk\": \"Normalization/sign convention mismatch between ABINIT’s FFT and cuFFT (cuFFT is unnormalized; sign conventions may differ).\",\n      \"mitigation\": \"Document ABINIT’s convention (forward/inverse definitions and scaling). Apply explicit scaling kernel (1/N) on inverse or forward as needed. Verify with known transforms (delta function, single plane wave) and energy conservation checks.\"\n    },\n    {\n      \"risk\": \"Thread-safety and MPI+OpenMP interactions (current code has *_nothreadsafe).\",\n      \"mitigation\": \"Use one cuFFT plan per GPU per host thread/stream or protect plan use with a mutex if shared. Prefer a design where each MPI rank owns one GPU and uses a small number of streams. If OpenMP is used, ensure each thread does not concurrently call the same cufftHandle unless explicitly managed.\"\n    },\n    {\n      \"risk\": \"ABINIT build/integration complexity (Fortran + CUDA, ISO_C_BINDING, multiple precisions).\",\n      \"mitigation\": \"Create a small C/CUDA wrapper library exposing C bindings callable from Fortran (ISO_C_BINDING). Provide both DP (Z2Z) and SP (C2C) paths if needed. Add configure-time detection and runtime selection.\"\n    }\n  ]\n}\n```",
+    "cost": 0.06468175
+  },
+  "total_cost": 0.07850325,
+  "vtune_data": "\nIntel VTune Profiler 2025.9 - Hotspot Analysis for ABINIT 9.10.4\nConfiguration: Si bulk, 2 atoms, ecut=40 Ha, 8x8x8 k-grid, FFT grid 45x45x45\nTotal CPU Time: 9.799s\n\nTop Hotspots:\n  sg_ffty                     3.991s  40.7%   (FFT y-direction transform)\n  sg_fftpx                    1.550s  15.8%   (FFT x-direction transform with zero-padding)\n  fftrisc_one_nothreadsafe    1.101s  11.2%   (FFT dispatcher for wavefunctions)\n  dfpt_mkffkg                 0.632s   6.4%   (FFT kernel generation for DFPT)\n  zgemm_ (BLAS)               0.385s   3.9%   (Complex matrix multiply)\n  [Others]                    2.141s  21.8%\n\nFFT-related functions total: ~68% of runtime\n"
+}
