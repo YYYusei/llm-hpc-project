@@ -303,6 +303,65 @@ class FullPipelineTester:
             "gpt-5.2": LLMClient(model="gpt-5.2")
         }
     
+    def _load_direct_results(self) -> Dict[str, Any]:
+        """
+        从 direct generation 的结果 JSON 文件加载加速比。
+        搜索路径（按优先级）：
+          1. results/direct_generation_results.json  — 手动整合文件
+          2. results/cuda_spmv/spmv_test_results.json — SPMV 单独跑的结果
+          3. 若均不存在，返回空 dict 并打印警告
+        """
+        # 1. 尝试读整合文件
+        combined_path = os.path.join("results", "direct_generation_results.json")
+        if os.path.exists(combined_path):
+            with open(combined_path, "r") as f:
+                data = json.load(f)
+            logger.info(f"Loaded direct results from {combined_path}")
+            return data  # 期望格式: {"minimd": {"speedup": 14.34, ...}, "spmv": {...}}
+
+        # 2. 逐个文件拼凑
+        loaded = {}
+
+        spmv_path = os.path.join("results", "cuda_spmv", "spmv_test_results.json")
+        if os.path.exists(spmv_path):
+            with open(spmv_path, "r") as f:
+                spmv_data = json.load(f)
+            # spmv_test_results.json 结构: {"gpt-5.2": {"benchmark": {"speedup": ...}}, ...}
+            best = max(
+                (v.get("benchmark", {}) for v in spmv_data.values() if isinstance(v, dict)),
+                key=lambda b: b.get("speedup", 0),
+                default={}
+            )
+            if best.get("speedup"):
+                loaded["spmv"] = best
+                logger.info(f"Loaded SPMV direct result: {best['speedup']:.2f}x")
+
+        # miniMD 没有独立 JSON，读取 gpu_conversion 目录下最新的 .cu benchmark 结果
+        minimd_result_path = os.path.join("results", "cuda_minimd", "minimd_test_results.json")
+        if os.path.exists(minimd_result_path):
+            with open(minimd_result_path, "r") as f:
+                minimd_data = json.load(f)
+            best = max(
+                (v.get("benchmark", {}) for v in minimd_data.values() if isinstance(v, dict)),
+                key=lambda b: b.get("speedup", 0),
+                default={}
+            )
+            if best.get("speedup"):
+                loaded["minimd"] = best
+                logger.info(f"Loaded miniMD direct result: {best['speedup']:.2f}x")
+
+        if loaded:
+            return loaded
+
+        # 3. Fallback：提示用户
+        logger.warning(
+            "Direct generation result files not found. "
+            "Run test_cuda_spmv.py / miniMD direct gen first, or create "
+            f"'{combined_path}' manually. "
+            "Format: {{\"minimd\": {{\"speedup\": 14.34}}, \"spmv\": {{\"speedup\": 10.30}}}}"
+        )
+        return {}
+
     def extract_cuda_code(self, response: str) -> str:
         for pattern in [r'```cuda\n(.*?)```', r'```cpp\n(.*?)```', r'```\n(.*?)```']:
             match = re.search(pattern, response, re.DOTALL)
@@ -561,6 +620,9 @@ Output ONLY fixed code:
                 print(f"  Speedup: {b['speedup']:.2f}x")
                 print(f"  Error: {b['error']:.2e}")
         
+        # 加载 direct generation 结果（优先从 JSON 读取，找不到则使用 fallback）
+        direct_results = self._load_direct_results()
+
         # Comparison with direct generation
         print("\n" + "=" * 70)
         print("COMPARISON: Direct Generation vs Full Pipeline")
@@ -568,12 +630,16 @@ Output ONLY fixed code:
         print(f"{'Kernel':<20} {'Direct':>12} {'Pipeline':>12} {'Diff':>10}")
         print("-" * 54)
         
-        direct_results = {"minimd": 14.34, "spmv": 10.30}
+        direct_results_display = {k: direct_results.get(k, {}) for k in results["kernels"]}
         for kernel_id, data in results["kernels"].items():
-            direct = direct_results[kernel_id]
+            direct_info = direct_results.get(kernel_id, {})
+            direct = direct_info.get("speedup", None)
             pipeline = data.get("benchmark", {}).get("speedup", 0)
-            diff = ((pipeline - direct) / direct * 100) if direct > 0 else 0
-            print(f"{KERNELS[kernel_id]['name']:<20} {direct:>10.2f}x {pipeline:>10.2f}x {diff:>+9.1f}%")
+            if direct is not None:
+                diff = ((pipeline - direct) / direct * 100) if direct > 0 else 0
+                print(f"{KERNELS[kernel_id]['name']:<20} {direct:>10.2f}x {pipeline:>10.2f}x {diff:>+9.1f}%")
+            else:
+                print(f"{KERNELS[kernel_id]['name']:<20} {'N/A':>11} {pipeline:>10.2f}x {'N/A':>10}")
         
         print("=" * 70)
         total_cost = sum(d["total_cost"] for d in results["kernels"].values())

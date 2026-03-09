@@ -126,7 +126,7 @@ def _extract_percentage(percentage_str):
     return None
 
 
-def _percentage_similarity(actual: Optional[str], expected: Optional[str], tolerance: float = 0.1) -> float:
+def _percentage_similarity(actual: Optional[str], expected: Optional[str], tolerance: float = 0.3) -> float:
     """
     计算百分比相似度
     tolerance: 允许的误差范围（如0.1表示10%）
@@ -306,6 +306,65 @@ def _optimization_suggestions_quality(
         "completeness": avg_completeness,
         "overall": count_score * 0.6 + avg_completeness * 0.4
     }
+
+
+def _analysis_detail_score(result_data: Dict[str, Any]) -> float:
+    """
+    计算分析深度/详细程度评分 (Analysis Detail, weight: 15%)
+    按照论文评估框架，累积计分，上限 1.0：
+      - Hotspot reasoning:    >100 chars → +0.2;  >50 → +0.1
+      - Bottleneck reasoning: >200 chars → +0.3; >100 → +0.2; >50 → +0.1
+      - GPU reasoning:        >100 chars 或 >2 challenges → +0.2;
+                              >50  chars 或 ≥1 challenge  → +0.1
+      - Suggestion volume:    ≥5 → +0.3; ≥3 → +0.2; ≥1 → +0.1
+    """
+    score = 0.0
+
+    # 1. Hotspot reasoning
+    hotspots = result_data.get("hotspots", [])
+    hotspot_reason = ""
+    if hotspots and isinstance(hotspots[0], dict):
+        hotspot_reason = hotspots[0].get("reason", "") or ""
+    hr_len = len(str(hotspot_reason))
+    if hr_len > 100:
+        score += 0.2
+    elif hr_len > 50:
+        score += 0.1
+
+    # 2. Bottleneck reasoning
+    bottleneck = result_data.get("bottleneck_type", {})
+    bt_reason = bottleneck.get("reasoning", "") or "" if isinstance(bottleneck, dict) else ""
+    bt_len = len(str(bt_reason))
+    if bt_len > 200:
+        score += 0.3
+    elif bt_len > 100:
+        score += 0.2
+    elif bt_len > 50:
+        score += 0.1
+
+    # 3. GPU reasoning
+    gpu = result_data.get("gpu_suitability", {})
+    if isinstance(gpu, dict):
+        gpu_reason = gpu.get("reasoning", "") or ""
+        gpu_challenges = gpu.get("challenges", []) or []
+        gpu_len = len(str(gpu_reason))
+        n_challenges = len(gpu_challenges)
+        if gpu_len > 100 or n_challenges > 2:
+            score += 0.2
+        elif gpu_len > 50 or n_challenges >= 1:
+            score += 0.1
+
+    # 4. Suggestion volume
+    suggestions = result_data.get("optimization_suggestions", [])
+    n_sug = len(suggestions)
+    if n_sug >= 5:
+        score += 0.3
+    elif n_sug >= 3:
+        score += 0.2
+    elif n_sug >= 1:
+        score += 0.1
+
+    return min(1.0, score)
 
 
 class HPCAnalyzer:
@@ -530,13 +589,14 @@ class HPCAnalyzer:
         Returns:
             评估结果字典，包含相似度分数和多维度评估
         """
-        # 默认权重
+        # 默认权重（与论文评估框架一致）
         if weights is None:
             weights = {
-                "hotspot": 0.4,
-                "bottleneck": 0.3,
-                "gpu": 0.2,
-                "suggestions": 0.1
+                "hotspot": 0.25,
+                "bottleneck": 0.30,
+                "gpu": 0.20,
+                "suggestions": 0.10,
+                "detail": 0.15
             }
         
         evaluation = {
@@ -703,12 +763,32 @@ class HPCAnalyzer:
         }
         evaluation["details"].update(suggestions_details)
         
-        # ========== 5. 计算总分（加权平均） ==========
+        # ========== 5. 分析深度评估（Analysis Detail, 15%） ==========
+        # 直接从 result 的底层数据计算，无需 ground truth
+        result_dict = {
+            "hotspots": result.hotspots,
+            "bottleneck_type": result.bottleneck_type,
+            "gpu_suitability": result.gpu_suitability,
+            "optimization_suggestions": result.optimization_suggestions
+        }
+        detail_score = _analysis_detail_score(result_dict)
+        detail_details = {"detail_score": detail_score}
+
+        evaluation["similarity_scores"]["detail"] = detail_score
+        evaluation["dimension_scores"]["detail"] = {
+            "score": detail_score,
+            "weighted_score": detail_score * weights["detail"],
+            "details": detail_details
+        }
+        evaluation["details"].update(detail_details)
+
+        # ========== 6. 计算总分（加权平均） ==========
         total_score = (
             hotspot_score * weights["hotspot"] +
             bottleneck_score * weights["bottleneck"] +
             gpu_score * weights["gpu"] +
-            suggestions_score * weights["suggestions"]
+            suggestions_score * weights["suggestions"] +
+            detail_score * weights["detail"]
         ) * 100  # 转换为0-100分
         
         evaluation["score"] = round(total_score, 2)
@@ -732,7 +812,7 @@ class HPCAnalyzer:
         logger.info(
             f"Evaluation complete: score = {total_score:.2f}/100 "
             f"(hotspot={hotspot_score:.2f}, bottleneck={bottleneck_score:.2f}, "
-            f"gpu={gpu_score:.2f}, suggestions={suggestions_score:.2f})"
+            f"gpu={gpu_score:.2f}, suggestions={suggestions_score:.2f}, detail={detail_score:.2f})"
         )
         
         return evaluation

@@ -1,0 +1,134 @@
+{
+  "program": "abinit",
+  "source": "benchmarks/abinit/m_nonlop_ylm.F90",
+  "timestamp": "2026-03-09T18:40:05.516494",
+  "stage1": {
+    "model": "gpt-4o",
+    "bottleneck_type": "compute",
+    "hotspot_count": 3,
+    "gpu_suitable": true,
+    "eval_score": 80.22573710073709,
+    "cost": 0.048601
+  },
+  "stage2": {
+    "model": "gpt-5.2",
+    "bottleneck_corrected": true,
+    "corrected_type": "mixed (memory + compute) with dominant overhead from allocation/initialization and phase-factor generation; compute-bound only inside opernla/opernlb kernels for large npw",
+    "validation_reasoning": "从给出的 nonlop_ylm 源码看，热点 70% 落在 nonlop_ylm 本体并不等价于“纯计算瓶颈”。该例程在每个 (itypat, atom-block) 内反复 ABI_MALLOC/ABI_FREE 多个 4D/5D 临时数组并清零（gx/gxfac/dgxdt/d2gxdt/...），还可能反复调用 ph1d3d 生成 ph3d(in/out)。这些操作通常是内存带宽/延迟与分配器开销主导，且会破坏缓存与NUMA局部性。真正的高FLOP部分主要在 opernla_ylm/opernlb_ylm（投影与回写）以及 opernlc/opernld（小矩阵/张量收缩）内部；当 npw 很大时这些核可能偏 compute，但整体端到端更常见是 mixed。初步结论“compute-bound”为过度简化，需要用 roofline（FLOPs/byte）与硬件计数器（L2/L3 miss、mem BW、malloc 次数）验证。",
+    "num_optimizations": 6,
+    "cost": 0.08718325
+  },
+  "total_cost": 0.13578425,
+  "full_result": {
+    "code_name": "abinit",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "subroutine nonlop_ylm (line 300)",
+          "estimated_time_percentage": "70%",
+          "reason": "This subroutine contains multiple nested loops and complex operations, including memory allocations and deallocations, which are likely to consume a significant portion of the execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "call opernla_ylm (line 1050)",
+          "estimated_time_percentage": "15%",
+          "reason": "This function is called within a loop and involves complex operations related to non-local projectors, which are computationally intensive.",
+          "confidence": "medium"
+        },
+        {
+          "location": "call opernlb_ylm (line 1600)",
+          "estimated_time_percentage": "10%",
+          "reason": "Similar to opernla_ylm, this function is called within a loop and involves complex operations, contributing to a significant portion of the runtime.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the complex mathematical operations and nested loops that dominate the execution time."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves a large number of independent operations and data parallelism, which are well-suited for GPU acceleration.",
+        "recommended_approach": "Port the computationally intensive loops to CUDA or OpenCL, focusing on maximizing data parallelism and minimizing data transfer between CPU and GPU."
+      },
+      "cost": 0.048601
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "mixed (memory + compute) with dominant overhead from allocation/initialization and phase-factor generation; compute-bound only inside opernla/opernlb kernels for large npw",
+        "reasoning": "从给出的 nonlop_ylm 源码看，热点 70% 落在 nonlop_ylm 本体并不等价于“纯计算瓶颈”。该例程在每个 (itypat, atom-block) 内反复 ABI_MALLOC/ABI_FREE 多个 4D/5D 临时数组并清零（gx/gxfac/dgxdt/d2gxdt/...），还可能反复调用 ph1d3d 生成 ph3d(in/out)。这些操作通常是内存带宽/延迟与分配器开销主导，且会破坏缓存与NUMA局部性。真正的高FLOP部分主要在 opernla_ylm/opernlb_ylm（投影与回写）以及 opernlc/opernld（小矩阵/张量收缩）内部；当 npw 很大时这些核可能偏 compute，但整体端到端更常见是 mixed。初步结论“compute-bound”为过度简化，需要用 roofline（FLOPs/byte）与硬件计数器（L2/L3 miss、mem BW、malloc 次数）验证。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "nonlop_ylm: 反复 ABI_MALLOC/ABI_FREE + 大数组清零导致的开销与缓存抖动",
+          "technique": "引入持久化工作区(workspace)与按需清零；将临时数组提升到外层复用；用“脏标记/分段清零”替代全量置零",
+          "code_changes": "1) 在 module 级或通过新增 derived type workspace 传入：缓存 gx/gxfac/dgxdt/d2gxdt/dgxdtfac/d2gxdtfac 以及 *_sij、cplex_dgxdt/cplex_d2gxdt、sij_typ 等。\n2) 以最大尺寸一次性分配：max_nlmn=max over types, max_nincat=mincat, max_ndgxdt/max_nd2gxdt/max_ndgxdtfac/max_nd2gxdtfac（由 choice/signs 决定）。\n3) 每个 block 仅对实际使用的切片清零：例如 gx(:,1:nlmn,1:nincat,1:nspinor)=0；对 ndgxdt==0 的数组不触碰。\n4) 对 dgxdt/d2gxdt 等可用“写入覆盖”的路径，删除预清零（依赖 opernla_ylm 是否完全写满；若不完全写满则用 per-derivative/per-lmn 的局部清零）。\n5) 将 sij_typ 的 ABI_MALLOC/ABI_FREE 移到 itypat 循环外：每个 itypat 分配一次并复用到所有 block。",
+          "expected_speedup": "1.2x-2.0x（取决于 mincat、nlmn、nd* 维度与 malloc 实现；在小/中等 npw、频繁调用场景更明显）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "nonlop_ylm: ph1d3d 结构因子/相位因子重复计算",
+          "technique": "相位因子缓存与跨 band/调用复用；将 ph3d 计算与 nonlop 调用解耦；或在 nloalg(2)>0 时强制走预计算路径",
+          "code_changes": "1) 若同一 k 点/同一 (ia3:ia4) block 在多个 band 上重复调用 nonlop_ylm：将 ph1d3d 移到更外层（band 循环外），并通过标志位表明 ph3din/ph3dout 已就绪。\n2) 在 nonlop_ylm 内部：当 nloalg(2)<=0 时才算 ph3d；建议新增缓存键 (kpt, ia3, ia4, npw, matblk) 并避免重复。\n3) 若内存允许，直接存储 ph3d for all atoms（或按 type 分块）以减少重复生成。",
+          "expected_speedup": "1.1x-1.5x（强依赖 band 数与是否重复调用；多 band 时收益大）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "opernla_ylm (15%): 投影 <p|c> 计算（npw×nlmn×nincat×nspinor）",
+          "technique": "选择更高效实现路径（mv / mv-dgemv / native）+ 批处理成 GEMM；向量化与数据布局优化",
+          "code_changes": "1) 优先使用 opernla_ylm_mv_dgemv 或将 native 内核改为 GEMM：把 (npw) 维作为 K，把 (nlmn*nincat*nspinor) 作为 N，形成 C = A^H * B 形式（或分块）。\n2) 调参 nloalg(1)：在大 npw 时倾向 dgemv/gemm 路径；在小 npw 或 nlmn 很小则 native 可能更好。建议加入基于 (npw, nlmn, nincat) 的自适应选择。\n3) 确保 ffnlin_typ、ph3din、vectin 在内核访问方向上连续：Fortran 列主序下，尽量让最内层循环走第1维（npw）连续；必要时对 ffnlin 维度重排为 ffnlin(lmn,npw,der) 或引入转置缓存。\n4) 在 opernla 内部用 do concurrent / OpenMP SIMD 指令提示编译器向量化；对复数乘加使用 FMA 友好形式（拆成 re/im 两路）。",
+          "expected_speedup": "1.2x-2.5x（取决于是否能从 dgemv 升级到 gemm，以及缓存命中；大体系更高）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "opernlb_ylm (10%): 回写 |out> += Σ |p> * coeff 的散射累加",
+          "technique": "批处理/分块减少对 vectout 的写放大；使用线程私有缓冲 + 归约；或改为 GEMM + 后处理",
+          "code_changes": "1) 将对 vectout 的更新按 G 向量分块（tile npwout），在 L2/L3 可容纳的块内累加，减少反复写回。\n2) OpenMP 并行时避免多个线程对同一 vectout 元素原子加：采用 thread-private partial vectout(tile) 后做 reduction（或按 G 分配线程，保证无冲突）。\n3) 若走 mv-dgemv 路径，尝试把多个 (ia, lmn, spinor) 合并成更宽的矩阵乘，提升算术强度。",
+          "expected_speedup": "1.1x-2.0x（取决于并行冲突与写带宽；多线程/NUMA 下更明显）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "nonlop_ylm: cpopt==4/2 路径中大量小拷贝与分支（gx/dgxdt 从 cprjin 取回）",
+          "technique": "减少数据搬运：直接指针/视图绑定；合并分支；预计算 ishift/idir 映射表",
+          "code_changes": "1) 对 cprjin(iatm+ia,ispinor)%cp/dcp 若内存布局允许，使用指针关联到 gx/dgxdt 的切片（避免显式拷贝）。\n2) 将 choice/idir 到 (idir1,idir2,ishift) 的逻辑提到循环外，生成小表 map(ii)->(src_deriv_index, cplex_index)，内层仅按表拷贝。\n3) 对 cplex==2 与 cplex==1 两套代码，尽量统一为“re/im 两通道”实现，减少分支与指令缓存压力。",
+          "expected_speedup": "1.05x-1.3x（主要减少前后处理开销；对小 npw 更显著）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "nonlop_ylm: gmet/work* 多次 ABI_MALLOC/ABI_FREE（choice 5/51/52/54/55/8/81/6 等）",
+          "technique": "栈上小数组/自动数组或持久化小工作区；避免 reshape 临时大数组",
+          "code_changes": "1) 将 work1..work7、gmet 改为 automatic arrays（若编译器/栈允许）或复用 workspace 中的小缓冲。\n2) choice==6 中 work3(6+3*natom,6) 可能很大：避免 reshape 生成大临时，改为显式索引访问 enlout 一维数组，或分块处理 6 列转换，减少峰值内存与带宽。\n3) 对 MATMUL(TRANSPOSE(gprimd),gprimd) 用手写 3x3 乘法，避免通用 MATMUL 开销。",
+          "expected_speedup": "1.02x-1.2x（依赖 choice 分布；对 choice==6/55 等重路径更明显）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将非局域算符应用拆成两阶段并在 GPU 上批处理：\n(1) Projection: 对每个 atom-block/type 计算 gx = <p|vectin>（opernla）。\n(2) Contraction: gxfac = D * gx（opernlc，小矩阵/批量小GEMM）。\n(3) Scatter-back: vectout += |p> * gxfac（opernlb）。\n并行粒度：以 (G 向量, atom in block, lmn, spinor, derivative) 展开；优先让线程块覆盖 G 维以获得连续内存访问。",
+        "data_layout": "1) 将复数改为 SoA：re/im 分离数组（当前 cplex 维在最前，已接近 SoA，但需保证连续访问）。\n2) 重新组织 ffnlin/ffnlout 使得 GPU 内核最内层沿 G 连续：建议布局为 ffnl(reim, G, lmn, type, der) 或 ffnl(G, lmn, ...) 并保证 G 为最快变维。\n3) ph3d(in/out) 也应以 G 为最快变维并常驻 GPU；若 ph3d 可由简单相位递推生成，考虑在 GPU 端按需生成以减少 PCIe/内存占用。\n4) gx/gxfac 等中间量放 GPU 全局内存，按 (lmn, atom, spinor, reim) 紧凑排列，便于后续小矩阵批处理。",
+        "challenges": [
+          "vectout 的散射累加写冲突：需要按 G 分配线程避免冲突，或使用分块私有累加后归约；原子加会显著降速",
+          "小矩阵 D_ij（nlmn 通常不大）批量乘法效率：需要使用 batched GEMM（cuBLASLt/rocBLAS）或自写 warp-level kernel；否则算力利用率低",
+          "频繁的 choice/cpopt 分支导致 kernel 发散：建议按 (choice, signs, paw_opt, cplex) 预编译/分派专用 kernel，或在 CPU 端分组批处理",
+          "数据驻留与调用频率：若每个 band 都调用，必须让 vectin/ffnl/ph3d 常驻 GPU，避免反复 H2D/D2H；同时需要与 MPI 并行的 GPU-aware 通信配合"
+        ],
+        "expected_speedup": "端到端 2x-8x（取决于 npw、band 数、是否能避免数据搬运、以及 vectout 写冲突处理质量）；仅对 opernla/opernlb 核心计算部分可达 5x-20x 的加速潜力"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "估计范围：0.2-2.0 FLOPs/byte（端到端）；其中 opernla/opernlb 内核在大 npw、良好复用 ph3d/ffnl 时可达 ~1-3 FLOPs/byte，但 nonlop_ylm 的分配/清零/拷贝阶段接近 0 FLOPs/byte，显著拉低整体算术强度",
+        "cache_behavior": "1) gx/gxfac/dgxdt/... 为 (cplex, nd*, nlmn, nincat, nspinor) 多维数组，按 block 反复分配与全量清零会造成写分配(write-allocate)与缓存污染，挤出 ph3d/ffnl/vect 数据。\n2) ph3din/ph3dout 体积为 (2,npw,matblk)，npw 大时远超 LLC，若每个 block 重新生成/访问，呈流式读写，易受内存带宽限制。\n3) vectout 更新是典型“读-改-写”大数组，若并行不当会出现伪共享/写竞争；即使无竞争也会因写回带宽成为瓶颈。\n4) enl/sij_typ 等小数组可常驻缓存，但当前实现中 sij_typ 每 type 分配/拷贝一次仍有不必要开销。",
+        "data_dependencies": [
+          "vectout/ svectout 在 opernlb_ylm 中为累加更新（reduction dependency）；并行化需避免写冲突或使用分块归约",
+          "enlout 在 opernld_ylm 中为累加（reduction dependency），MPI/线程层面需要规约；当前仅在 spinor 并行时做 xmpi_sum",
+          "cprjin%cp/dcp 的复用依赖 cpopt 语义：cpopt>=2 读取历史投影，cpopt==0/1/3 写回；错误的并行/异步会破坏一致性"
+        ]
+      },
+      "cost": 0.08718325
+    },
+    "total_cost": 0.13578425
+  }
+}
