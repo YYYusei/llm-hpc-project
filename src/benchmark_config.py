@@ -168,7 +168,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
                     r"fourier.*transform"
                 ],
                 time_percentage=40.7,  # VTune: 3.991s / 9.799s
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: FFT memory-bandwidth bound at this problem size
                 loop_keywords=["fft loop", "butterfly", "radix", "y-direction"],
                 memory_patterns=["stride access", "complex multiply", "twiddle factors"]
             ),
@@ -179,7 +179,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
                     r"fft.*x"
                 ],
                 time_percentage=15.8,  # VTune: 1.550s / 9.799s
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: FFT memory-bandwidth bound
                 loop_keywords=["fft loop", "x-direction", "plane"],
                 memory_patterns=["stride access", "complex multiply"]
             ),
@@ -190,7 +190,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
                     r"fft.*one"
                 ],
                 time_percentage=11.2,  # VTune: 1.101s / 9.799s
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: FFT dispatch, memory-bound
                 loop_keywords=["fft dispatch", "fft scheduler"],
                 memory_patterns=["work array", "buffer management"]
             ),
@@ -201,7 +201,7 @@ BENCHMARK_DEFINITIONS: Dict[str, BenchmarkDefinition] = {
                     r"kernel.*generation"
                 ],
                 time_percentage=6.4,  # VTune: 0.632s / 9.799s
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: kernel generation, memory-bound
                 loop_keywords=["kernel loop", "plane wave loop", "g-vector"],
                 memory_patterns=["reciprocal space", "form factors"]
             ),

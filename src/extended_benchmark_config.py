@@ -27,7 +27,7 @@ EXTENDED_DEFINITIONS = {
                     r"stencil", r"temperature"
                 ],
                 time_percentage=85.0,
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: 5-point stencil, AI ~0.3 FLOPs/byte, memory-bandwidth bound
                 loop_keywords=["inner loop", "i loop", "j loop", "stencil loop", "grid loop"],
                 memory_patterns=["2D grid", "5-point stencil", "regular access"]
             ),
@@ -63,7 +63,7 @@ EXTENDED_DEFINITIONS = {
                     r"compute.*coefficient", r"anisotropic"
                 ],
                 time_percentage=78.0,
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: memory-bandwidth bound, AI <0.3 FLOPs/byte
                 loop_keywords=["pixel loop", "i loop", "j loop", "diffusion loop"],
                 memory_patterns=["2D image", "neighbor access", "gradient computation"]
             ),
@@ -99,7 +99,7 @@ EXTENDED_DEFINITIONS = {
                     r"anti.*hourglass"
                 ],
                 time_percentage=45.0,
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: memory + sync/atomics, indirect gather/scatter
                 loop_keywords=["element loop", "mode loop", "node loop", "hourglass mode"],
                 memory_patterns=["gather/scatter", "indirect indexing", "element connectivity"]
             ),
@@ -110,7 +110,7 @@ EXTENDED_DEFINITIONS = {
                     r"strain.*rate"
                 ],
                 time_percentage=25.0,
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: indirect gather, memory-latency bound
                 loop_keywords=["element loop", "cross product", "triple product"],
                 memory_patterns=["gather from nodes", "indirect indexing"]
             ),
@@ -118,7 +118,7 @@ EXTENDED_DEFINITIONS = {
                 name="CalcPressureForElems",
                 location_patterns=[r"pressure", r"CalcPressure", r"equation.*state"],
                 time_percentage=10.0,
-                bottleneck_type="compute",
+                bottleneck_type="memory",  # VTune: streaming access, low AI
                 loop_keywords=["element loop"],
                 memory_patterns=["contiguous access"]
             )
