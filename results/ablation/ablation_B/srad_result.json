@@ -1,0 +1,108 @@
+{
+  "program": "srad",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck": "memory",
+  "s1_score": 71.03846153846155,
+  "s1_gpu_suitable": true,
+  "s2_corrected": false,
+  "s2_type": "N/A",
+  "s2_reasoning": "The initial analysis correctly identifies the memory bottleneck due to the large temporary arrays and their poor cache reuse. The arithmetic operations, while non-trivial, are not sufficient to hide the memory latency, confirming that the performance is limited by memory bandwidth.",
+  "s2_gpu_suitable": true,
+  "cost": 0.043204,
+  "full_result": {
+    "code_name": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "srad_kernel(): Phase 1 diffusion coefficient computation loop (k loop body, nested i/j loops; approx lines 70-130)",
+          "estimated_time_percentage": "55-65%",
+          "reason": "Executed rows*cols*niter times; high arithmetic intensity per pixel (multiple neighbor loads, 4 gradient computations, several divisions, repeated image[idx] use, branches for boundaries, and coefficient clamping). Also writes 5 full-size arrays (dN/dS/dW/dE/c), creating large memory traffic.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel(): Phase 2 image update/divergence loop (k loop body, nested i/j loops; approx lines 140-175)",
+          "estimated_time_percentage": "30-40%",
+          "reason": "Executed rows*cols*niter times; streams through d* and c arrays and updates image. Significant memory bandwidth demand (multiple loads from large arrays + store to image) with relatively modest compute per element.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel(): per-iteration boundary handling inside both phases (iN/iS/jW/jE clamping; approx lines 80-95 and 150-160)",
+          "estimated_time_percentage": "3-8%",
+          "reason": "Branching and extra integer ops in the innermost loops inhibit vectorization and add overhead; although small relative to total, it impacts achievable throughput and SIMD efficiency.",
+          "confidence": "medium"
+        },
+        {
+          "location": "compute_statistics() (approx lines 205-225), called twice",
+          "estimated_time_percentage": "1-4%",
+          "reason": "Two full passes over the image with reductions; minor compared to SRAD iterations but still a full memory sweep.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "Despite nontrivial arithmetic, the implementation materializes and streams multiple full-size temporary arrays (dN/dS/dW/dE/c) every iteration. For 2048^2 doubles, each array is ~32 MiB; five arrays plus image cause large per-iteration bandwidth pressure and poor cache reuse (Phase 1 writes d* and c; Phase 2 rereads them). The arithmetic (divides/mults) is not enough to hide the memory traffic on typical CPUs, making sustained performance largely limited by memory bandwidth and cache behavior. Phase 1 has some compute pressure, but overall runtime is dominated by moving these arrays."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation is a regular 2D stencil-like pattern with per-pixel independent work within each iteration (given the previous iteration’s image). It has high parallelism (millions of pixels) and predictable memory access. The main challenge is memory bandwidth and handling boundaries; GPUs are well-suited for bandwidth-heavy stencils when using coalesced accesses and shared-memory tiling.",
+        "recommended_approach": "Use two CUDA/HIP kernels per iteration (or one fused kernel with shared-memory tiling): (1) compute c (and optionally gradients) from image, (2) update image using c and gradients. Prefer fusing to reduce global memory traffic: load an image tile with halo into shared memory, compute gradients and c, then compute D and write updated image. Use double buffering (ping-pong) for image between iterations to avoid read-after-write hazards. Handle boundaries with separate kernels or conditional checks. Consider float for higher throughput if accuracy permits."
+      },
+      "cost": 0.030667
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the large temporary arrays and their poor cache reuse. The arithmetic operations, while non-trivial, are not sufficient to hide the memory latency, confirming that the performance is limited by memory bandwidth."
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Phase 1 diffusion coefficient computation",
+          "technique": "Loop blocking and array fusion",
+          "code_changes": "Implement loop blocking to improve cache reuse by processing smaller blocks of the image at a time. Fuse the computation of gradients and diffusion coefficients to reduce the number of temporary arrays.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Phase 2 image update",
+          "technique": "Loop unrolling and vectorization",
+          "code_changes": "Unroll the inner loops and use SIMD instructions to perform multiple updates in parallel. This can be achieved using compiler pragmas or intrinsic functions.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Boundary handling",
+          "technique": "Precompute boundary indices",
+          "code_changes": "Precompute the boundary indices outside the main loops to avoid redundant calculations during each iteration.",
+          "expected_speedup": "Minimal, but reduces overhead",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use a 2D grid of threads where each thread computes the diffusion coefficient and updates the image for a single pixel. Employ shared memory to store tile data for improved memory access patterns.",
+        "data_layout": "Use a row-major layout for the image and temporary arrays to ensure coalesced memory accesses.",
+        "challenges": [
+          "Handling boundary conditions efficiently.",
+          "Managing shared memory usage to avoid bank conflicts."
+        ],
+        "expected_speedup": "5x - 10x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.25 FLOPs/byte",
+        "cache_behavior": "The current implementation suffers from poor cache reuse due to the large size of temporary arrays and their streaming access pattern. Loop blocking and fusion can help improve cache locality.",
+        "data_dependencies": [
+          "Phase 1 depends on the previous iteration's image data.",
+          "Phase 2 depends on the diffusion coefficients computed in Phase 1."
+        ]
+      },
+      "cost": 0.012537
+    },
+    "total_cost": 0.043204
+  }
+}

@@ -1,0 +1,121 @@
+{
+  "program": "jacobi2d",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck": "memory",
+  "s1_score": 84.50000000000001,
+  "s1_gpu_suitable": true,
+  "s2_corrected": false,
+  "s2_type": "N/A",
+  "s2_reasoning": "The initial analysis correctly identifies the memory-bound nature of the Jacobi kernel due to its low arithmetic intensity (0.10 FLOPs/byte) and high memory traffic. The working set size exceeds typical cache sizes, confirming that performance is limited by DRAM bandwidth.",
+  "s2_gpu_suitable": true,
+  "cost": 0.0412405,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel(): forward sweep A->B inner loops (t/i/j), approx lines 55-70",
+          "estimated_time_percentage": "45%",
+          "reason": "Dominant O(TSTEPS*N^2) work; 5-point stencil has very low arithmetic intensity and streams through large arrays, causing sustained high memory bandwidth demand and cache capacity misses.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel(): backward sweep B->A inner loops (t/i/j), approx lines 77-92",
+          "estimated_time_percentage": "45%",
+          "reason": "Same cost profile as forward sweep; second full-grid pass per timestep doubles memory traffic (read 5 values + write 1 per point) and remains bandwidth-limited.",
+          "confidence": "high"
+        },
+        {
+          "location": "compute_residual(): nested loops + sqrt, approx lines 118-134 (called twice)",
+          "estimated_time_percentage": "6%",
+          "reason": "Full-grid traversal with multiple loads per point and a reduction; less frequent than jacobi_kernel but still large N^2 memory streaming and limited vectorization/reduction overhead.",
+          "confidence": "medium"
+        },
+        {
+          "location": "compute_checksum(): nested loops reduction, approx lines 143-151",
+          "estimated_time_percentage": "2%",
+          "reason": "Full-grid streaming sum; reduction can limit SIMD efficiency and is memory-bandwidth dominated, but executed once.",
+          "confidence": "medium"
+        },
+        {
+          "location": "init_array(): nested loops initialization, approx lines 98-109",
+          "estimated_time_percentage": "2%",
+          "reason": "One-time O(N^2) initialization; mostly memory stores with some integer/FP ops, negligible compared to TSTEPS sweeps.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The stencil update performs ~5 FLOPs per grid point while moving ~48 bytes (5 loads + 1 store of doubles) per point, yielding ~0.10 FLOPs/byte. With N=4096 the working set (~256 MB for two grids) far exceeds cache, so performance is limited by sustained DRAM bandwidth rather than compute throughput. No inter-process communication is present."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi update is embarrassingly parallel within each sweep, has regular memory access, and is primarily bandwidth-bound—matching GPU strengths (high memory bandwidth, massive parallelism). The working set is large but fits in GPU memory on most modern devices; performance will be limited by global memory bandwidth and kernel launch overhead is amortized over large N^2.",
+        "recommended_approach": "Port jacobi_kernel to CUDA/HIP or use OpenMP target offload. Use two device arrays (A,B) and launch one kernel per sweep (or one kernel per timestep with two phases). Use 2D thread blocks (e.g., 32x8 or 16x16), coalesced accesses along j, and consider shared-memory tiling to reuse neighbor data within a block (load a tile with 1-cell halo). Keep A/B resident on device for all timesteps; only copy back for residual/checksum (or compute those on GPU with parallel reductions)."
+      },
+      "cost": 0.028565249999999997
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory-bound nature of the Jacobi kernel due to its low arithmetic intensity (0.10 FLOPs/byte) and high memory traffic. The working set size exceeds typical cache sizes, confirming that performance is limited by DRAM bandwidth."
+      },
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel()",
+          "technique": "Loop Tiling",
+          "code_changes": "Introduce loop tiling to improve cache reuse. For example, use a tile size of 32x32 to fit into L1 cache.",
+          "expected_speedup": "1.2x to 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel()",
+          "technique": "SIMD Vectorization",
+          "code_changes": "Use compiler pragmas or intrinsics to vectorize the inner loops. Ensure data alignment for optimal SIMD performance.",
+          "expected_speedup": "1.5x to 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel()",
+          "technique": "Prefetching",
+          "code_changes": "Use software prefetching to bring data into cache before it is needed, reducing cache miss penalties.",
+          "expected_speedup": "1.1x to 1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "compute_residual()",
+          "technique": "Loop Unrolling",
+          "code_changes": "Unroll the inner loop to reduce loop overhead and increase instruction-level parallelism.",
+          "expected_speedup": "1.1x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use CUDA or OpenCL to parallelize the outer loops (t/i) across GPU threads, with each thread handling a portion of the grid.",
+        "data_layout": "Use a 2D grid of thread blocks, with each block handling a tile of the grid to maximize coalesced memory access.",
+        "challenges": [
+          "Managing boundary conditions efficiently",
+          "Ensuring coalesced memory access for optimal bandwidth utilization"
+        ],
+        "expected_speedup": "10x to 50x, depending on GPU architecture and memory bandwidth"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.10 FLOPs/byte",
+        "cache_behavior": "The working set size (~256 MB) exceeds typical L3 cache sizes, leading to frequent cache misses and reliance on DRAM bandwidth.",
+        "data_dependencies": [
+          "No data dependencies within each sweep of jacobi_kernel()",
+          "compute_residual() has dependencies due to accumulation"
+        ]
+      },
+      "cost": 0.01267525
+    },
+    "total_cost": 0.0412405
+  }
+}

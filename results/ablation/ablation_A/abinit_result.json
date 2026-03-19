@@ -1,0 +1,78 @@
+{
+  "program": "abinit",
+  "config": "Ablation A (5.2→5.2)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck": "memory",
+  "s1_score": 69.57463144963144,
+  "s1_gpu_suitable": true,
+  "s2_corrected": false,
+  "s2_type": "N/A",
+  "s2_reasoning": "",
+  "s2_gpu_suitable": "unknown",
+  "cost": 0.1708,
+  "full_result": {
+    "code_name": "abinit",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "nonlop_ylm: call opernla_ylm/opernla_ylm_mv inside atom-type/block loops (around 'Compute projection <p_lmn|c>')",
+          "estimated_time_percentage": "35-55%",
+          "reason": "Dominant O(npwin * nlmn * nincat * nspinor) work: builds projector overlaps using plane-wave data (vectin, ph3din, ffnlin). High arithmetic plus heavy streaming of large arrays; executed for each atom block and type, and often recomputed depending on cpopt/choice.",
+          "confidence": "high"
+        },
+        {
+          "location": "nonlop_ylm: call opernlb_ylm/opernlb_ylm_mv inside atom-type/block loops (around 'Operate with the non-local potential ... get matrix element', signs==2 path)",
+          "estimated_time_percentage": "25-45%",
+          "reason": "Dominant O(npwout * nlmn * nincat * nspinor) scatter/add to vectout/svectout using phase factors and form factors. Typically memory-bandwidth limited due to large vectout updates and poor cache reuse; also sensitive to atom blocking and layout.",
+          "confidence": "high"
+        },
+        {
+          "location": "nonlop_ylm: call opernlc_ylm inside atom-type/block loops (around 'Contraction from <p_i|c> to Sum_j[Dij.<p_j|c>]')",
+          "estimated_time_percentage": "10-20%",
+          "reason": "Small dense contractions per atom block: applies Dij/Sij (size ~nlmn^2) to gx and derivatives. For PAW (paw_opt>0) this can be significant; tends to be compute-bound for larger nlmn but can be limited by repeated loads/stores of gx/gxfac/dgxdt* arrays.",
+          "confidence": "medium"
+        },
+        {
+          "location": "nonlop_ylm: call ph1d3d for in/out phase factors when nloalg(2)<=0 (inside block loops)",
+          "estimated_time_percentage": "5-15%",
+          "reason": "Recomputes 3D structure factors ph3din/ph3dout for each atom block and for both in/out paths. Cost scales with npw* nincat and involves transcendental/complex phase generation and large memory writes.",
+          "confidence": "medium"
+        },
+        {
+          "location": "nonlop_ylm: repeated ABI_MALLOC/ABI_FREE of gx/gxfac/dgxdt/... per atom block",
+          "estimated_time_percentage": "3-10%",
+          "reason": "Frequent dynamic allocations in the innermost block loop cause allocator overhead, potential synchronization, and loss of NUMA locality; also forces repeated zero-initialization of large temporary arrays.",
+          "confidence": "high"
+        },
+        {
+          "location": "nonlop_ylm: MPI reductions xmpi_sum on enlout/enlk/fnlk/strnlk/ddkk (end of routine, signs==1 & paral_spinor==1)",
+          "estimated_time_percentage": "1-8%",
+          "reason": "Collective reductions can become noticeable at scale, especially if called per band/k-point frequently; latency-bound and may serialize if small messages but many calls.",
+          "confidence": "low"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The dominant kernels (projection opernla_* and application opernlb_*) stream large plane-wave arrays (vectin/vectout, ph3d*, ffnl*) with limited temporal reuse, and perform many scattered updates to output vectors. Arithmetic intensity is moderate, but bandwidth and cache behavior (plus repeated zeroing/allocation) typically limit performance. Some subparts (opernlc_ylm dense contractions) can be compute-bound for large nlmn, but overall runtime is usually governed by memory traffic."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The dominant work is large, regular linear-algebra-like operations over plane waves and projector channels (opernla/opernlb), with high parallelism over npw, atoms, lmn, and spinors. Although memory-bound, GPUs can provide much higher bandwidth and can hide latency with massive threading. The main challenges are data layout, minimizing host-device transfers, and handling reductions/accumulations efficiently.",
+        "recommended_approach": "Keep vectin/vectout, ph3d*, ffnl* resident on GPU for the full band/k-point loop. Implement opernla/opernlb as CUDA/HIP kernels or via cuBLAS/rocBLAS (prefer GEMM/batched GEMM). Use GPU-friendly atom-block tiling; compute phases on GPU (or precompute once and reuse). For vectout accumulation, use block-level reductions or segmented reductions to avoid atomics; if necessary, accumulate into per-block temporary buffers then launch a reduction kernel. Overlap MPI with GPU using CUDA-aware MPI and streams."
+      },
+      "cost": 0.07231525
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "detailed_optimizations": [],
+      "gpu_implementation": {},
+      "performance_analysis": {},
+      "cost": 0.09848475
+    },
+    "total_cost": 0.1708
+  }
+}

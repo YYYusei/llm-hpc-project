@@ -1,0 +1,60 @@
+{
+  "program": "lulesh",
+  "config": "Ablation A (5.2→5.2)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck": "memory",
+  "s1_score": 72.41666666666667,
+  "s1_gpu_suitable": true,
+  "s2_corrected": false,
+  "s2_type": "N/A",
+  "s2_reasoning": "",
+  "s2_gpu_suitable": "unknown",
+  "cost": 0.09808049999999999,
+  "full_result": {
+    "code_name": "lulesh",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "CalcFBHourglassForceForElems(): element loop i=0..numElem-1, especially inner loop mode=0..3 and scatter to fx/fy/fz (approx lines 150-235)",
+          "estimated_time_percentage": "50-65%",
+          "reason": "Highest work per element: 4 hourglass modes with multiple dot-products and per-node force accumulation; additionally performs indirect gather of 8 node velocities and indirect scatter-add to 3 global force arrays (poor locality, inhibits vectorization, creates write conflicts under threading).",
+          "confidence": "high"
+        },
+        {
+          "location": "CalcKinematicsForElems(): element loop k=0..numElem-1 including gather of x/y/z and xd/yd/zd and volume/gradient math (approx lines 45-135)",
+          "estimated_time_percentage": "20-35%",
+          "reason": "Per-element indirect gathers of 6 node fields (x,y,z,xd,yd,zd) plus substantial arithmetic (cross products, determinant, strain-rate terms). Indirect access reduces cache efficiency and limits SIMD; arithmetic intensity is moderate but dominated by gather latency on CPUs.",
+          "confidence": "high"
+        },
+        {
+          "location": "CalcPressureForElems(): loop i=0..numElem-1 (not called in main, but would be a minor hotspot if included) (approx lines 240-260)",
+          "estimated_time_percentage": "0-5%",
+          "reason": "Simple per-element scalar math with branches and fabs; typically much cheaper than kinematics/hourglass and likely memory-latency limited if arrays are large.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "Although the hourglass kernel has heavy FP operations, overall performance is dominated by indirect gather/scatter on node-based arrays (xd/yd/zd reads; fx/fy/fz read-modify-write). These accesses have poor spatial locality, low effective bandwidth utilization, and (in parallel) require atomics or coloring, which further reduces throughput. The kinematics kernel similarly suffers from indirect gathers of multiple fields. Net effect: memory-latency/bandwidth and irregular access dominate more than peak FLOP capability."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "Element-wise parallelism is abundant (NUM_ELEMS independent computations), and the hourglass/kinematics math maps well to GPU threads. The main challenge is the indirect node scatter (fx/fy/fz) causing write conflicts and non-coalesced memory access; without restructuring, atomics can dominate and reduce speedup.",
+        "recommended_approach": "Use an element-parallel kernel to compute per-element nodal force contributions into a temporary array (elemForce[numElem][8][3]) in global memory (coalesced by element). Then launch a node-parallel reduction kernel using a precomputed node-to-element adjacency (CSR) to sum contributions for each node without atomics (or with limited atomics). Alternatively, use mesh coloring on GPU (few colors for hex meshes) and run one kernel per color to allow direct scatter without atomics. Keep gamma in constant memory, use SoA for x/y/z/xd/yd/zd/fx/fy/fz, and aim for coalesced loads by reordering elements/nodes."
+      },
+      "cost": 0.0321755
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "detailed_optimizations": [],
+      "gpu_implementation": {},
+      "performance_analysis": {},
+      "cost": 0.06590499999999999
+    },
+    "total_cost": 0.09808049999999999
+  }
+}

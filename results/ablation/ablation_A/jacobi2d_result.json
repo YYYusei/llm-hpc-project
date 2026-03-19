@@ -1,0 +1,145 @@
+{
+  "program": "jacobi2d",
+  "config": "Ablation A (5.2→5.2)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck": "memory",
+  "s1_score": 84.50000000000001,
+  "s1_gpu_suitable": true,
+  "s2_corrected": false,
+  "s2_type": "N/A",
+  "s2_reasoning": "主耗时在 jacobi_kernel 两个二维 stencil sweep（约 90%）是合理的；该 5-point Jacobi 每点仅少量 FLOPs，但需要从内存流入/流出大量数据，且 2*N*N*8=256MB 工作集远超 LLC，时间步之间会反复流式访问 DRAM，典型带宽受限。需要补充的一点：按“DRAM 口径”计算时，写分配(RFO)会让 store 产生额外读流量；若未使用 non-temporal store，实际字节/点可能接近 56B（5 load=40B + store RFO+write=16B），算术强度更低，因此 memory-bound 判断更稳。",
+  "s2_gpu_suitable": true,
+  "cost": 0.07086975,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel(): forward sweep A->B nested loops (for i=1..n-2, for j=1..n-2), approx lines 55-69",
+          "estimated_time_percentage": "45%",
+          "reason": "Executes (n-2)^2 updates per timestep with 5 loads + 1 store per point and very low arithmetic intensity; working set far exceeds cache so most accesses stream from/to DRAM.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel(): backward sweep B->A nested loops (for i=1..n-2, for j=1..n-2), approx lines 77-90",
+          "estimated_time_percentage": "45%",
+          "reason": "Same stencil and memory traffic as forward sweep; second full-grid pass per timestep doubles DRAM bandwidth demand.",
+          "confidence": "high"
+        },
+        {
+          "location": "compute_residual(): nested loops + sqrt reduction, approx lines 118-134 (called twice)",
+          "estimated_time_percentage": "6%",
+          "reason": "Full-grid read with 5-point stencil and a reduction; still memory-heavy but only executed twice, so much smaller total cost than the 2*TSTEPS stencil sweeps.",
+          "confidence": "medium"
+        },
+        {
+          "location": "compute_checksum(): nested loops reduction, approx lines 143-151",
+          "estimated_time_percentage": "2%",
+          "reason": "Streams through entire array once; purely memory bandwidth + scalar reduction overhead.",
+          "confidence": "medium"
+        },
+        {
+          "location": "init_array(): initialization nested loops, approx lines 97-106",
+          "estimated_time_percentage": "2%",
+          "reason": "One-time full-grid writes to A and B; negligible compared to 1000 full-grid stencil passes.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The dominant work is the 5-point Jacobi stencil executed 2*(TSTEPS) times over a large 4096^2 grid. Each update performs ~5 FLOPs but moves ~48 bytes (5 loads + 1 store of doubles), giving ~0.10 FLOPs/byte, far below typical machine balance. The working set (~2*4096^2*8 ≈ 256 MB) exceeds cache, so performance is limited by sustained DRAM bandwidth rather than compute."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi update is a regular, massively parallel 2D stencil with no intra-iteration dependencies and predictable memory access. GPUs can provide much higher memory bandwidth than CPUs, which is the limiting factor here. The main caveat is that performance will still be bandwidth-bound, so the implementation must be optimized for coalesced access and cache/shared-memory reuse.",
+        "recommended_approach": "Port jacobi_kernel to CUDA/HIP/SYCL: launch a 2D grid of threads over (i,j) for each sweep, using two device arrays (ping-pong). Use a fused kernel per sweep (or two kernels per timestep) with coalesced row-major access; consider using shared memory to stage a tile with halo (e.g., (Tx+2)x(Ty+2)) to reduce global loads for neighbor accesses. Keep A/B resident on device for all timesteps; only copy back final A for residual/checksum (or compute those on GPU too). Use streams and avoid host-device transfers inside the timestep loop."
+      },
+      "cost": 0.028327249999999998
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "主耗时在 jacobi_kernel 两个二维 stencil sweep（约 90%）是合理的；该 5-point Jacobi 每点仅少量 FLOPs，但需要从内存流入/流出大量数据，且 2*N*N*8=256MB 工作集远超 LLC，时间步之间会反复流式访问 DRAM，典型带宽受限。需要补充的一点：按“DRAM 口径”计算时，写分配(RFO)会让 store 产生额外读流量；若未使用 non-temporal store，实际字节/点可能接近 56B（5 load=40B + store RFO+write=16B），算术强度更低，因此 memory-bound 判断更稳。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel: A->B sweep（45%）与 B->A sweep（45%）整体带宽效率",
+          "technique": "指针交换(ping-pong)替代第二个 sweep；每个时间步只做一次 stencil",
+          "code_changes": "将 jacobi_kernel 改为每步只计算 dst=stencil(src)，然后 swap(src,dst)。示例：\n\nvoid jacobi_kernel(int tsteps,int n,double* A,double* B){\n  double *src=A,*dst=B;\n  for(int t=0;t<tsteps;t++){\n    for(int i=1;i<n-1;i++){\n      int row=i*n;\n      for(int j=1;j<n-1;j++){\n        int idx=row+j;\n        dst[idx]=0.2*(src[idx]+src[idx-1]+src[idx+1]+src[idx-n]+src[idx+n]);\n      }\n    }\n    double* tmp=src; src=dst; dst=tmp;\n  }\n  if(src!=A) memcpy(A,src,(size_t)n*n*sizeof(double)); // 若主程序要求结果在A\n}\n",
+          "expected_speedup": "≈1.7x–2.0x（核心原因：每步从“两次全域更新”降为“一次全域更新”，内存流量与计算量近似减半；若最后需要 memcpy 回 A，会略低于 2x）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel: 内层循环吞吐（减少地址计算/提升向量化）",
+          "technique": "消除重复乘法与公共子表达式；restrict + 对齐；显式向量化友好写法",
+          "code_changes": "1) 预计算行基址与 idx，避免反复 i*n：\nfor(i=1;i<n-1;i++){ int row=i*n; for(j=1;j<n-1;j++){ int idx=row+j; ... }}\n2) 使用 restrict 帮助编译器：\nvoid jacobi_kernel(..., double* __restrict A, double* __restrict B)\n3) 分配对齐内存：posix_memalign(&A,64,bytes); posix_memalign(&B,64,bytes);\n4) 编译选项：-O3 -march=native -ffast-math（若允许）并检查向量化报告。\n",
+          "expected_speedup": "≈1.05x–1.25x（在带宽受限下主要来自更好的向量化与更少的整数/地址开销）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel: 写流量与 RFO（写分配）开销",
+          "technique": "Non-temporal store（流式写）/编译器内建；或 OpenMP simd + nontemporal",
+          "code_changes": "当 dst 不会在短时间内被 CPU 读取（典型 Jacobi 流式），可对 dst 使用 non-temporal store。\n- Intel/Clang 可尝试：#pragma vector nontemporal(dst)\n- 或使用 intrinsics（AVX-512/AVX2）对 dst 做 _mm_stream_pd/_mm512_stream_pd。\n注意：需要保证 dst 对齐、并避免马上读取 dst（同一时间步内不读 dst）。\n",
+          "expected_speedup": "≈1.05x–1.30x（取决于平台与是否确实被 RFO 限制；在写占比高时更明显）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel: 多核扩展（利用内存带宽上限）",
+          "technique": "OpenMP 并行 + 合理调度/绑核；NUMA first-touch",
+          "code_changes": "1) 并行外层 i：\n#pragma omp parallel for schedule(static)\nfor(i=1;i<n-1;i++) { ... }\n2) init_array 也并行以 first-touch：\n#pragma omp parallel for collapse(2) schedule(static)\nfor(i=0;i<n;i++) for(j=0;j<n;j++) ...\n3) 运行时：OMP_PROC_BIND=close, OMP_PLACES=cores；双路 NUMA 用 numactl --interleave=all 或按 socket 分块。\n",
+          "expected_speedup": "≈(带宽可扩展范围内) 2x–10x（取决于内存通道数/NUMA/单核带宽；最终受系统可持续带宽封顶）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "compute_residual（~6%）",
+          "technique": "OpenMP reduction + 向量化；减少 sqrt/除法开销（保持数值一致）",
+          "code_changes": "并行与归约：\n#pragma omp parallel for reduction(+:residual) schedule(static)\nfor(i=1;i<n-1;i++){\n  int row=i*n;\n  for(j=1;j<n-1;j++){\n    int idx=row+j;\n    double lap = A[idx-n]+A[idx+n]+A[idx-1]+A[idx+1]-4.0*A[idx];\n    residual += lap*lap;\n  }\n}\nreturn sqrt(residual / ((double)(n-2)*(n-2)));\n",
+          "expected_speedup": "≈2x–8x（多核并行后该部分占比会进一步下降；单核优化通常 1.05x–1.2x）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "compute_checksum（~2%）",
+          "technique": "OpenMP reduction + 向量化；可选 Kahan/分块求和（若关心可重复性）",
+          "code_changes": "#pragma omp parallel for reduction(+:sum) collapse(2) schedule(static)\nfor(i=0;i<n;i++) for(j=0;j<n;j++) sum += A[i*n+j];\n若需要更稳定：每线程局部 Kahan，再做线程间归约。\n",
+          "expected_speedup": "≈2x–8x（取决于核数；总体收益有限但便宜）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "init_array（~2%）与整体内存分配/页映射",
+          "technique": "并行初始化 + 对齐分配 + 大页(THP/hugepage) + 避免 malloc 造成的 NUMA 远端页",
+          "code_changes": "1) posix_memalign 64B 对齐。\n2) init_array 使用 OpenMP collapse(2) static 做 first-touch。\n3) Linux 可启用 THP 或显式 hugepage（视环境）。\n",
+          "expected_speedup": "init 本身 2x–8x；对主循环的间接收益：NUMA 正确时可提升 1.1x–1.5x（双路/多路更明显）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "2D 网格并行：每个线程负责一个网格点 (i,j) 的更新；每个时间步 launch 一个 kernel 计算 dst=stencil(src)，然后交换指针。使用 2D thread block（如 32x8 或 16x16）以保证 j 方向合并访问。可选：在 block 内用 shared memory 做 tile+halo（(Bx+2)*(By+2)）缓存 src，减少对全局内存的重复读取（尤其是上下左右邻居）。残差/校验和用单独 kernel 做并行归约（分层 reduction 或使用 CUB）。",
+        "data_layout": "保持行主序(row-major)一维展开，确保 j 为最快变化维度；在 GPU 上让 threadIdx.x 对应 j 以实现全局内存 coalescing。建议使用 pitched allocation（cudaMallocPitch）或保证 n 为对齐友好（4096 本身很好）。使用双缓冲 src/dst 指针交换，避免每步额外拷贝。",
+        "challenges": [
+          "带宽受限：即使上 GPU 仍主要受 HBM/DRAM 带宽限制；需要最大化合并访问、减少冗余加载（shared memory tile 或只依赖 L2/只读缓存的权衡）。",
+          "时间步循环的 kernel launch 开销：500 步会有 500 次 launch（或 500 次*1 kernel）；可用 CUDA Graphs 或在一个 kernel 内做多步 time-tiling（更复杂，需处理 halo 传播）。",
+          "双精度吞吐与带宽：双精度下寄存器/带宽压力更大；需要选择合适 block 尺寸以维持 occupancy。",
+          "归约的数值可重复性：GPU 并行归约会改变加法顺序；若需要 bitwise 一致需特殊处理（代价高）。"
+        ],
+        "expected_speedup": "相对单核 CPU：通常 20x–100x（取决于 CPU/内存带宽与 GPU 带宽）。相对“已用 OpenMP 跑满内存带宽的多核 CPU”：常见 2x–6x（取决于平台带宽比、是否使用 shared memory/graphs、以及 PCIe 传输是否可忽略——本例数据常驻 GPU 时可忽略）。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.10 FLOPs/byte（按 5 FLOPs / 48B 估算）；若考虑写分配(RFO)则约 5/56≈0.089 FLOPs/byte。若使用 non-temporal store 可接近 5/48。",
+        "cache_behavior": "空间局部性：j 方向连续访问，硬件预取有效；时间局部性：同一时间步内对 src 的中心/左右/上下存在短暂复用，但工作集 256MB 远超 LLC，跨行(i±1)数据多为流式，整体呈带宽受限的 streaming stencil。两次 sweep（原实现）会把每步的读写流量翻倍；若不做 non-temporal store，dst 写会触发 RFO 读入 cache line，增加内存读带宽压力。NUMA 下若未 first-touch，可能出现远端内存访问导致带宽下降。",
+        "data_dependencies": [
+          "Jacobi 单个 sweep 内：每个 (i,j) 只读 src 邻域并写 dst[idx]，点与点之间无 RAW/WAR/WAW 依赖（可并行）。",
+          "时间步之间：t 与 t+1 存在依赖（t+1 读取 t 的结果），因此只能在时间维串行；可做时间分块/波前类方法但复杂且受边界交换影响。",
+          "compute_residual/checksum：归约依赖（reduction），需要并行归约策略；浮点加法非结合导致结果可能随并行度变化。"
+        ]
+      },
+      "cost": 0.0425425
+    },
+    "total_cost": 0.07086975
+  }
+}
