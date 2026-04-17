@@ -222,25 +222,27 @@ def _bottleneck_type_similarity(identified: str, expected: str) -> Dict[str, flo
     """
     计算瓶颈类型识别的相似度
     考虑主类型和子类型的匹配
+    
+    2026-04-17: 改用 bottleneck_taxonomy.primary() 作为 "primary category"
+    的唯一权威判断，避免和 run_*.py 使用不一致的规则。
     """
-    identified_lower = identified.lower().strip()
-    expected_lower = expected.lower().strip()
+    # Lazy import to avoid circular dependency if analyzer is loaded first
+    from bottleneck_taxonomy import primary as _taxonomy_primary
     
-    # 主类型匹配
-    primary_types = ["compute", "memory", "communication", "latency", "bandwidth"]
-    identified_primary = None
-    expected_primary = None
+    identified_primary = _taxonomy_primary(identified)
+    expected_primary = _taxonomy_primary(expected)
     
-    for ptype in primary_types:
-        if ptype in identified_lower:
-            identified_primary = ptype
-        if ptype in expected_lower:
-            expected_primary = ptype
-    
-    primary_match = 1.0 if identified_primary == expected_primary else 0.0
+    primary_match = (
+        1.0 if (identified_primary == expected_primary
+                and identified_primary != 'unknown')
+        else 0.0
+    )
     
     # 字符串相似度
-    string_sim = _string_similarity(identified_lower, expected_lower)
+    string_sim = _string_similarity(
+        identified.lower().strip(),
+        expected.lower().strip()
+    )
     
     return {
         "primary_match": primary_match,

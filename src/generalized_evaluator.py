@@ -285,7 +285,15 @@ class GeneralizedEvaluator:
         benchmark: BenchmarkDefinition,
         result: EvaluationResult
     ) -> float:
-        """评估瓶颈类型 - 使用关键词匹配"""
+        """
+        评估瓶颈类型。
+        
+        2026-04-17 改用 bottleneck_taxonomy.primary() 作为 primary
+        category 判断的唯一权威实现。同时保留对 "mixed" 字样的识别
+        (evaluator-only 的宽松匹配，不影响 run_*.py 里的 pf 定义)。
+        """
+        from bottleneck_taxonomy import primary as _taxonomy_primary
+        
         if not identified:
             result.errors.append("未识别瓶颈类型")
             return 0.0
@@ -296,38 +304,34 @@ class GeneralizedEvaluator:
         primary_hotspot = max(benchmark.hotspots, key=lambda h: h.time_percentage) if benchmark.hotspots else None
         expected_type = primary_hotspot.bottleneck_type.lower() if primary_hotspot else ""
         
-        # 关键词匹配（更宽松）
-        type_keywords = {
-            "compute": ["compute", "cpu", "arithmetic", "calculation", "flop", "alu", "fp", "instruction"],
-            "memory": ["memory", "bandwidth", "cache", "data", "latency", "load", "store", "fetch"],
-            "mixed": ["mixed", "both", "hybrid"]
-        }
+        # Primary category via taxonomy (pf rule)
+        identified_category = _taxonomy_primary(identified_type)
+        expected_category = _taxonomy_primary(expected_type)
         
-        identified_category = None
-        expected_category = None
+        # Evaluator-only extension: recognise "mixed" / "both" / "hybrid"
+        # even though these aren't primary categories in the taxonomy.
+        def _has_mixed_marker(text):
+            return any(m in text for m in ('mixed', 'both', 'hybrid'))
         
-        # 检查识别的类型包含哪些关键词
-        for category, keywords in type_keywords.items():
-            if any(kw in identified_type for kw in keywords):
-                identified_category = category
-                break
+        if _has_mixed_marker(identified_type):
+            identified_category = 'mixed'
+        if _has_mixed_marker(expected_type):
+            expected_category = 'mixed'
         
-        # 检查期望的类型
-        for category, keywords in type_keywords.items():
-            if any(kw in expected_type for kw in keywords):
-                expected_category = category
-                break
+        # Normalise 'unknown' to None for the scoring branches below
+        if identified_category == 'unknown':
+            identified_category = None
+        if expected_category == 'unknown':
+            expected_category = None
         
         # 评分
         if identified_category == expected_category and identified_category is not None:
             result.details["bottleneck_match"] = True
             return 1.0
         elif identified_category is not None and expected_category is not None:
-            # 部分匹配（如识别为 memory/latency，期望是 memory）
             result.warnings.append(f"瓶颈类型部分匹配: 识别为 {identified_category}, 期望 {expected_category}")
             return 0.5
         elif identified_category is not None:
-            # 至少识别出了类型
             result.warnings.append(f"瓶颈类型可能不匹配: {identified_type}")
             return 0.3
         else:

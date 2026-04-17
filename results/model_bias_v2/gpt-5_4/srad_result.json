@@ -1,0 +1,57 @@
+{
+  "program": "srad",
+  "model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "Although the kernel contains nontrivial arithmetic, the implementation stores four directional gradients plus diffusion coefficients in separate full-size arrays and then rereads them in a second pass. This creates very high memory bandwidth demand and poor cache efficiency: each iteration streams image, dN, dS, dW, dE, and c over millions of elements. The arithmetic per byte is reduced by the two-phase design and temporary arrays, so on modern CPUs this version is more likely memory-bound than ",
+  "ground_truth": "memory",
+  "correct": true,
+  "eval_score": 86.71330275229357,
+  "cost": 0.026215,
+  "stage1": {
+    "model": "gpt-5.4",
+    "hotspots": [
+      {
+        "location": "srad_kernel() Phase 1 diffusion coefficient loop (nested for i/j, inside k iteration)",
+        "estimated_time_percentage": "45%",
+        "reason": "Per-pixel stencil computation performs multiple neighbor loads, gradient calculations, several divisions, repeated image[idx] reuse, and coefficient evaluation for every pixel across 100 iterations. This dominates runtime due to high arithmetic intensity and large total iteration count.",
+        "confidence": "high"
+      },
+      {
+        "location": "srad_kernel() Phase 2 image update loop (nested for i/j, inside k iteration)",
+        "estimated_time_percentage": "33%",
+        "reason": "Per-pixel divergence and update sweep touches multiple large arrays (c, dN, dS, dW, dE, image), causing substantial memory traffic and another full-grid traversal each iteration.",
+        "confidence": "high"
+      },
+      {
+        "location": "srad_kernel() overall repeated full-image passes across niter loop",
+        "estimated_time_percentage": "78%",
+        "reason": "The kernel executes two complete passes over a 2048x2048 image for 100 iterations, repeatedly streaming several auxiliary arrays. The aggregate cost of these passes overwhelmingly exceeds initialization and statistics.",
+        "confidence": "high"
+      },
+      {
+        "location": "compute_statistics() reduction loop",
+        "estimated_time_percentage": "3%",
+        "reason": "Full-array reduction over image for sum and sum of squares, but executed only twice and with simple arithmetic.",
+        "confidence": "high"
+      },
+      {
+        "location": "random_init() initialization loop",
+        "estimated_time_percentage": "2%",
+        "reason": "Linear pass over the image with rand() and stores, but only executed once.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "Although the kernel contains nontrivial arithmetic, the implementation stores four directional gradients plus diffusion coefficients in separate full-size arrays and then rereads them in a second pass. This creates very high memory bandwidth demand and poor cache efficiency: each iteration streams image, dN, dS, dW, dE, and c over millions of elements. The arithmetic per byte is reduced by the two-phase design and temporary arrays, so on modern CPUs this version is more likely memory-bound than purely compute-bound."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The computation is a regular 2D stencil over a dense grid with uniform per-pixel work and limited control divergence. Each iteration consists of data-parallel operations with nearest-neighbor accesses, which map well to GPU thread blocks. The main challenge is memory traffic, but GPUs handle this pattern effectively when using tiled shared-memory or cache-friendly implementations.",
+      "recommended_approach": "Port the two phases as CUDA or HIP kernels, preferably using a tiled stencil design. Keep image and coefficient data resident on device across all iterations, use one or two kernels per iteration, process interior separately from boundaries, and consider fusing phases or using shared memory/texture cache for neighbor accesses. If precision allows, use float for higher throughput."
+    },
+    "cost": 0.026215,
+    "bottleneck_raw": "memory"
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "program": "abinit",
+  "model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "Although the core kernels perform substantial arithmetic, the routine repeatedly streams large multidimensional arrays over plane waves/projectors/atoms, generates phase factors, copies data between layouts, and allocates/zeros temporaries inside the innermost block-processing path. The arithmetic intensity is likely moderate, especially for projector application and phase-factor handling, making memory bandwidth and data movement the dominant limiter on CPUs. Communication appears secondary exc",
+  "ground_truth": "memory",
+  "correct": true,
+  "eval_score": 82.06848894348894,
+  "cost": 0.07008924999999999,
+  "stage1": {
+    "model": "gpt-5.4",
+    "hotspots": [
+      {
+        "location": "Main atom-type/block loop in nonlop_ylm around calls to opernla_ylm/opernla_ylm_mv and opernlb_ylm/opernlb_ylm_mv",
+        "estimated_time_percentage": "60-80%",
+        "reason": "The dominant work is inside the nested loops over atom types, atom blocks, spinors, projectors, and plane waves. The projection <p|c> and reconstruction back to reciprocal space scale with npw * nlmn * nincat * nspinor and are invoked for each atom block. These routines likely perform the bulk of floating-point work and memory traffic.",
+        "confidence": "high"
+      },
+      {
+        "location": "call opernlc_ylm inside nonlop_ylm atom-block loop",
+        "estimated_time_percentage": "10-20%",
+        "reason": "This contraction step applies Dij/Sij-like couplings between projector coefficients, involving dense small-to-medium matrix operations over nlmn, atoms, and spinor channels. It is executed for every atom block and feeds both energy and operator application paths.",
+        "confidence": "high"
+      },
+      {
+        "location": "call ph1d3d for ph3din/ph3dout generation inside atom-block loop",
+        "estimated_time_percentage": "5-15%",
+        "reason": "Phase-factor generation is repeated per atom block and for both input/output paths when nloalg(2)<=0. This can be expensive due to traversal over all plane waves and atoms in the block, and may duplicate work across repeated calls.",
+        "confidence": "medium"
+      },
+      {
+        "location": "Repeated ABI_MALLOC/ABI_FREE of gx/gxfac/dgxdt/d2gxdt and related temporaries inside atom-block loop",
+        "estimated_time_percentage": "5-10%",
+        "reason": "Large multidimensional temporary arrays are allocated, zeroed, and freed for every atom block. This adds allocator overhead, cache/TLB disruption, and extra memory bandwidth consumption, especially for small-to-medium blocks where setup costs are significant.",
+        "confidence": "high"
+      },
+      {
+        "location": "Data marshaling loops copying cprjin <-> gx/dgxdt and optional gx_left inside atom-block loop",
+        "estimated_time_percentage": "5-10%",
+        "reason": "There are multiple explicit nested loops copying projector coefficients and derivatives between derived-type storage and contiguous work arrays. These loops are bandwidth-heavy and may inhibit vectorization due to derived-type indirection.",
+        "confidence": "medium"
+      },
+      {
+        "location": "MPI reductions at end of nonlop_ylm: xmpi_sum on enlout/enlk/fnlk/strnlk/ddkk",
+        "estimated_time_percentage": "1-10%",
+        "reason": "For signs==1 and parallel spinor decomposition, several collective reductions are performed. Cost depends on process count and message sizes; usually secondary to local kernels but can become noticeable at scale.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "Although the core kernels perform substantial arithmetic, the routine repeatedly streams large multidimensional arrays over plane waves/projectors/atoms, generates phase factors, copies data between layouts, and allocates/zeros temporaries inside the innermost block-processing path. The arithmetic intensity is likely moderate, especially for projector application and phase-factor handling, making memory bandwidth and data movement the dominant limiter on CPUs. Communication appears secondary except at very large MPI scale."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The dominant kernels are regular, data-parallel operations over plane waves, projectors, atoms, and spinors, which are generally well suited to GPUs. The best candidates are the projection/reconstruction kernels and dense contractions in opernla/opernlb/opernlc. However, current frequent allocations, derived-type data structures, and scattered data marshaling would limit GPU efficiency unless refactored.",
+      "recommended_approach": "Port opernla_ylm/opernla_ylm_mv, opernlb_ylm/opernlb_ylm_mv, and opernlc_ylm first. Flatten cprjin and projector/form-factor data into contiguous device-friendly arrays, batch multiple bands/vectors to use GEMM-like kernels, keep ph3d and projector coefficients resident on device across calls, and minimize host-device transfers by performing contraction and reconstruction entirely on GPU. Use CUDA/HIP/OpenACC/OpenMP target depending project portability requirements."
+    },
+    "cost": 0.07008924999999999,
+    "bottleneck_raw": "memory"
+  }
+}

@@ -1,0 +1,138 @@
+{
+  "program": "srad",
+  "config": "Ablation C (4o->5.4)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck": "compute",
+  "s1_score": 64.07692307692307,
+  "s1_gpu_suitable": true,
+  "s2_corrected": true,
+  "s2_type": "mixed, memory-traffic-dominated on CPU with significant arithmetic cost",
+  "s2_reasoning": "初步分析将其简单归类为 compute-bound 不够准确。该核函数每个像素在 Phase 1 中执行较多浮点运算和若干除法，但并没有实际 exp() 调用，注释与代码不一致。与此同时，代码为每个像素读写多个大数组：image、dN/dS/dW/dE、c，并且 Phase 1 先写梯度数组、Phase 2 再读回这些数组，导致大量内存流量。对 2048x2048 双精度图像，dN/dS/dW/dE/c 共约 5 x 32MB = 160MB，远超典型 LLC，跨 phase 重用较差，因此 CPU 上更可能表现为“中等算术强度 + 明显内存带宽/缓存压力”的混合瓶颈，而不是纯计算瓶颈。真正昂",
+  "s2_gpu_suitable": true,
+  "cost": 0.05410475000000001,
+  "full_result": {
+    "code_name": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Involves divergence computation and image update, which are computationally intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and each element's computation is independent per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using GPU threads to handle different pixels and leveraging shared memory for neighbor data."
+      },
+      "cost": 0.01108275
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "mixed, memory-traffic-dominated on CPU with significant arithmetic cost",
+        "reasoning": "初步分析将其简单归类为 compute-bound 不够准确。该核函数每个像素在 Phase 1 中执行较多浮点运算和若干除法，但并没有实际 exp() 调用，注释与代码不一致。与此同时，代码为每个像素读写多个大数组：image、dN/dS/dW/dE、c，并且 Phase 1 先写梯度数组、Phase 2 再读回这些数组，导致大量内存流量。对 2048x2048 双精度图像，dN/dS/dW/dE/c 共约 5 x 32MB = 160MB，远超典型 LLC，跨 phase 重用较差，因此 CPU 上更可能表现为“中等算术强度 + 明显内存带宽/缓存压力”的混合瓶颈，而不是纯计算瓶颈。真正昂贵的是除法、重复索引计算、边界分支、以及中间数组造成的缓存失效和带宽消耗。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Phase 1 + Phase 2 融合，消除 dN/dS/dW/dE 全尺寸中间数组",
+          "technique": "kernel fusion + on-the-fly gradient recomputation / rolling buffer",
+          "code_changes": "将两阶段改写为单次遍历或按行块(tile)遍历：在处理像素时直接加载中心与四邻域，计算 dN/dS/dW/dE、G2、L、c，并立即用于更新；若严格保持原算法中 cS/cE 依赖下一行/下一列系数，可采用 3-row rolling buffer 保存 c 的当前行/下一行，或保留仅 c 数组而删除 dN/dS/dW/dE 四个数组。最小改动版本：删除 dN/dS/dW/dE 的 malloc/free；Phase 1 仅计算 c[idx]；Phase 2 中重新计算 dN/dS/dW/dE 而不是从数组读取。",
+          "expected_speedup": "1.4x-2.2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "减少除法与重复表达式开销",
+          "technique": "strength reduction + common subexpression elimination",
+          "code_changes": "在 Phase 1 中缓存 center=image[idx]，inv_center=1.0/center，inv_center2=inv_center*inv_center；将 G2 除法改为乘 inv_center2，L 除法改为乘 inv_center；预计算 q0_denom = q0sqr*(1.0+q0sqr) 于迭代外；将 den=(1.0+0.25*L); den=den*den; qsqr=num/(den+1e-15); c=1.0/(1.0+(qsqr-q0sqr)/q0_denom)。同时避免重复 image[idx]、i*cols 的计算。",
+          "expected_speedup": "1.15x-1.35x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "改善缓存局部性与边界分支开销",
+          "technique": "interior/boundary split + loop tiling",
+          "code_changes": "将主循环拆成内部区域 i=1..rows-2, j=1..cols-2 的无分支版本，以及四条边界单独处理。内部区域直接使用 idx±1、idx±cols 访问邻居，去掉每像素 4 个条件判断。进一步按行块或二维 tile（如 64x64 或 128x32）处理，提升 image/c 的缓存命中率。",
+          "expected_speedup": "1.1x-1.3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "提升 SIMD 向量化效率",
+          "technique": "restrict + alignment + pragma omp simd / compiler-friendly rewrite",
+          "code_changes": "将函数签名改为 void srad_kernel(double *__restrict image, ...)。若保留 c 数组，也声明为 restrict。使用 aligned_alloc/posix_memalign 进行 64B 对齐。内部区域循环写成线性 idx 递增形式，避免复杂条件；可加 #pragma omp simd 或 #pragma GCC ivdep 于 j 循环。示例：double *row=&image[i*cols]; double *rowN=&image[(i-1)*cols]; double *rowS=&image[(i+1)*cols]; 通过 row[j-1], row[j+1] 访问。",
+          "expected_speedup": "1.2x-1.8x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "多核 CPU 并行",
+          "technique": "OpenMP parallel for with static scheduling",
+          "code_changes": "对每次迭代中的两个 phase 分别使用 #pragma omp parallel for schedule(static) collapse(2) 或按行并行。若采用融合/rolling buffer 方案，则按 tile 并行。注意每次迭代 phase 间需要隐式 barrier。示例：#pragma omp parallel for schedule(static) for (i=1;i<rows-1;i++) for (j=1;j<cols-1;j++) {...}",
+          "expected_speedup": "6x-20x（取决于核数与内存带宽）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "降低内存占用与带宽压力",
+          "technique": "mixed precision / float storage",
+          "code_changes": "若数值精度允许，将 image、c 以及中间梯度改为 float，统计量仍可用 double 累加。代码层面将 double* 改为 float*，常量改为单精度，compute_statistics 中使用 double sum/sum2。需验证收敛与输出误差。",
+          "expected_speedup": "1.3x-2.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "减少 malloc/free 与初始化开销，改善 NUMA 行为",
+          "technique": "persistent allocation + first-touch initialization",
+          "code_changes": "将 c 等工作数组在 srad_kernel 外部分配并复用；在并行环境下使用并行 first-touch 初始化数组，确保 NUMA 本地性。避免每次调用 srad_kernel 时重复 malloc/free。",
+          "expected_speedup": "1.02x-1.1x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "进一步降低访存次数的高级实现",
+          "technique": "stencil temporal blocking / wavefront tiling",
+          "code_changes": "按时间块处理多个迭代，在 tile 内保留局部数据，减少 image 在迭代间反复写回主存。需要双缓冲 image_old/image_new 或 carefully ordered in-place scheme。实现复杂，但对大图像和多迭代有效。",
+          "expected_speedup": "1.3x-2.5x",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "采用二维网格并行，每个线程处理一个像素。推荐两种实现路径：1) 两 kernel 方案：kernel1 计算 c（以及可选梯度），kernel2 计算 D 并更新 image；2) 更优的 tiled shared-memory 方案：每个 block 加载带 halo 的 image tile 到 shared memory，在 block 内计算梯度与 c，并写回 c 或直接双缓冲更新 image。若要严格保持原始两阶段语义，建议使用双缓冲 image_old/image_new，并在 kernel1 生成 c，kernel2 从 image_old+c 计算 image_new。每次迭代后交换指针。",
+        "data_layout": "使用连续行主序一维数组，优先 float 存储以提高吞吐和降低带宽。线程块建议 16x16 或 32x8，保证 x 方向连续访问实现全局内存合并。若使用 shared memory，则分配 (blockDim.y+2) x (blockDim.x+2) 的 tile 存放 image halo。c 可单独存储为紧凑数组；若寄存器压力允许，可在单 kernel 中局部重算梯度而不存 dN/dS/dW/dE。",
+        "challenges": [
+          "Phase 2 需要邻近位置的 c（特别是南、东），若单 kernel 融合不当会引入块间同步问题；解决方案是保留两 kernel 或使用双缓冲并在第二 kernel 中读取全局 c",
+          "shared memory halo 加载与边界处理增加实现复杂度；可通过内部区域专用 kernel + 边界 kernel 简化",
+          "双精度在消费级 GPU 上吞吐较低；若算法允许，改用 float 可显著提速",
+          "寄存器压力较高（中心值、4 邻域、梯度、G2、L、qsqr、c 等），可能降低 occupancy；需通过限制 block size、减少临时变量、使用编译器报告调优",
+          "迭代次数多，kernel launch 开销虽相对较小，但仍建议使用 CUDA Graphs 或 kernel fusion 降低调度成本",
+          "数值稳定性与 CPU 结果一致性：float、FMA、不同求值顺序会带来微小偏差，需要定义可接受误差"
+        ],
+        "expected_speedup": "相对单线程 CPU：20x-80x；相对优化后的多核 CPU：3x-10x。若使用 float + shared memory tile + 双缓冲，通常可达到区间上半段。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "原始实现粗估：Phase 1 每像素约 30-40 FLOPs + 3-4 次除法，内存流量约 6 次 image 读 + 5 次数组写 ≈ 88B；Phase 2 每像素约 8-12 FLOPs，内存流量约读 c/d* 多数组并写 image ≈ 64-80B。合计约 40-50 FLOPs / 152-168B，算术强度约 0.24-0.33 FLOPs/byte（若将除法折算为等效高代价，计算压力会上升，但 Roofline 角度仍偏低到中等）。删除 dN/dS/dW/dE 后可提升到约 0.4-0.6 FLOPs/byte。",
+        "cache_behavior": "当前实现缓存行为较差。image 访问具有规则 stencil 模式，空间局部性较好；但 dN/dS/dW/dE/c 为全尺寸数组，Phase 1 写入后 Phase 2 再读取，工作集远大于 LLC，导致中间数组基本以流式方式进出内存。边界条件分支破坏向量化并增加前端开销。按行遍历对 image 的当前行/上下行有一定重用，但由于同时维护 5 个大数组，缓存压力显著。若仅保留 c 或采用 rolling buffer，可明显改善缓存命中率和带宽利用。",
+        "data_dependencies": [
+          "同一迭代内，Phase 1 的 c[idx] 依赖当前 image 的 4 邻域值",
+          "Phase 2 的 image[idx] 更新依赖当前迭代的 c[idx]、c[i+1,j]、c[i,j+1] 以及当前 image 的梯度",
+          "不同迭代之间存在时间依赖：第 k+1 次迭代必须等待第 k 次迭代完成",
+          "单个 phase 内同一迭代的不同像素计算基本可并行，因为都只读取旧 image / 已完成的 c，不依赖同 phase 中其他像素的新 image",
+          "若采用 in-place 更新，必须保证整个 Phase 2 使用的是本迭代开始时的梯度/系数语义；融合时需避免读到已更新邻居导致数值改变"
+        ]
+      },
+      "cost": 0.043022000000000005
+    },
+    "total_cost": 0.05410475000000001
+  }
+}
