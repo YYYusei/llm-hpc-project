@@ -80,15 +80,18 @@ llm-hpc-project/
 ├── prompts/                              # Stage 1 + Stage 2 prompt templates
 │
 ├── benchmarks/                           # Source code for nine evaluation programs
-│   ├── minimd/        hpcg/        abinit/         # Original four programs
+│   ├── minimd/        hpcg/        abinit/         # Original three (HPCG counted twice: SPMV + SYMGS)
 │   ├── hotspot/       srad/        lulesh/         # Extended five programs
 │   └── nas_cg/        jacobi2d/    omp_comparison.c
 │
 ├── results/                              # Stored JSON outputs from all experiments
 │
+├── run_original.py                       # Baseline cascade: GPT-4o → GPT-5.2 (validate/correct prompt)
 ├── run_role_swap.py                      # Central experiment: NeutralPipeline + BiasedAgreementPipeline
 ├── run_ablation.py                       # Ablations A (5.2→5.2) + B (5.2→4o)
 ├── run_ablation_cd.py                    # Ablations C (4o→5.4) + D (5.4→5.4)
+├── run_all_experiments.py                # One-shot orchestrator for all 7 configurations
+├── rerun_model_bias.py                   # Single-stage bias test (full S1 capture for rescoring)
 ├── rescore_all.py                        # Regenerate change counts from stored JSONs (zero-cost)
 ├── rescore_eval_all.py                   # Regenerate Stage 1 evaluation scores from stored JSONs
 ├── test_cuda_*.py                        # CUDA generation experiments per kernel
@@ -258,18 +261,22 @@ described in §2.3 of the thesis.
 ### Phase 2: Single-stage bias characterisation (RQ1)
 
 ```bash
-python test_model_bias.py
+python rerun_model_bias.py --model gpt-4o
+python rerun_model_bias.py --model gpt-5.2
+python rerun_model_bias.py --model gpt-5.4
 ```
 
 Establishes per-model directional bias (GPT-4o → compute, GPT-5.x
-→ memory). Output stored in `results/single_stage/`.
+→ memory). `rerun_model_bias.py` saves the full Stage 1 output
+(including hotspots) so that `rescore_eval_all.py` can later
+re-evaluate against updated ground truth without additional API
+calls. Output stored in `results/model_bias_v2/`.
 
 ### Phase 3: Cascaded pipeline baseline (RQ2)
 
 ```bash
-# Original cascade
-python test_cascaded.py            # GPT-4o → GPT-5.2 (original 4 programs)
-python test_extended_cascaded.py   # extended to 9 programs
+# Original cascade (baseline: GPT-4o → GPT-5.2 across all 9 programs)
+python run_original.py
 
 # Ablations A/B (model-pair variation, same-bias and reversed)
 python run_ablation.py             # 5.2→5.2, 5.2→4o
@@ -502,14 +509,18 @@ cd llm-hpc-project
 pip install -r requirements.txt
 export OPENAI_API_KEY="sk-..."
 
-# Five model-pair configurations (Phase 3)
-python test_cascaded.py
-python test_extended_cascaded.py
-python run_ablation.py
-python run_ablation_cd.py
+# All seven cascade configurations in one shot (Phases 3 + 4).
+# Idempotent: per-program JSON files are skipped if already present,
+# so the orchestrator resumes cleanly after any interruption.
+python run_all_experiments.py
 
-# Role-Swap (Phase 4 — central experiment)
-python run_role_swap.py
+# Or run individual phases / a subset of stages:
+#   python run_all_experiments.py --stages OABCD   # only model-pair (Phase 3)
+#   python run_all_experiments.py --stages V1V3    # only Role-Swap (Phase 4)
+#   python run_original.py                         # just the baseline
+#   python run_ablation.py                         # just A/B
+#   python run_ablation_cd.py                      # just C/D
+#   python run_role_swap.py                        # just V1/V3
 
 # Rescore (Phase 5 — zero cost)
 python rescore_all.py
@@ -562,7 +573,7 @@ in their released form. Full disclosure is provided in
 
 ```bibtex
 @thesis{llm-hpc-2026,
-  author = {Yusei},
+  author = {Wenshou Zhong}
   title  = {Meta-Prompt Design for LLM-Assisted HPC Performance
             Analysis: When Prompt Structure Outweighs Model Choice},
   school = {University of Leeds},
@@ -589,5 +600,5 @@ consortium, the ABINIT developers, the Rodinia benchmark suite,
 Lawrence Livermore National Laboratory, the NASA Advanced
 Supercomputing Division, and the PolyBench/C developers. Intel
 VTune Profiler used under the oneAPI community licence. Project
-supervised by Dr.Xia at the School of Computing,
+supervised by Dr. Xia at the School of Computing,
 University of Leeds.
