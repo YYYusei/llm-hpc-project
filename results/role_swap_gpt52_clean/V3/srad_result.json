@@ -1,0 +1,131 @@
+{
+  "program": "srad",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "mixed (compute-dominated with notable memory traffic); Phase1 compute-heavy, Phase2 bandwidth/latency-sensitive",
+  "s1_score": 63.19036697247705,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "compute",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.04563125,
+  "full_result": {
+    "code_name": "srad",
+    "program_key": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Involves divergence computation and image update, which are computationally intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the intensive arithmetic operations, including divisions, square roots, and exponential function calls, which dominate the execution time."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and element-independent computations per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using GPU threads to handle different pixels and leveraging shared memory for neighbor data access."
+      },
+      "cost": 0.01108275,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "mixed (compute-dominated with notable memory traffic); Phase1 compute-heavy, Phase2 bandwidth/latency-sensitive",
+        "reasoning": "Phase 1 per-pixel performs many FP ops (multiple mul/add, 2 divisions by image, reciprocal, clamp) and includes expensive operations (sqrt/exp not present in this code path; original Rodinia variants sometimes use exp(), but here diffusion coefficient is rational form 1/(1+den)). Even without exp(), divisions and dependency chains make it throughput/latency limited on CPU. Phase 2 is lighter arithmetic but streams multiple arrays (c and d*) and updates image, so it tends to be more memory-bound. Overall runtime is dominated by Phase1 arithmetic + Phase2 memory traffic; on modern CPUs the combined kernel often behaves as compute-dominated unless vectorization is poor, in which case it becomes latency-bound."
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Phase 1 (lines 47-97): remove dN/dS/dW/dE arrays; fuse phases to reduce memory traffic",
+          "technique": "kernel fusion + recompute gradients on the fly + single-pass update using neighbor c",
+          "code_changes": "Replace separate dN/dS/dW/dE allocations with on-the-fly gradient computation. Compute c for current pixel and store to c[]. Then in Phase2, instead of reading d* arrays, recompute gradients from image (or keep a small sliding window). Option A (two-pass): keep only c[] and recompute gradients in Phase2. Option B (single-pass tiled): process tiles, load image tile with halo into a local buffer, compute c and D within tile, write updated image to a second buffer (ping-pong). This removes 4 full-size arrays and reduces memory bandwidth.\n\nPseudo (two-pass, minimal change):\n- delete dN/dS/dW/dE malloc/free\n- Phase1: compute gradients as locals (dN,dS,dW,dE) and compute c[idx]\n- Phase2: recompute dN,dS,dW,dE as locals and compute D using cN/cS/cW/cE\n\nAlso switch to ping-pong buffers to avoid in-place update hazards if later parallelized across iterations:\nfor k: compute c from img_in; update img_out; swap pointers.",
+          "expected_speedup": "1.3x-2.2x (CPU), higher if memory bandwidth was limiting; also enables better cache residency",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Phase 1: reduce division/sqrt latency and improve vectorization",
+          "technique": "strength reduction (reciprocal), FMA-friendly algebra, fast-math (optional), SIMD",
+          "code_changes": "Hoist repeated reciprocals:\n- invI = 1.0 / image[idx]; invI2 = invI * invI\n- G2 = (dN*dN + dS*dS + dW*dW + dE*dE) * invI2\n- L  = (dN + dS + dW + dE) * invI\nRewrite den for qsqr using fused operations:\n- t = 1.0 + 0.25*L; den_q = t*t\n- qsqr = (0.5*G2 - 0.0625*L*L) / (den_q + 1e-15)\nFor c:\n- den_c = (qsqr - q0sqr) / (q0sqr*(1.0+q0sqr))\n- c = 1.0 / (1.0 + den_c)\nUse compiler flags and pragmas:\n- GCC/Clang: -O3 -march=native -ffast-math (if acceptable numerically)\n- Add #pragma omp simd on inner j loop; ensure pointers are restrict-qualified.\nChange signature:\nvoid srad_kernel(double* __restrict image, ...)\nIf using float is acceptable, convert to float to double SIMD width and reduce bandwidth.",
+          "expected_speedup": "1.2x-1.8x (CPU) depending on SIMD width and division throughput; float can add another 1.3x-2.0x",
+          "difficulty": "easy/medium"
+        },
+        {
+          "target": "Phase 1 & 2: eliminate branchy boundary clamps inside inner loop",
+          "technique": "separate boundary handling + interior fast path",
+          "code_changes": "Process interior region [1..rows-2]x[1..cols-2] with fixed neighbor indices (no ternary). Handle borders in separate loops (top/bottom rows, left/right cols).\nExample:\nfor i=1..rows-2 for j=1..cols-2 { idx=i*cols+j; iN=idx-cols; iS=idx+cols; jW=idx-1; jE=idx+1; ... }\nThen handle i=0, i=rows-1, j=0, j=cols-1 separately.\nThis improves vectorization and reduces mispredicts.",
+          "expected_speedup": "1.1x-1.4x (CPU), mainly by enabling SIMD and reducing control overhead",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Phase 2: improve cache locality and parallel scaling",
+          "technique": "OpenMP parallel for + static scheduling + NUMA first-touch",
+          "code_changes": "Add OpenMP over i (or collapsed i,j) for both phases:\n#pragma omp parallel for schedule(static)\nfor (i=...)\nEnsure allocations are first-touched in parallel (initialize c[] in parallel) to place pages on local NUMA nodes.\nIf using ping-pong buffers, parallelize update safely.\nAlso consider blocking over j to fit L1/L2 (e.g., j+=JB).",
+          "expected_speedup": "Up to ~Ncores scaling until memory bandwidth saturates; typical 4x-20x on multi-core CPUs depending on socket and precision",
+          "difficulty": "easy/medium"
+        },
+        {
+          "target": "Memory allocation overhead and alignment",
+          "technique": "reuse buffers across iterations + aligned allocation",
+          "code_changes": "Move malloc/free outside srad_kernel if called repeatedly; or allocate once and reuse. Use aligned allocation for SIMD:\n- posix_memalign(&ptr, 64, bytes) or aligned_alloc(64,...)\nOptionally use huge pages for large arrays.\nIf removing d* arrays (fusion), only keep c and ping-pong images.",
+          "expected_speedup": "Small for single call (1-3%), but helps stability and SIMD efficiency",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "2D grid of threads (one thread per pixel) with ping-pong images per iteration. Use two kernels per iteration (compute c, then update) or a fused tiled kernel using shared memory halo. Prefer fused tiled kernel to reduce global memory traffic: load tile of image into shared memory with 1-pixel halo, compute c and update D using neighbor c (either compute c for tile first then __syncthreads, or compute c and store to shared, then update). Synchronize between iterations by launching kernels per iteration (global barrier).",
+        "data_layout": "Row-major contiguous arrays. Use float (or half) if acceptable to increase throughput. Store image as pitched linear memory for coalescing; ensure alignment. If keeping c, store as same layout. For fused approach, keep only image_in/image_out and optionally c in shared memory (tile-local).",
+        "challenges": [
+          "Iteration-level global dependency requires kernel launch per iteration (or CUDA Graphs) and prevents full fusion across iterations.",
+          "If computing c and update in one kernel, need tile-level synchronization and careful handling of halo; also need c of neighbor pixels (south/east) which may be in another thread—requires shared memory staging.",
+          "Double precision is significantly slower on many GPUs; using double may reduce speedup unless on HPC-class GPUs.",
+          "Boundary handling and avoiding branch divergence (use separate boundary kernel or clamp via min/max)."
+        ],
+        "expected_speedup": "Single GPU vs single CPU core: ~20x-100x (float), ~5x-30x (double) depending on GPU. Versus multi-core CPU: typically ~2x-10x (float) and ~1.5x-6x (double), strongly dependent on memory bandwidth and whether d* arrays are eliminated."
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "Phase1 ~1.0-2.0 FLOPs/byte (double) depending on whether gradients are stored; Phase2 ~0.2-0.6 FLOPs/byte. Overall tends to be low-to-moderate; with d* arrays it becomes more bandwidth-sensitive.",
+        "cache_behavior": "Current code streams multiple full-size arrays each iteration: image (R/W), c (R/W), dN/dS/dW/dE (W in Phase1, R in Phase2). Working set per iteration far exceeds LLC for 2048^2 doubles (~32 MiB per array). This causes capacity misses and turns Phase2 into a streaming bandwidth kernel. Boundary branches inhibit SIMD and reduce effective prefetching. Fusing/removing d* arrays reduces total bytes moved and improves cache reuse (especially if tiled with halo).",
+        "data_dependencies": [
+          "Within an iteration: c[idx] depends only on image neighbors from the same iteration (read-only image).",
+          "Phase2 update of image[idx] depends on c at idx, south, east (and implicitly north/west via using c[idx] for cN/cW in this code) and gradients at idx; no cross-pixel write conflicts if writing to a separate output buffer.",
+          "Across iterations: image at iteration k+1 depends on image at iteration k (true dependency), requiring global synchronization between iterations in parallel implementations."
+        ]
+      },
+      "cost": 0.034548499999999996,
+      "bottleneck_raw": "mixed (compute-dominated with notable memory traffic); Phase1 compute-heavy, Phase2 bandwidth/latency-sensitive"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "compute",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.04563125
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "program": "adi",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 60.74999999999999,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0287385,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_adi, Column Sweep loop (line 66-78)",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs multiple operations on arrays and is executed for each time step, making it a significant part of the computation.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi, Row Sweep loop (line 82-94)",
+          "estimated_time_percentage": "40%",
+          "reason": "Similar to the Column Sweep, this loop also performs intensive operations on arrays for each time step.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent operations across iterations, which are suitable for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the loops, focusing on distributing the work of each sweep across multiple threads."
+      },
+      "cost": 0.00927325,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "memory",
+        "reasoning": "初步分析正确。代码中存在大量对二维数组的访问，特别是u、v、p、q数组，这些访问模式在列扫描和行扫描中表现出不同的内存访问模式。列扫描中访问u[j][i]是跨行访问（列主序），导致缓存效率低下；行扫描中访问v[i][j]是连续访问。这种混合访问模式导致严重的缓存不命中。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "内存访问模式优化",
+          "technique": "循环分块（tiling）",
+          "code_changes": "在Column Sweep和Row Sweep循环中引入分块，将大数组分解为适合缓存的小块。例如：\nfor (ii=1; ii<_PB_N-1; ii+=TILE_SIZE) {\n  for (i=ii; i<min(ii+TILE_SIZE, _PB_N-1); i++) {\n    // 原Column Sweep内循环\n  }\n}\n类似地处理Row Sweep。",
+          "expected_speedup": "2-5倍（取决于缓存大小和分块大小）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "数据布局优化",
+          "technique": "数组转置或结构体数组",
+          "code_changes": "1. 在Column Sweep前对u数组进行转置，使u[j][i]变为连续访问；\n2. 或使用结构体数组：struct {DATA_TYPE u, v, p, q;} grid[N][N]; 提高空间局部性。",
+          "expected_speedup": "1.5-3倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "计算强度提升",
+          "technique": "循环融合和标量替换",
+          "code_changes": "将p[i][j]和q[i][j]的计算融合，减少中间数组访问。使用局部变量存储重复计算的表达式，如a*p[i][j-1]+b。",
+          "expected_speedup": "1.2-1.5倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "指令级并行",
+          "technique": "SIMD向量化",
+          "code_changes": "在Row Sweep的内循环（j循环）添加OpenMP SIMD指令：\n#pragma omp simd\nfor (j=1; j<_PB_N-1; j++) { ... }",
+          "expected_speedup": "2-4倍（取决于SIMD宽度）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 每个时间步分为两个核函数：column_sweep和row_sweep。2. Column Sweep：每个线程块处理一列（或几列），每个线程处理一行的计算。3. Row Sweep：每个线程块处理一行，每个线程处理一列。4. 使用共享内存存储p、q的中间结果。",
+        "data_layout": "使用二维纹理内存或全局内存，考虑将数组存储为结构体数组以提高合并访问。对于Column Sweep，考虑对u数组进行转置或使用共享内存进行转置。",
+        "challenges": [
+          "依赖关系：p[i][j]依赖p[i][j-1]，需要线程内串行处理或并行前缀扫描算法。",
+          "内存访问模式：Column Sweep的非合并访问，需要转置或使用共享内存重新组织数据。",
+          "分支发散：边界条件处理可能导致分支发散。",
+          "共享内存限制：p和q数组可能过大，需分块处理。"
+        ],
+        "expected_speedup": "10-50倍（相对于优化后的CPU版本），具体取决于GPU型号和问题规模。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.5 FLOPs/byte（每个内循环迭代约10次浮点运算，访问约20字节内存）",
+        "cache_behavior": "1. Column Sweep：访问u[j][i]是跨行访问，每次访问间隔N个元素，导致缓存行利用率低（1/N）。2. Row Sweep：访问v[i][j]是连续访问，缓存友好。3. p和q数组在列方向访问，但每个i的p[i][j]是连续的。",
+        "data_dependencies": [
+          "列扫描中：p[i][j]依赖p[i][j-1]，q[i][j]依赖q[i][j-1]和u[j][i-1]、u[j][i]、u[j][i+1]，反向扫描中v[j][i]依赖v[j+1][i]。",
+          "行扫描类似，但依赖方向相反。",
+          "时间步之间：u和v数组交替更新，存在跨时间步依赖。"
+        ]
+      },
+      "cost": 0.01946525,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0287385
+  }
+}

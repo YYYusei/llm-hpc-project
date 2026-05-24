@@ -1,0 +1,123 @@
+{
+  "program": "heat_3d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory-bandwidth bound (stencil streaming) + limited cache reuse across time steps",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.05685225,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-80",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with nested loops iterating over the 3D arrays, which is the most computationally intensive part of the code.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 3D arrays with non-contiguous memory access patterns, leading to poor cache utilization and high memory bandwidth usage."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular, data-parallel computations over large datasets, which are well-suited for GPU acceleration.",
+        "recommended_approach": "Port the kernel_heat_3d function to CUDA or OpenCL, using GPU threads to handle different parts of the 3D arrays in parallel."
+      },
+      "cost": 0.008195250000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "memory-bandwidth bound (stencil streaming) + limited cache reuse across time steps",
+        "reasoning": "kernel_heat_3d 占用 ~90% 时间，核心为 3D 7-point stencil（中心点+6邻居）在大体积数组上做两次 sweep（A->B, B->A）。每个格点更新需要多次从内存读取邻居元素并写回结果，算术操作相对较少，算术强度低；且每个时间步需要对整个 3D 域读写两遍，工作集远大于 LLC 时，跨时间步复用几乎不存在，主要受内存带宽限制。k 为最内层虽保证单位步长访问，但 i/j 方向邻居跨行/跨平面导致缓存行复用有限；同时表达式中对 A[i][j][k]（或 B[i][j][k]）重复加载若编译器未充分寄存器化会进一步增加带宽压力。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "热点 kernel_heat_3d：减少每点内存流量（避免重复加载中心点）",
+          "technique": "标量替换/寄存器缓存 + 表达式重写（FMA 友好）",
+          "code_changes": "在最内层循环中先加载中心点并复用；将 0.125*(x -2*c + y) 形式改写为 0.125*(x+y) + (1-0.75)*c 或直接合并系数，减少对 c 的重复引用并利于编译器生成 FMA。\n\n示例（A->B 一段，B->A 同理）：\n```cpp\nfor (i=1;i<_PB_N-1;i++)\n  for (j=1;j<_PB_N-1;j++)\n    for (k=1;k<_PB_N-1;k++) {\n      DATA_TYPE c = A[i][j][k];\n      DATA_TYPE sum = A[i+1][j][k] + A[i-1][j][k]\n                    + A[i][j+1][k] + A[i][j-1][k]\n                    + A[i][j][k+1] + A[i][j][k-1];\n      // 原式等价：c + 0.125*(sum - 6*2? 注意原式为三方向各 -2*c，共 -6*c\n      B[i][j][k] = c + (DATA_TYPE)0.125 * (sum - (DATA_TYPE)6.0 * c);\n    }\n```\n（保持数值等价：原式三项各含 -2*c，总计 -6*c）",
+          "expected_speedup": "1.05x–1.20x（取决于编译器是否已做 CSE/寄存器化；带宽瓶颈下收益有限但稳定）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "热点 kernel_heat_3d：提升单核/单 NUMA 域带宽利用率",
+          "technique": "OpenMP 并行 + 合理 collapse/schedule + NUMA first-touch",
+          "code_changes": "对 i/j 维并行（避免对 k 并行导致更差的写合并/更高开销），并在初始化阶段并行 first-touch 以匹配 NUMA。\n\n```cpp\n// init_array: 并行 first-touch\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=0;i<n;i++)\n  for (int j=0;j<n;j++)\n    for (int k=0;k<n;k++)\n      A[i][j][k] = B[i][j][k] = ...;\n\n// kernel: A->B\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=1;i<_PB_N-1;i++)\n  for (int j=1;j<_PB_N-1;j++)\n    for (int k=1;k<_PB_N-1;k++) { ... }\n\n// kernel: B->A 同样并行\n```\n必要时加 `OMP_PROC_BIND=close`、`OMP_PLACES=cores`，并确保大页/NUMA 策略正确。",
+          "expected_speedup": "按内存带宽扩展：典型 4–16 核可达 3x–10x（到达带宽饱和后不再线性）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "热点 kernel_heat_3d：改善缓存复用（尤其是 i/j 方向邻居）",
+          "technique": "3D/2D cache blocking（tiling）+ 选择合适块尺寸",
+          "code_changes": "对 i/j/k 做分块，使一个 tile 的 3D 子块（含 halo）尽量驻留在 LLC/L2，减少跨行/跨平面反复从内存取数。示例（以 i/j 分块，k 保持内层连续）：\n```cpp\nconst int Ti=16, Tj=16; // 需按缓存/数据类型调参\nfor (t=1;t<=TSTEPS;t++) {\n  for (int ii=1; ii<_PB_N-1; ii+=Ti)\n    for (int jj=1; jj<_PB_N-1; jj+=Tj)\n      for (int i=ii; i<min(ii+Ti,_PB_N-1); i++)\n        for (int j=jj; j<min(jj+Tj,_PB_N-1); j++)\n          for (int k=1; k<_PB_N-1; k++) { /* A->B */ }\n  // B->A 同样分块\n}\n```\n块大小经验：让 (Ti*Tj*Nk_tile)*sizeof(DATA_TYPE) 及其 halo 在 LLC/L2 内；若 L2 较大可尝试 k 也分块（Tk=64/128）。",
+          "expected_speedup": "1.1x–1.6x（工作集远大于缓存时更明显；若已带宽饱和则收益受限）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "热点 kernel_heat_3d：跨时间步提升数据复用（减少每步全域读写两遍）",
+          "technique": "时间分块/波前（time skewing / diamond tiling）",
+          "code_changes": "将时间维 t 与空间维联合分块，在一个空间 tile 内连续推进多个时间步，使数据在缓存中被多次使用后再写回内存。实现可用经典 wavefront：对 (t,i,j) 做 skew 变换，或采用 diamond tiling（实现复杂）。\n\n代码层面通常需要重排循环并处理依赖边界，例如：\n- 选择 Tt（如 2–8）\n- 对 i 维做 skew：i' = i + t*s\n- 在 tile 内执行 A->B->A... 多步\n\n（PolyBench 代码可先用 Pluto/Polly 生成参考变换，再手工固化）",
+          "expected_speedup": "1.3x–3.0x（在内存带宽受限且缓存足够时潜力大；取决于 Tt 与 tile 设计）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "热点 kernel_heat_3d：提升向量化与访存效率",
+          "technique": "显式 SIMD（OpenMP simd）+ restrict + 对齐 + 线性化数组",
+          "code_changes": "PolyBench 的 3D 宏可能阻碍编译器别名分析；可将 A/B 线性化为 1D 并使用 restrict 指针，保证 k 维连续并显式向量化。\n\n示例（概念）：\n```cpp\nDATA_TYPE * __restrict A1 = &A[0][0][0];\nDATA_TYPE * __restrict B1 = &B[0][0][0];\nauto idx = [&](int i,int j,int k){ return (i*n + j)*n + k; };\n\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=1;i<n-1;i++)\n  for (int j=1;j<n-1;j++) {\n    #pragma omp simd\n    for (int k=1;k<n-1;k++) {\n      int p = idx(i,j,k);\n      DATA_TYPE c = A1[p];\n      DATA_TYPE sum = A1[p+n*n] + A1[p-n*n] + A1[p+n] + A1[p-n] + A1[p+1] + A1[p-1];\n      B1[p] = c + (DATA_TYPE)0.125*(sum - (DATA_TYPE)6.0*c);\n    }\n  }\n```\n并确保分配对齐（如 64B）与编译选项 `-O3 -march=native -ffast-math`（若允许）。",
+          "expected_speedup": "1.1x–1.4x（若原本未充分向量化/别名限制严重则更高）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "每个时间步两次 kernel（A->B, B->A），每个线程负责一个 (i,j,k) 网格点更新；采用 3D grid（或将 (i,j) 展平为 2D，k 为 x 维以保证合并访问）。使用 shared memory 做块内 halo 缓存：每个 thread block 加载 (Bx+2)*(By+2)*(Bz+2) 子块（含边界层）到 shared，再计算内部点，减少对全局内存的重复读取。对时间步可保持在 GPU 上循环，避免 CPU-GPU 往返。",
+        "data_layout": "使用线性化 1D 数组（row-major），令 k 为最快变化维（当前 C 布局已满足）。GPU 上建议：\n- 线程 x 维对应 k（连续地址，保证全局内存合并）\n- 线程块形状如 (Bx,By,Bz)=(32,4,1) 或 (16,8,1)，根据寄存器/shared 限制调参\n- 使用 pitched allocation 或手动对齐以改善对齐与吞吐",
+        "challenges": [
+          "shared memory 容量与 halo 开销：3D tile 的 (Bx+2)*(By+2)*(Bz+2) 可能很大；通常选择 Bz=1（或很小）并让 k 维在寄存器/全局中流式处理，或做 2.5D tiling",
+          "时间步同步与 kernel launch 开销：每步两次 launch；可用 CUDA Graphs 或在单 kernel 内做少量 time unrolling（Tt=2..4）但需处理读写切换与寄存器压力",
+          "边界处理与分支：边界层需要条件判断；可通过只发射内部域网格（i/j/k 从 1..n-2）避免分支",
+          "带宽瓶颈仍存在：即使在 GPU 上也多为带宽受限，需要依赖合并访问、shared 复用、以及可能的时间分块来接近峰值带宽"
+        ],
+        "expected_speedup": "相对单核 CPU：10x–60x（取决于 n、数据类型、CPU/GPU 带宽比与是否做 shared/时间分块）；相对多核已带宽饱和的 CPU：2x–8x 更常见。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.20–0.35 FLOPs/byte（内存受限）。估算：每点更新读取 7 个值（中心+6邻居）并写 1 个值。若为 double：最少内存流量约 (7R+1W)*8=64B；若考虑写分配(RFO)则约 72B。FLOPs：sum(5 adds) + (6*c)(1 mul) + (sum-6c)(1 sub) + *0.125(1 mul) + +c(1 add) ≈ 9 FLOPs（不同计数口径 9–13）。因此 AI≈9/72=0.125 到 13/64=0.20；若缓存命中/写回优化可到 ~0.3 左右，但总体仍偏低。",
+        "cache_behavior": "k 为最内层，A[i][j][k±1] 连续，空间局部性好；但 A[i][j±1][k] 跨 stride=n，A[i±1][j][k] 跨 stride=n*n，导致同一缓存行复用有限。对大 n（工作集 >> LLC），每个时间步两次全域 sweep 使数据在下一时间步前已被逐出，跨 t 的时间局部性差。写 B/A 为流式写，但通常触发写分配（RFO）增加读流量；若能使用 non-temporal store（在不需要很快读回且不破坏后续复用时）可降低带宽压力，但本程序下一半 sweep 会读 B（或 A），因此对同一数组的写后很快读回，是否适合 NT store 取决于分块/时间分块策略。",
+        "data_dependencies": [
+          "空间依赖（同一时间步内）：B[i][j][k] 依赖 A 的 6 个邻居与中心点（读 A，写 B），因此同一 sweep 内各 (i,j,k) 之间无写后读冲突（输出独立），适合并行",
+          "时间依赖：t 步的 B 依赖 t-1 步的 A；随后 A(t) 依赖 B(t)。因此时间维存在严格顺序依赖，需用双缓冲（已使用 A/B）或时间分块/波前来提升复用"
+        ]
+      },
+      "cost": 0.048657,
+      "bottleneck_raw": "memory-bandwidth bound (stencil streaming) + limited cache reuse across time steps"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.05685225
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "program": "hotspot",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory-bound (Memory Bandwidth & Cache Misses)",
+  "s1_score": 66.125,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.034496,
+  "full_result": {
+    "code_name": "hotspot",
+    "program_key": "hotspot",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "compute_tran_temp() - inner loop at line 66",
+          "estimated_time_percentage": "85%",
+          "reason": "This loop performs the main 2D stencil computation, which is the core of the thermal simulation and involves multiple arithmetic operations per grid cell.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the intensive arithmetic operations required for the 5-point stencil computation across a large grid."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular grid updates with a 5-point stencil, which is highly parallelizable and suitable for GPU execution.",
+        "recommended_approach": "Port the inner loop to a GPU kernel using CUDA or OpenCL, ensuring each thread handles a single grid cell update. Use shared memory to optimize data access patterns."
+      },
+      "cost": 0.01121575,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "Memory-bound (Memory Bandwidth & Cache Misses)",
+        "reasoning": "虽然该算法包含大量的浮点运算，但它本质上是一个 2D 5 点 stencil 差分计算。对于内部网格点，每次更新需要加载 5 个 temp 元素和 1 个 power 元素（共 48 字节），并写入 1 个 result 元素（8 字节），总共 56 字节的数据传输，而仅执行约 11 次浮点运算。其算术强度（Arithmetic Intensity）约为 0.2 FLOPs/byte，远低于现代 CPU 的平衡点，因此其真正的物理瓶颈是内存带宽和缓存失效，而非计算单元（ALU）饱和。此外，内层循环中存在大量的 if-else 分支判断，导致严重的控制流分支预测失败，这也极大地限制了指令级并行度（ILP）。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "消除内层循环分支预测瓶颈",
+          "technique": "Loop Peeling (循环剥离)",
+          "code_changes": "将边界条件（i=0, i=row-1, j=0, j=col-1）从主循环中剥离出来单独处理。主循环只计算内部节点（i从1到row-2，j从1到col-2），从而完全消除内层循环中的 if-else 分支判断，使编译器能够进行高效的向量化（SIMD）。",
+          "expected_speedup": "2.0x - 3.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "提高数据局部性与缓存命中率",
+          "technique": "Loop Tiling / Blocking (循环分块)",
+          "code_changes": "引入二维分块（Block Size 如 32x32 或 64x64），将大网格分割为适合 L1/L2 Cache 的小块进行计算，减少由于大跨度行访问导致的 Cache Line 频繁替换。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "多核并行化",
+          "technique": "OpenMP 多线程并行化与常数提取",
+          "code_changes": "在剥离分支后的主循环外层添加 `#pragma omp parallel for collapse(2)`。同时，将循环内部的重复计算（如 `step / Cap`，`2.0 * Rx_1` 等）提取为循环外的常数，减少冗余乘除法。",
+          "expected_speedup": "4.0x - 8.0x (取决于 CPU 核心数)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 或 OpenACC 进行二维线程块映射。每个线程负责计算一个网格点。利用 GPU 的 Shared Memory（共享内存）构建光晕区（Halo Exchange），将 5 点 stencil 所需的邻域数据一次性加载到 Shared Memory 中，避免对 Global Memory 的重复冗余读取。",
+        "data_layout": "保持现有的 1D 线性行优先布局（Row-Major），以确保 GPU 线程在读取相邻列元素（j, j+1, j-1）时能够实现合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "边界条件分支在 GPU 线程束（Warp）内会导致分支分化（Branch Divergence）。解决方案：在 CUDA Kernel 中使用三目运算符或边界线程提前退出，或者将边界计算与内部计算拆分为不同的 Kernel。",
+          "频繁的 CPU-GPU 数据拷贝。解决方案：将整个时间步循环（k 循环）放入 GPU 端执行，仅在初始和结束时进行数据传输。"
+        ],
+        "expected_speedup": "15x - 50x (相比于单线程 CPU 优化前版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.196 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，由于按行遍历，`temp[(i-1)*col+j]` 和 `temp[(i+1)*col+j]` 会导致跨行访问。当列宽 `col` 较大时，相邻行的数据无法驻留在 L1/L2 缓存中，导致高频的 Cache Miss。此外，由于没有写分配优化，写回 `result` 也会占用额外的总线带宽。",
+        "data_dependencies": [
+          "时间步迭代依赖：第 k+1 次迭代的输入 temp 依赖于第 k 次迭代的输出 result（通过指针交换解决，但限制了时间维度的并行）",
+          "空间无依赖：在单次迭代 k 内，`result[i*col+j]` 的更新仅依赖于上一时间步的 `temp` 邻域值，空间各网格点之间的计算完全独立，无数据写冲突"
+        ]
+      },
+      "cost": 0.023280250000000002,
+      "bottleneck_raw": "Memory-bound (Memory Bandwidth & Cache Misses)"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.034496
+  }
+}

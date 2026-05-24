@@ -51,6 +51,8 @@ def main():
                         help="Output parent directory (config subdir 'ablation_original' will be created)")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if result JSON already exists")
+    parser.add_argument("--s2-model", default=None,
+                        help="Override S2 model (e.g. deepseek-v3-2-251201, gemini-3.5-flash). Default: gpt-5.2")
     args = parser.parse_args()
     
     logging.basicConfig(
@@ -78,7 +80,7 @@ def main():
     
     pipeline = ConfigurableCascadedPipeline(
         s1_model=ORIGINAL_CONFIG['s1_model'],
-        s2_model=ORIGINAL_CONFIG['s2_model']
+        s2_model=args.s2_model or ORIGINAL_CONFIG['s2_model']
     )
     
     config_dir = output_dir / "ablation_original"

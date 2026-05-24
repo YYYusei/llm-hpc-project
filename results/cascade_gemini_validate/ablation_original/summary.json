@@ -1,0 +1,115 @@
+{
+  "config": {
+    "s1_model": "gpt-4o",
+    "s2_model": "gpt-5.2",
+    "label": "Original (4o→5.2)"
+  },
+  "timestamp": "2026-05-24T22:54:27.369611",
+  "programs_tested": [
+    "seidel_2d"
+  ],
+  "results": {
+    "seidel_2d": {
+      "program": "seidel_2d",
+      "config": "Original (4o→5.2)",
+      "s1_model": "gpt-4o",
+      "s2_model": "gemini-3.5-flash",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "Pipeline/Instruction Dependency & Memory Latency (Loop-carried Dependency)",
+      "s1_score": 61.50675675675675,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.0293055,
+      "full_result": {
+        "code_name": "seidel_2d",
+        "program_key": "seidel_2d",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_seidel_2d (line 50)",
+              "estimated_time_percentage": "90%",
+              "reason": "This function contains the main computational loop that iterates over time steps and grid points, performing the majority of the computation.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The kernel performs a 2D stencil computation which is typically memory-bound due to the need to load multiple neighboring elements from memory for each computation."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The computation is regular and involves a large number of independent operations, making it well-suited for GPU execution.",
+            "recommended_approach": "Use CUDA or OpenCL to offload the main computation to the GPU, ensuring coalesced memory accesses and using shared memory to reduce global memory bandwidth requirements."
+          },
+          "cost": 0.00756,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gemini-3.5-flash",
+          "validation": {
+            "bottleneck_correct": false,
+            "corrected_bottleneck": "Pipeline/Instruction Dependency & Memory Latency (Loop-carried Dependency)",
+            "reasoning": "虽然 2D Stencil 算法通常是访存受限（Memory-bound）的，但 Seidel-2d 算法具有非常强的**循环携带数据依赖（Loop-carried dependency）**。在计算 A[i][j] 时，它依赖于当前迭代步已经更新过的 A[i-1][j-1], A[i-1][j], A[i-1][j+1] 和 A[i][j-1]。这种严格的串行依赖导致编译器无法进行自动向量化（Vectorization），且无法直接进行多线程并行化。因此，真正的瓶颈在于数据依赖导致的流水线停顿（Pipeline Stall）和无法并行化，而非单纯的物理内存带宽限制。"
+          },
+          "analysis": {},
+          "detailed_optimizations": [
+            {
+              "target": "kernel_seidel_2d",
+              "technique": "Loop Tiling & Wavefront Parallelism (波前并行/斜向分块)",
+              "code_changes": "将 2D 空间循环进行坐标变换（Skewing），消除内层循环的依赖，从而允许向量化和多线程并行。变换公式：p = i + j, q = i - j。或者使用 OpenMP 的 `depend` 子句进行任务级波前并行化：\n```c\n// 伪代码示例：基于 Block 的波前并行\n#pragma omp parallel\n{\n  // 引入时间维度的 Tiling (Polyhedral Compilation 常用手段)\n  // 通过 PLUTO 等多面体编译器生成斜向分块代码\n}\n```",
+              "expected_speedup": "2.0x - 5.0x (多核 CPU 上)",
+              "difficulty": "hard"
+            },
+            {
+              "target": "kernel_seidel_2d",
+              "technique": "Register Blocking & Loop Unrolling",
+              "code_changes": "在无法直接并行的局部区域，通过手动展开循环（如展开 j 维），将中间结果暂存在寄存器中，减少对 L1 Cache 的重复读写。\n```c\n// 展开 j 维，每次处理 2 个元素，利用寄存器复用 A[i-1][j] 等数据\nfor (i = 1; i <= _PB_N - 2; i++) {\n  for (j = 1; j <= _PB_N - 3; j += 2) {\n    // 手动提取公共项，减少冗余访存\n  }\n}\n```",
+              "expected_speedup": "1.2x - 1.5x",
+              "difficulty": "medium"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "由于存在严格的局部数据依赖，不能直接将 i 和 j 循环映射到 GPU 的 ThreadIdx.y 和 ThreadIdx.x。必须采用以下策略之一：\n1. **波前并行（Wavefront/Diagonal Sweep）**：沿着对角线（i + j = const）并行化。同一条对角线上的元素彼此独立，可以由 GPU 线程并行计算。每次迭代沿对角线向右下方推进。\n2. **红黑着色法（Red-Black Gauss-Seidel）**：将网格点分为红点和黑点。红点只依赖黑点，黑点只依赖红点。第一步并行更新所有红点，第二步并行更新所有黑点。这改变了计算顺序，但极易在 GPU 上并行化。",
+            "data_layout": "维持标准的 2D 行优先（Row-Major）布局。在波前并行中，为了保证合并访存（Coalesced Memory Access），需要通过 Shared Memory 进行数据转置和缓存，或者使用 Warp Shuffle 指令在线程间传递数据。",
+            "challenges": [
+              "波前并行时，对角线长度动态变化，导致 GPU 线程利用率（Occupancy）在边界处极低，且线程束分化（Thread Divergence）严重。",
+              "红黑着色法虽然并行度极高，但改变了数值收敛轨迹，需要验证是否满足算法精度和收敛性要求。"
+            ],
+            "expected_speedup": "10x - 30x (相比于未优化的单线程 CPU 版本；若采用红黑着色法可达 50x+)"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "0.11 FLOPs/byte",
+            "cache_behavior": "在单线程串行执行时，由于 A[i][j] 的更新紧接着就会在下一行或下一个元素的计算中被读取（例如 A[i][j-1] 是刚刚更新过的值），L1 缓存命中率极高。然而，由于缺乏时间局部性优化（Time Tiling），当矩阵大小 N 远大于 L3 缓存容量时，跨时间步 t 的迭代会导致数据被反复写回主存再读出，造成严重的 Cache Capacity Miss。",
+            "data_dependencies": [
+              "RAW (Read-After-Write) 空间依赖：A[i][j] 依赖于同时间步内已更新的 A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1]",
+              "WAR (Write-After-Read) 空间依赖：A[i][j] 的更新不能覆盖还未被 A[i+1][j-1] 等后续元素使用的旧值（但在 Seidel 中，算法本身定义就是使用最新值，因此形成了严格的串行执行顺序）",
+              "跨时间步依赖：时间步 t+1 依赖于时间步 t 的完整计算结果"
+            ]
+          },
+          "cost": 0.0217455,
+          "bottleneck_raw": "Pipeline/Instruction Dependency & Memory Latency (Loop-carried Dependency)"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.0293055
+      }
+    }
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "program": "fdtd_2d",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.029078,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (lines 66-94)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves regular data access patterns and independent operations across grid points, which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, ensuring data transfer between host and device is minimized and overlapped with computation where possible."
+      },
+      "cost": 0.00900725,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "原分析正确。FDTD-2D 算法的算术强度极低，每个网格点仅需 2-4 次浮点运算，却需要多次内存读写（如更新 hz 需要读取 ex, ey 多个相邻元素）。此外，虽然内层循环 j 保证了行连续访问，但由于时间步 t 的存在，数据在时间维度上被反复读写，导致了巨大的内存带宽压力。瓶颈确实是 Memory Bandwidth Bound。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_fdtd_2d 循环融合与向量化",
+          "technique": "Loop Fusion & Vectorization",
+          "code_changes": "将更新 ey, ex, hz 的多个独立 i, j 循环在保证数据依赖的前提下进行局部融合，减少对 hz, ex, ey 的重复内存加载。同时，使用 #pragma omp simd 或 #pragma ivdep 强制编译器对最内层 j 循环进行 SIMD 向量化。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "CPU 多核并行化",
+          "technique": "OpenMP Parallel Loop",
+          "code_changes": "在每个时间步 t 内部，对外层 i 循环使用 #pragma omp parallel for 实施多线程并行化。注意需要保持时间步 t 的串行顺序，仅在空间网格上并行。",
+          "expected_speedup": "4.0x - 8.0x (取决于CPU核心数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "时间与空间时空平卡",
+          "technique": "Loop Tiling (Temporal & Spatial)",
+          "code_changes": "对 t, i, j 循环进行三维分块（Tiling），将数据缓存在 L1/L2 Cache 中，实现时间维度的重用，大幅降低对主存带宽的消耗。",
+          "expected_speedup": "2.0x - 3.5x",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将 ex, ey, hz 数组分配在 GPU 显存上。每个时间步 t 内部，启动三个连续的 CUDA Kernel 分别更新 ey, ex 和 hz。每个 Kernel 的线程块（Thread Block）映射到 2D 空间网格 (i, j)。利用共享内存（Shared Memory）暂存相邻的 hz, ex, ey 元素，以减少全局显存（Global Memory）的重复访问。",
+        "data_layout": "保持行优先（Row-Major）布局，确保最内层线程索引（threadIdx.x）映射到连续的 j 维度，从而实现完美的合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "时间步 t 之间的同步：由于 t 存在全局依赖，无法在单个 Kernel 内完成所有时间步，必须在主机端循环启动 Kernel，这会引入 Kernel 启动开销。解决方案：使用 CUDA Dynamic Parallelism 或在单个 Kernel 中使用 Cooperative Groups 进行网格级同步（仅限较小网格）。",
+          "边界条件处理：在差分计算中，边界处的线程需要进行分支判断，可能导致线程束分化（Warp Divergence）。解决方案：通过扩大网格边界（Padding）或将边界计算剥离到独立的轻量级 Kernel 中。"
+        ],
+        "expected_speedup": "20x - 50x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "~0.15 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，由于数组大小（NX*NY）通常远超 CPU 缓存容量，每个时间步 t 开始时，数据都会被完全挤出缓存。更新 hz 时需要读取 ex[i][j], ex[i][j+1], ey[i][j], ey[i+1][j]，这会导致严重的 L1/L2 缓存行冲突和重复加载。",
+        "data_dependencies": [
+          "时间步 t 之间存在严格的串行依赖：t 步的 hz 依赖于 t 步的 ex 和 ey，而 t+1 步的 ey 又依赖于 t 步的 hz。",
+          "空间依赖：ey[i][j] 依赖 hz[i][j] 和 hz[i-1][j]（I方向一阶差分）；ex[i][j] 依赖 hz[i][j] 和 hz[i][j-1]（J方向一阶差分）；hz[i][j] 依赖 ex 和 ey 的前向差分。"
+        ]
+      },
+      "cost": 0.02007075,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.029078
+  }
+}

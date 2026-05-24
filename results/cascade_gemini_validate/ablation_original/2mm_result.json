@@ -1,0 +1,107 @@
+{
+  "program": "2mm",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory-Bound 与 Instruction-Overhead 混合型瓶颈（在未优化前），优化后转化为 Compute-Bound",
+  "s1_score": 80.05839231547017,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": true,
+    "s1_matches_gt": true,
+    "s2_matches_gt": false,
+    "correction_type": "over-correction"
+  },
+  "cost": 0.03492125,
+  "full_result": {
+    "code_name": "2mm",
+    "program_key": "2mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_2mm, line 66-82",
+          "estimated_time_percentage": "70%",
+          "reason": "Matrix multiplication operations are typically compute-intensive and dominate execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_2mm, line 83-91",
+          "estimated_time_percentage": "25%",
+          "reason": "The second matrix multiplication and addition operation is also compute-intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary operations are matrix multiplications, which are compute-bound due to the large number of arithmetic operations relative to memory accesses."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves dense matrix operations, which are highly parallelizable and suitable for GPU acceleration.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU, ensuring data transfer overhead is minimized by keeping data on the GPU as much as possible."
+      },
+      "cost": 0.0090615,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "Memory-Bound 与 Instruction-Overhead 混合型瓶颈（在未优化前），优化后转化为 Compute-Bound",
+        "reasoning": "虽然矩阵乘法（GEMM）在理论上是计算密集型的，但在原始 C 代码实现中，由于缺乏循环分块（Tiling）和向量化，CPU 缓存命中率极低（尤其是对 B 和 C 矩阵的非连续跨步访问）。此外，内层循环中存在大量的地址计算开销和标量冗余乘法（如 alpha * A[i][k]）。因此，在未进行手工优化或编译器高级自动并行化之前，该程序实际受限于内存带宽（Cache Misses）和指令发射效率，而非纯粹的浮点计算峰值。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_2mm (两个矩阵乘法内核)",
+          "technique": "循环重组 (Loop Permutation) 与向量化 (SIMD)",
+          "code_changes": "将第一个 GEMM 的循环顺序从 i-j-k 改为 i-k-j，使对 B 矩阵的访问变为行连续访问，从而允许编译器自动生成 SIMD 向量化指令并消除对 tmp 的非连续写入。同理，将第二个 GEMM 的循环顺序重组，并提取常数乘法。\n\n```cpp\n// 优化后的 CPU 实现\n// 1. 第一个 GEMM: tmp = alpha * A * B\nfor (i = 0; i < _PB_NI; i++) {\n    for (j = 0; j < _PB_NJ; j++) {\n        tmp[i][j] = SCALAR_VAL(0.0);\n    }\n    for (k = 0; k < _PB_NK; k++) {\n        DATA_TYPE alpha_A = alpha * A[i][k];\n        #pragma omp simd\n        for (j = 0; j < _PB_NJ; j++) {\n            tmp[i][j] += alpha_A * B[k][j];\n        }\n    }\n}\n// 2. 第二个 GEMM: D = tmp * C + beta * D\nfor (i = 0; i < _PB_NI; i++) {\n    #pragma omp simd\n    for (j = 0; j < _PB_NL; j++) {\n        D[i][j] *= beta;\n    }\n    for (k = 0; k < _PB_NJ; k++) {\n        DATA_TYPE tmp_val = tmp[i][k];\n        #pragma omp simd\n        for (j = 0; j < _PB_NL; j++) {\n            D[i][j] += tmp_val * C[k][j];\n        }\n    }\n}\n```",
+          "expected_speedup": "4.0x - 8.0x (单线程下)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "整个 kernel_2mm",
+          "technique": "循环分块 (Loop Tiling) 与 OpenMP 多线程并行化",
+          "code_changes": "对外层循环进行 Tiling（如 64x64 块大小）以完全适配 L1/L2 Cache，并结合 `#pragma omp parallel for` 实现多核并行计算。",
+          "expected_speedup": "15.0x - 30.0x (多核 CPU 上)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 将两个 GEMM 映射为两个独立的 GPU Kernel。利用共享内存（Shared Memory）进行 2D 瓦片式（Tiled）协同加载，消除对全局内存（Global Memory）的重复读取。在 Kernel 1 中，每个 Thread Block 负责计算 `tmp` 的一个子块；Kernel 2 负责计算 `D` 的一个子块。两个 Kernel 之间通过 CUDA Stream 默认同步机制确保数据依赖安全。",
+        "data_layout": "保持现有的行优先（Row-Major）2D 数组布局。在 CUDA 线程映射中，确保 ThreadIdx.x 映射到矩阵的列索引（即最内层连续维度），以实现全局内存合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "共享内存中的 Bank Conflict：在分块转置或非步长 1 访问时可能发生，需要通过填充（Padding，如 `shared[16][17]`）来消除。",
+          "数据传输开销：若 PCIe 传输时间大于 GPU 计算时间，会导致整体加速比下降。需确保数据在 GPU 内存中常驻，或使用 Unified Memory / 异步拷贝（cudaMemcpyAsync）掩盖传输延迟。"
+        ],
+        "expected_speedup": "50.0x - 150.0x (相比于未优化的单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "对于大小为 N 的标准矩阵，总计算量约为 2 * (2 * N^3) = 4N^3 FLOPs。总数据传输量（若无 Cache 命中）约为 5 * N^2 * sizeof(DATA_TYPE) 字节。理论算术强度为 O(N)，但在无优化实现中，由于 Cache 抖动，实际算术强度退化至接近 O(1) FLOPs/byte。通过 Tiling 优化后，算术强度可提升至接近 Block_Size / sizeof(DATA_TYPE) FLOPs/byte。",
+        "cache_behavior": "在原始代码中，`B[k][j]` 和 `C[k][j]` 的访问在内层循环中随着 `k` 的变化而跨行跳转，导致极高的 L1/L3 D-Cache Miss rate。重组为 i-k-j 后，最内层循环对 `B[k][j]` 和 `D[i][j]` 的访问变为完美连续的空间局部性访问，Cache 命中率可提升至 95% 以上。",
+        "data_dependencies": [
+          "第一个 GEMM 中，`tmp[i][j]` 的累加对 `k` 存在流依赖（Read-after-Write），但通过重组为 i-k-j 并使用临时寄存器，可以消除空间依赖，实现并行的向量化写入。",
+          "第二个 GEMM 依赖于第一个 GEMM 输出的 `tmp` 矩阵，这两个大循环步之间存在全局数据依赖，必须顺序执行（或采用流水线分块，但通常直接顺序执行更高效）。"
+        ]
+      },
+      "cost": 0.02585975,
+      "bottleneck_raw": "Memory-Bound 与 Instruction-Overhead 混合型瓶颈（在未优化前），优化后转化为 Compute-Bound"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": true,
+      "s1_matches_gt": true,
+      "s2_matches_gt": false,
+      "correction_type": "over-correction"
+    },
+    "total_cost": 0.03492125
+  }
+}

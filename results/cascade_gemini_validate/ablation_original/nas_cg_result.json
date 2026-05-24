@@ -1,0 +1,114 @@
+{
+  "program": "nas_cg",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 83.58133971291866,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.035551250000000006,
+  "full_result": {
+    "code_name": "nas_cg",
+    "program_key": "nas_cg",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "sparse_matvec() - line 54",
+          "estimated_time_percentage": "65%",
+          "reason": "This function is the primary hotspot due to its memory-bound nature, caused by irregular memory access patterns and low arithmetic intensity.",
+          "confidence": "high"
+        },
+        {
+          "location": "dot_product() - line 92",
+          "estimated_time_percentage": "15%",
+          "reason": "This function is a secondary hotspot due to its memory-bound nature, with streaming access and low arithmetic intensity.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The primary bottleneck is memory-bound due to irregular memory access patterns in sparse_matvec() and low arithmetic intensity in both sparse_matvec() and dot_product()."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The sparse matrix-vector multiplication can benefit from GPU acceleration, but irregular memory access patterns may limit efficiency.",
+        "recommended_approach": "Use libraries like cuSPARSE for SpMV and optimize data transfer between host and device. Consider using hybrid formats like HYB to improve performance on GPUs."
+      },
+      "cost": 0.01120875,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步分析准确。SpMV (sparse_matvec) 的核心瓶颈在于间接寻址 `x[colidx[j]]` 导致的 L1/L2/L3 缓存不连续访问与高缺失率，且每个非零元仅执行一次乘法和一次加法（2 FLOPs），其算术强度极低，完全受限于内存带宽（Memory-bound）。dot_product 则是典型的流式向量操作，同样受限于内存带宽。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "sparse_matvec",
+          "technique": "OpenMP 并行化与循环展开 (Loop Unrolling)",
+          "code_changes": "void sparse_matvec(int n, const int *rowptr, const int *colidx, const double *values, const double *x, double *y)\n{\n    #pragma omp parallel for schedule(static)\n    for (int i = 0; i < n; i++) {\n        double sum = 0.0;\n        int start = rowptr[i];\n        int end = rowptr[i + 1];\n        int j = start;\n        // 4x Loop Unrolling\n        for (; j <= end - 4; j += 4) {\n            sum += values[j] * x[colidx[j]];\n            sum += values[j+1] * x[colidx[j+1]];\n            sum += values[j+2] * x[colidx[j+2]];\n            sum += values[j+3] * x[colidx[j+3]];\n        }\n        for (; j < end; j++) {\n            sum += values[j] * x[colidx[j]];\n        }\n        y[i] = sum;\n    }\n}",
+          "expected_speedup": "3.0x - 6.0x (取决于多核 CPU 核心数与内存通道数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "dot_product",
+          "technique": "SIMD 向量化 (AVX2/AVX-512) 与 OpenMP 规约",
+          "code_changes": "double dot_product(const double *x, const double *y, int n)\n{\n    double sum = 0.0;\n    #pragma omp parallel for reduction(+:sum) schedule(static)\n    for (int i = 0; i < n; i++) {\n        sum += x[i] * y[i];\n    }\n    return sum;\n}",
+          "expected_speedup": "2.0x - 4.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "sparse_matvec",
+          "technique": "分块 CSR (BCSR) 或 寄存器分块 (Register Blocking)",
+          "code_changes": "将稀疏矩阵重构为 2x2 或 4x4 的小块，复用向量 x 的加载值，减少间接寻址次数。由于需要修改数据结构生成部分，代码改动较大，需重写矩阵存储格式。",
+          "expected_speedup": "1.3x - 1.8x (在 OpenMP 基础上)",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 或 OpenACC 将 SpMV 和向量操作移植到 GPU。对于 SpMV，采用基于 Warp-Level 的并行策略：每个 Warp（32个线程）负责处理矩阵的一行或多行，利用 `__shfl_down_sync` 束内规约计算行和，避免线程分支发散，并利用 GPU 的高带宽（HBM/GDDR）缓解内存瓶颈。",
+        "data_layout": "保持 CSR 格式，但为了在 GPU 上实现合并内存访问（Coalesced Memory Access），可将数据转换为 ELLPACK 格式或采用 Hybrid (ELL + COO) 格式，使相邻线程访问连续的内存地址。",
+        "challenges": [
+          "由于每行的非零元个数可能不均匀，会导致 Warp 内的线程负载不均衡（Load Imbalance）。",
+          "频繁的 CPU-GPU 数据传输。必须将整个 CG 迭代循环（conj_grad）放入 GPU 运行，避免在每次迭代中传输向量 x, p, q, r。"
+        ],
+        "expected_speedup": "15x - 30x (相比于单线程 CPU 性能)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.125 FLOPs/byte",
+        "cache_behavior": "在 sparse_matvec 中，values 和 colidx 是连续读取的，能很好地利用 L1/L2 预取。然而，x[colidx[j]] 引入了随机内存访问。当矩阵规模较大（如 Class B）时，x 向量无法完全容纳在 CPU 缓存中，导致频繁的 L3 缓存缺失和 DRAM 访问延迟。dot_product 则是纯粹的流式读取，缓存复用率为 0。",
+        "data_dependencies": [
+          "sparse_matvec: 每一行的计算 `y[i]` 相互独立，无行间数据依赖，可完全并行化。",
+          "dot_product: 存在跨迭代的累加依赖（Reduction），在并行化时需要使用 reduction(+:sum) 避免竞态条件。"
+        ]
+      },
+      "cost": 0.024342500000000003,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.035551250000000006
+  }
+}

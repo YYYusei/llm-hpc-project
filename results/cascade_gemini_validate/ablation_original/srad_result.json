@@ -1,0 +1,114 @@
+{
+  "program": "srad",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory-bound (内存带宽瓶颈) 与 Cache Thrashing (缓存抖动)",
+  "s1_score": 63.19036697247705,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.0313985,
+  "full_result": {
+    "code_name": "srad",
+    "program_key": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Involves divergence computation and image update, which are computationally intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and operations are element-independent per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using GPU threads to handle different pixels and leveraging shared memory for intermediate computations."
+      },
+      "cost": 0.01105475,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "Memory-bound (内存带宽瓶颈) 与 Cache Thrashing (缓存抖动)",
+        "reasoning": "虽然 Phase 1 包含除法和数学运算，但原始代码中分配了 5 个与图像等大的 double 数组 (dN, dS, dW, dE, c)，在 2048x2048 分辨率下，每个数组占用 32MB，总计 160MB，远超 CPU L3 缓存容量。Phase 1 和 Phase 2 之间存在大量的中间数组读写，导致极高的内存带宽消耗和缓存失效。此外，代码中没有使用 SIMD 向量化，且存在重复的邻域边界计算。因此，真正的瓶颈是内存带宽和低效的缓存利用，而非纯计算瓶颈。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "消除中间大数组与内存带宽优化",
+          "technique": "Loop Fusion (循环融合) & Array Elimination (数组消除)",
+          "code_changes": "消除 dN, dS, dW, dE 数组。在单次循环中，直接利用局部变量计算梯度、ICOV 和 c[idx]。仅保留 c 数组用于 Phase 2 的散度计算，或者使用滑动窗口 (Sliding Window) 缓存 c 的值，将空间复杂度从 O(5*N) 降至 O(1*N) 甚至更低。",
+          "expected_speedup": "2.5x - 3.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "减少 Cache Miss 与提升局部性",
+          "technique": "Cache Blocking (分块优化) & OpenMP 并行化",
+          "code_changes": "引入 #pragma omp parallel for collapse(2) 进行多线程并行化。同时对行和列进行分块 (Tiling)，使工作集适配 L2/L3 缓存，减少伪共享和缓存失效。",
+          "expected_speedup": "6.0x - 10.0x (在多核 CPU 上)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "消除冗余边界判断与向量化",
+          "technique": "Loop Peeling (循环剥离) & SIMD Vectorization",
+          "code_changes": "将内部核心循环的边界条件 (i==0, i==rows-1 等) 剥离到循环体外处理。使内部核心循环（1 到 rows-2，1 到 cols-2）完全无分支，便于编译器自动进行 AVX2/AVX-512 向量化，或显式使用 #pragma omp simd 引导。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenCL 进行二维网格并行化。每个线程处理一个像素。利用 共享内存 (Shared Memory) 缓存图像像素和扩散系数 c，以消除冗余的全局内存访问。将 Phase 1 和 Phase 2 编写为两个独立的 Kernel，或者使用 Cooperative Groups 进行网格同步，合并为一个 Kernel。",
+        "data_layout": "保持一维连续布局 (Row-Major)，确保 GPU 线程束 (Warp) 在访问 image[idx]、c[idx] 时能够实现合并内存访问 (Coalesced Memory Access)。",
+        "challenges": [
+          "边界处的线程分支发散 (Branch Divergence)。",
+          "由于邻域访问 (N, S, E, W)，全局内存读取存在重复。必须使用 Shared Memory 或是 Texture Cache (ReadOnly Cache) 来缓解带宽压力。"
+        ],
+        "expected_speedup": "30x - 50x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.15 FLOPs/byte",
+        "cache_behavior": "极差。由于 5 个 32MB 数组的存在，每次迭代都会发生严重的 L3 缓存颠簸 (Thrashing)。Phase 2 访问 c[iS * cols + j] 和 c[i * cols + jE] 导致非连续内存读取，进一步降低了缓存命中率。",
+        "data_dependencies": [
+          "Phase 1 的 c[idx] 依赖于当前迭代的 image[idx] 及其四周邻域的值。",
+          "Phase 2 的 image[idx] 更新依赖于 Phase 1 计算出的 c 数组及其南向、东向邻域的值 (c[iS], c[jE])，这构成了跨 Phase 的数据依赖，阻止了简单的单层循环完全融合。"
+        ]
+      },
+      "cost": 0.02034375,
+      "bottleneck_raw": "Memory-bound (内存带宽瓶颈) 与 Cache Thrashing (缓存抖动)"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.0313985
+  }
+}

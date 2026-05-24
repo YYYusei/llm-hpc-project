@@ -1,0 +1,125 @@
+{
+  "program": "fdtd_2d",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory bandwidth / cache miss (streaming stencil)",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.05248075,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (lines 66-94)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves regular data access patterns and independent operations across large data sets, which are well-suited for GPU parallelization.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, focusing on maximizing occupancy and minimizing memory transfer overhead."
+      },
+      "cost": 0.00888125,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory bandwidth / cache miss (streaming stencil)",
+        "reasoning": "kernel_fdtd_2d 占比约 90% 且每个时间步对 ex/ey/hz 三个大二维数组做多次全域扫描。每个网格点的计算仅包含少量加减乘（低 FLOPs），但需要加载/存储多个数组元素（含邻点），整体算术强度低，性能主要受内存带宽与缓存复用不足限制。访问模式总体规则但存在跨行(i-1/i+1)与相邻列(j-1/j+1)的 stencil 读取，若未做块化/并行化与对齐，容易出现 L1/L2 命中率不高、带宽打不满或受写回压力影响。时间步之间存在严格依赖（t 维串行），但同一时间步内各二维点更新可并行。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_fdtd_2d: ey[0][j] = _fict_[t] (边界赋值)",
+          "technique": "SIMD + 并行化 + 减少循环开销",
+          "code_changes": "1) 将该循环与后续 ey 更新分离并并行：\n#pragma omp parallel for simd\nfor (int j=0;j<ny;j++) ey[0][j]=_fict_[t];\n2) 若使用编译器向量化不稳定，确保 ey 行连续：保持 j 为内层（已满足）。",
+          "expected_speedup": "整体贡献小（<5%），但可减少串行段；对多核可接近线性加速该段",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_fdtd_2d: ey 更新 (i=1..nx-1, j=0..ny-1)",
+          "technique": "OpenMP 并行 + SIMD 向量化 + restrict/对齐 + cache blocking",
+          "code_changes": "A) 指针别名与对齐：将 POLYBENCH_2D 访问在内核中转为扁平指针并加 restrict（或在函数签名中加 restrict）：\nDATA_TYPE (*restrict ex)[NY] = ...; 同理 ey,hz。\nB) 并行与向量化：\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=1;i<nx;i++) {\n  #pragma omp simd\n  for (int j=0;j<ny;j++)\n    ey[i][j] -= (DATA_TYPE)0.5*(hz[i][j]-hz[i-1][j]);\n}\nC) 块化（提升 hz 两行复用与写回局部性）：\nfor (ii=1; ii<nx; ii+=Ti)\n  for (jj=0; jj<ny; jj+=Tj)\n    for (i=ii; i<min(ii+Ti,nx); i++)\n      for (j=jj; j<min(jj+Tj,ny); j++) ...\n建议 Tj 取 128~512/sizeof(DATA_TYPE) 的元素数，Ti 取 8~32（依 L2/L3 调参）。",
+          "expected_speedup": "CPU 多核：取决于带宽，常见 4-12x（相对单线程）；块化可再提升 1.1-1.4x（视缓存/NUMA）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_fdtd_2d: ex 更新 (i=0..nx-1, j=1..ny-1)",
+          "technique": "OpenMP 并行 + SIMD + 边界处理外提 + 预取/对齐",
+          "code_changes": "A) 外提边界 j=0 不更新，保持 j 从 1 开始（已满足）。\nB) 并行与向量化：\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=0;i<nx;i++) {\n  #pragma omp simd\n  for (int j=1;j<ny;j++)\n    ex[i][j] -= (DATA_TYPE)0.5*(hz[i][j]-hz[i][j-1]);\n}\nC) 若编译器不易向量化，确保连续访问：保持 j 内层；可加编译选项 -O3 -march=native -ffast-math(若允许)；并确保数组按 64B 对齐（PolyBench 通常已对齐，但可确认/改为 aligned_alloc）。",
+          "expected_speedup": "与 ey 类似，受带宽限制；块化/并行后通常 4-12x（相对单线程），额外优化 1.05-1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_fdtd_2d: hz 更新 (i=0..nx-2, j=0..ny-2)",
+          "technique": "融合/块化以提升 ex/ey 复用 + OpenMP 并行 + SIMD + 减少内存流量",
+          "code_changes": "A) 该步读取 ex[i][j], ex[i][j+1], ey[i][j], ey[i+1][j] 并写 hz[i][j]，建议对 (i,j) 做 2D tile，使 ex/ey 的相邻元素在缓存中复用。\nB) 并行与向量化：\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i=0;i<nx-1;i++) {\n  #pragma omp simd\n  for (int j=0;j<ny-1;j++) {\n    hz[i][j] -= (DATA_TYPE)0.7 * ( (ex[i][j+1]-ex[i][j]) + (ey[i+1][j]-ey[i][j]) );\n  }\n}\nC) 更激进：时间步内不建议跨步骤融合（ey/ex/hz 三阶段存在读写依赖），但可在 hz 更新中对 ex/ey 的差分先在寄存器中计算，避免重复加载（编译器通常可做）。\nD) NUMA：大尺寸时使用 first-touch 初始化并绑定线程（OMP_PROC_BIND=close, OMP_PLACES=cores）。",
+          "expected_speedup": "与前两步类似；tile 后对 ex/ey 的缓存命中改善，常见 1.1-1.5x（在带宽未饱和或 LLC 压力大时更明显）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_fdtd_2d: 全局（跨三个更新阶段）",
+          "technique": "减少写分配/写回压力 + 编译器与数据类型策略",
+          "code_changes": "A) 若平台支持并且允许：对大数组写入使用 non-temporal store（需要手写 intrinsics 或编译器 pragma，且仅当数据不会很快被再次读取才有利；本 kernel 中 ex/ey 写后会在同一 t 的 hz 阶段读取，因此对 ex/ey 不建议 NT store；hz 写后下一 t 会读，通常也不建议）。\nB) 若精度允许：DATA_TYPE 从 double 改 float（PolyBench 可配置），内存流量减半，带宽瓶颈下接近 1.6-2.0x。\nC) 确保编译选项：-O3 -march=native；OpenMP：-fopenmp；并检查向量化报告（如 GCC -fopt-info-vec）。",
+          "expected_speedup": "float：~1.6-2.0x；编译/向量化修正：1.1-1.3x（若原本未充分向量化）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "按时间步串行、每个阶段一个 kernel（或使用 CUDA Graph/融合 launch 以降低启动开销）。每个 kernel 采用 2D grid 覆盖 (i,j) 点：\n1) kernel_set_ey0<<<(ny+T-1)/T, T>>>(t): 写 ey[0][j]\n2) kernel_update_ey<<<dim3(ceil(ny/Tx), ceil((nx-1)/Ty)), dim3(Tx,Ty)>>>\n3) kernel_update_ex<<<dim3(ceil((ny-1)/Tx), ceil(nx/Ty)), dim3(Tx,Ty)>>>\n4) kernel_update_hz<<<dim3(ceil((ny-1)/Tx), ceil((nx-1)/Ty)), dim3(Tx,Ty)>>>\n其中 Tx 建议 32（保证合并访问），Ty 4~8；对 hz 更新可用 shared memory tile 缓存 ex/ey 邻域以减少全局读。",
+        "data_layout": "保持行主序（C contiguous）：j 为最快维度。GPU 上确保 pitch/对齐：使用 cudaMallocPitch 或保证 NY 连续且 128B 对齐。建议将 ex/ey/hz 展平为 1D：idx=i*ny+j，便于手写 CUDA/HIP。_fict_ 放 constant memory 或每步从 host 传标量 fict_t。",
+        "challenges": [
+          "阶段间必须全局同步：ey/ex/hz 三阶段需要 kernel 边界同步（或 cooperative groups，但复杂）；因此每个 t 至少 3-4 次 kernel launch，tmax 大时 launch 开销可忽略，小 tmax 时需 CUDA Graph 优化",
+          "hz 更新需要读取 ex/ey 的相邻元素，若不做 tile，带宽压力大；tile 需处理边界与 shared memory bank/conflict",
+          "带宽瓶颈明显：性能主要取决于 HBM 带宽与访问合并；需要保证 j 方向线程连续以实现 coalescing",
+          "若使用 double，部分 GPU 吞吐/带宽比更差；float 可显著提升"
+        ],
+        "expected_speedup": "相对单核 CPU：常见 20-80x（取决于问题规模与精度）；相对已带宽饱和的多核 CPU：约 3-10x（double），float 可能更高。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "≈0.08–0.12 FLOPs/byte（double，未计缓存复用；按每点约 11 FLOPs、约 96–136 bytes 访存估算，实际因缓存/写分配略有浮动）",
+        "cache_behavior": "三次二维全域 sweep/时间步：\n- ey 更新读取 hz[i][j] 与 hz[i-1][j]（两行），写 ey[i][j]；对 j 连续，空间局部性好；对 i-1 行有一定时间局部性，但工作集大时主要依赖 L2/L3。\n- ex 更新读取 hz[i][j] 与 hz[i][j-1]（同一行相邻列），写 ex[i][j]；对 j 连续，易向量化。\n- hz 更新读取 ex(i,j/j+1) 与 ey(i/i+1,j)，写 hz；需要相邻行/列，tile 可提升 ex/ey 的复用并降低 LLC 压力。\n整体呈 streaming stencil，若 nx*ny 很大，性能接近内存带宽上限；多线程下易受带宽饱和与 NUMA 影响。",
+        "data_dependencies": [
+          "时间步依赖：t+1 需要 t 结束后的 ex/ey/hz（t 维串行）",
+          "同一时间步内阶段依赖：ey(阶段2) 依赖 hz(阶段4 的上一时间步结果)；ex(阶段3) 依赖同一时间步开始时的 hz；hz(阶段4) 依赖本时间步更新后的 ex 与 ey",
+          "空间依赖（stencil）：ey[i][j] 依赖 hz[i][j], hz[i-1][j]；ex[i][j] 依赖 hz[i][j], hz[i][j-1]；hz[i][j] 依赖 ex[i][j], ex[i][j+1], ey[i][j], ey[i+1][j]"
+        ]
+      },
+      "cost": 0.0435995,
+      "bottleneck_raw": "memory bandwidth / cache miss (streaming stencil)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.05248075
+  }
+}

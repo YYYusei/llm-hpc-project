@@ -1,0 +1,108 @@
+{
+  "program": "gramschmidt",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 48.02710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03168725,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt (line 66)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with multiple nested loops, which are likely to dominate the execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "Inner loop of kernel_gramschmidt (line 74-80)",
+          "estimated_time_percentage": "50%",
+          "reason": "The inner loop performs operations on arrays A and Q, which involve repeated memory accesses and computations.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large matrices A, R, and Q, which suggests that memory bandwidth and latency are likely the primary bottlenecks."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves large matrix operations that are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the kernel_gramschmidt function to CUDA or OpenCL, focusing on parallelizing the innermost loops and optimizing memory access patterns for the GPU."
+      },
+      "cost": 0.00880775,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "Memory Bandwidth & Cache Inefficiency (Non-contiguous Memory Access)",
+        "reasoning": "原分析正确。Gram-Schmidt 算法在 C 语言的行优先（Row-major）存储布局下，频繁对二维数组 A 和 Q 进行列向跨步访问（如 A[i][k]、Q[i][k]，其中内层循环是 i）。这导致了极差的空间局部性（Stride-M），引发频繁的 L1/L2 缓存缺失和 TLB 抖动，使内存带宽和延迟成为绝对瓶颈。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_gramschmidt (内层循环 i)",
+          "technique": "Loop Nest Optimization & Cache Blocking (矩阵转置与循环融合)",
+          "code_changes": "1. 在计算前将 A 矩阵转置为 A_T (N x M)，使对列的访问变为对行的连续访问。\n2. 同样将 Q 存储为 Q_T (N x M)。\n3. 优化后的核心计算：\nfor (k = 0; k < _PB_N; k++) {\n  nrm = 0.0;\n  for (i = 0; i < _PB_M; i++) nrm += A_T[k][i] * A_T[k][i];\n  R[k][k] = sqrt(nrm);\n  for (i = 0; i < _PB_M; i++) Q_T[k][i] = A_T[k][i] / R[k][k];\n  for (j = k + 1; j < _PB_N; j++) {\n    R[k][j] = 0.0;\n    // 融合点积与向量减法，或使用 SIMD 向量化\n    for (i = 0; i < _PB_M; i++) R[k][j] += Q_T[k][i] * A_T[j][i];\n    for (i = 0; i < _PB_M; i++) A_T[j][i] -= Q_T[k][i] * R[k][j];\n  }\n}",
+          "expected_speedup": "3.0x - 5.0x (CPU 单线程)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_gramschmidt (外层循环 j)",
+          "technique": "OpenMP 多线程并行化与 SIMD 向量化",
+          "code_changes": "在转置后的 `for (j = k + 1; j < _PB_N; j++)` 循环上应用 `#pragma omp parallel for`。同时，对最内层的 `i` 循环应用 `#pragma omp simd` 或 `#pragma vector always` 以强制编译器生成 AVX2/AVX-512 向量化指令。",
+          "expected_speedup": "8.0x - 15.0x (多核 CPU)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 将 A 和 Q 矩阵以转置格式（Row-major，即 A_T[N][M]）拷贝至 GPU 显存。\n2. 迭代 k 从 0 到 N-1：\n   a. 使用 cublasDnrm2 计算 A_T[k] 的模长，更新 R[k][k]。\n   b. 启动一个一维 Kernel，将 A_T[k] 除以 R[k][k] 得到 Q_T[k]。\n   c. 启动一个二维 Grid Kernel 并行处理 j = k+1 到 N-1 的列更新。每个 Block 处理一个或多个 j，利用共享内存（Shared Memory）对 `Q_T[k][i] * A_T[j][i]` 进行归约求和得到 R[k][j]，随后每个线程独立更新 `A_T[j][i]`。",
+        "data_layout": "采用转置布局（M x N 变为 N x M），确保 GPU 线程在读取 `i` 维度时满足合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "每轮迭代 k 之间的同步开销：由于算法的串行依赖，需要启动 N 次 Kernel，小规模矩阵下启动开销占比高。",
+          "归约操作（Reduction）的效率：在计算 R[k][j] 时需要跨线程归约，需使用 Warp Shuffle 指令优化。"
+        ],
+        "expected_speedup": "20.0x - 50.0x (相比于未优化的 CPU 串行版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 2.0 FLOPs/byte",
+        "cache_behavior": "在原始代码中，由于按列访问（A[i][k]），每次加载一个 double 元素（8 bytes）都会将整条 Cache Line（64 bytes）载入，但其余 7 个元素未被使用即被替换，导致 Cache 效率仅为 12.5%。转置后，连续的 `i` 循环完美匹配 Cache Line 预取，Cache 命中率可提升至 95% 以上。",
+        "data_dependencies": [
+          "Loop k 存在循环携带依赖：第 k 步生成的 Q[i][k] 用于更新后续所有 j > k 的 A[i][j]。",
+          "Loop j 之间相互独立，可以完全并行化。",
+          "Loop i 在计算 R[k][j] 时存在归约依赖（Reduction），在更新 A[i][j] 时是数据并行的。"
+        ]
+      },
+      "cost": 0.0228795,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03168725
+  }
+}

@@ -1,0 +1,140 @@
+{
+  "program": "adi",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory bandwidth + cache/TLB inefficiency (stride access) under loop-carried dependencies",
+  "s1_score": 60.74999999999999,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.05660725,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_adi, Column Sweep loop, line 66",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop iterates over the entire 2D array multiple times, performing calculations that involve dependencies on previous iterations.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi, Row Sweep loop, line 80",
+          "estimated_time_percentage": "40%",
+          "reason": "Similar to the Column Sweep, this loop also iterates over the entire 2D array with dependencies, contributing significantly to the execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The performance is primarily limited by memory access patterns due to the frequent reads and writes to large 2D arrays, which can lead to cache misses and inefficient memory bandwidth utilization."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent operations within the sweeps, making it suitable for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the sweeps, mapping each iteration of the outer loops to a GPU thread block and each inner loop iteration to a thread."
+      },
+      "cost": 0.00972125,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory bandwidth + cache/TLB inefficiency (stride access) under loop-carried dependencies",
+        "reasoning": "两段热点（Column Sweep 与 Row Sweep）都包含 Thomas 三对角求解的前向递推/回代：j 方向存在强 loop-carried dependency，限制了向量化与细粒度并行；同时每步需要对 u/v/p/q 做多次读写。尤其 Column Sweep 中访问 u[j][i±1]、v[j][i] 属于按列访问（C 行主序下 stride=N），导致缓存行利用率低、TLB 压力大、硬件预取效果差，实际表现为内存带宽/访存延迟主导。Row Sweep 的访问更连续，但仍被 p/q 的递推依赖限制 ILP/向量化，且整体数据规模大时工作集超出缓存，带宽仍是主要限制。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep loop (line ~66): improve locality of u/v column access",
+          "technique": "transpose/SoA layout or explicit packing of columns into contiguous buffers; then run Thomas on packed data",
+          "code_changes": "在每个 tstep 的 Column Sweep 前，将 u 的列方向数据打包为连续数组（或维护 uT=transpose(u) 使列访问变为行访问）。示例（packing）：\n1) 分配临时缓冲：DATA_TYPE *uc = aligned_alloc(64, n*sizeof(DATA_TYPE));\n2) 对固定 i：for (j=0;j<n;j++) uc[j]=u[j][i]; 同时需要 u[j][i-1],u[j][i+1] 可打包为 ucm1/ucp1 或在打包时读取。\n3) Thomas 前向：使用 uc/ucm1/ucp1 计算 q/p；回代写回 vc[j]；最后 for (j=0;j<n;j++) v[j][i]=vc[j];\n若允许更大改动：维护 uT[i][j]=u[j][i]、vT 同理，Column Sweep 直接在 uT 的行上做连续访问，结束后再转置回或后续都用转置布局。",
+          "expected_speedup": "1.3x–2.5x（取决于 N、缓存/TLB、是否避免额外拷贝；转置布局通常优于每次 packing）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "Column Sweep loop: reduce redundant loads and divisions",
+          "technique": "common subexpression elimination + reciprocal hoisting + restrict/alignment",
+          "code_changes": "将分母 denom = a*p[i][j-1]+b 提取并用倒数替代除法：\nfor (j=1; j<n-1; j++) {\n  DATA_TYPE denom = a*pijm1 + b; // pijm1 = p[i][j-1]\n  DATA_TYPE inv = SCALAR_VAL(1.0)/denom;\n  p[i][j] = -c * inv;\n  q[i][j] = (rhs - a*qijm1) * inv;\n}\n同时用局部标量缓存 p[i][j-1], q[i][j-1]（避免重复从内存读）：\nDATA_TYPE pijm1=p[i][0], qijm1=q[i][0];\n循环内更新 pijm1=qijm1。\n为编译器提供别名信息：将 kernel_adi 形参改为 DATA_TYPE (*restrict u)[N] 等，或在 PolyBench 宏外包一层 restrict 指针；并确保 64B 对齐（PolyBench 通常已对齐，但可显式使用 aligned_alloc/posix_memalign）。",
+          "expected_speedup": "1.1x–1.4x（除法减少、load 减少、ILP 提升；对大 N 更明显）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Row Sweep loop (line ~80): enable better vectorization/throughput",
+          "technique": "scalar replacement + loop fission for boundary + pragma hints",
+          "code_changes": "将边界赋值与主循环拆分，减少分支/写入干扰：\nfor (i=1;i<n-1;i++) { u[i][0]=1; p[i][0]=0; q[i][0]=1; }\nfor (i=1;i<n-1;i++) {\n  DATA_TYPE pijm1=0, qijm1=1;\n  for (j=1;j<n-1;j++) {\n    DATA_TYPE denom = d*pijm1 + e;\n    DATA_TYPE inv = 1/denom;\n    DATA_TYPE rhs = (-a*v[i-1][j] + (1+2*a)*v[i][j] - c*v[i+1][j]);\n    DATA_TYPE pij = -f*inv;\n    DATA_TYPE qij = (rhs - d*qijm1)*inv;\n    p[i][j]=pij; q[i][j]=qij;\n    pijm1=pij; qijm1=qij;\n  }\n}\n回代同理用局部缓存减少读：\nDATA_TYPE unext = u[i][n-1]=1; for (j=n-2;j>=1;j--) { unext = p[i][j]*unext + q[i][j]; u[i][j]=unext; }\n并可加编译器提示：#pragma clang loop unroll(enable) 或 #pragma GCC unroll 4（谨慎，避免 I-cache 压力）。",
+          "expected_speedup": "1.1x–1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Both sweeps: improve cache reuse across i by blocking and reducing p/q footprint",
+          "technique": "tile i dimension + reuse p/q buffers per i (1D) instead of full N×N",
+          "code_changes": "观察到 p[i][j], q[i][j] 仅在同一 i 的前向/回代中使用，可将 p/q 从 2D 改为 1D 临时数组（长度 n），每个 i 重用：\nDATA_TYPE *p1 = aligned_alloc(64,n*sizeof(DATA_TYPE));\nDATA_TYPE *q1 = aligned_alloc(64,n*sizeof(DATA_TYPE));\nfor (i=1;i<n-1;i++) { p1[0]=0; q1[0]=...; for (j=1;j<n-1;j++){... p1[j]=...; q1[j]=...;} for (j=n-2;j>=1;j--){ v[j][i]=p1[j]*v[j+1][i]+q1[j]; } }\nRow Sweep 同理。\n这样将 p/q 的写流量从 O(n^2) 降到 O(n)（每 i），显著降低内存带宽压力与缓存污染。",
+          "expected_speedup": "1.3x–2.0x（通常非常可观，尤其当原 p/q 不能驻留缓存时）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Build/compile level",
+          "technique": "fast-math (if acceptable), LTO, architecture tuning",
+          "code_changes": "编译选项建议：-O3 -march=native -ffast-math（若允许放宽 IEEE）-fno-math-errno -funroll-loops(谨慎)；并开启 LTO：-flto。若使用 OpenMP 并行 i（见下条），加 -fopenmp。",
+          "expected_speedup": "1.05x–1.2x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "CPU parallelism across independent lines",
+          "technique": "OpenMP parallelize over i (each i is an independent tridiagonal solve)",
+          "code_changes": "两段 sweep 的外层 i 循环可并行（每个 i 独立，前提是 p/q 使用 1D 私有缓冲或 p/q 2D 不共享写同一行）：\n#pragma omp parallel for schedule(static)\nfor (i=1;i<n-1;i++) { ... }\n若采用 1D p1/q1，需要在并行区内私有分配或使用 threadprivate 缓冲（例如每线程分配一次）。",
+          "expected_speedup": "接近 CPU 核数的 0.6x–0.9x 并行效率（受内存带宽限制；例如 8 核可能 4x–7x）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "以“每条独立三对角线=一个并行任务”为核心：对每个 tstep，Column Sweep 启动 (n-2) 个任务（对应 i=1..n-2 的列线），Row Sweep 同理（对应行线）。每个任务内部执行 Thomas（顺序）或使用并行三对角算法（PCR/CR）以提升单任务并行度。推荐两级方案：\n(1) 简化高效：一个 CUDA block 处理一条线，线程 0 顺序 Thomas（或少量线程协作做加载/存储），依赖大量并发线来填满 GPU；\n(2) 更激进：对每条线用 PCR/CR（parallel cyclic reduction）在 block 内并行求解，降低串行段，适合 n 较大时。",
+        "data_layout": "关键是避免列访问的非合并：\n- 方案A（推荐）：维护转置布局 uT/vT（使 Column Sweep 变为行连续访问），Row Sweep 访问原布局；两者之间通过转置核或直接双布局维护（每步写两份，增加带宽）。\n- 方案B：仅对 Column Sweep 做按列打包到临时连续缓冲（device 上用 kernel gather/scatter），Thomas 在连续缓冲上执行，再 scatter 回 v。\n- p/q 建议不保留全局 2D：在 GPU 上每条线使用 shared memory 或全局 1D 临时（每线一段）存放 p/q，减少全局写流量。",
+        "challenges": [
+          "Thomas 算法本质串行：若每条线仅用单线程，会出现长串行段；需要足够多的线并发或采用 PCR/CR 提升并行度",
+          "Column Sweep 的内存合并问题：原始 u[j][i] 列访问在 GPU 上会导致非合并加载，必须通过转置/打包解决，否则带宽利用率很差",
+          "寄存器/共享内存压力：PCR/CR 需要多轮同步与临时数组，n 大时 shared memory 占用高，影响 occupancy",
+          "数值稳定性与精度：PCR/CR 与 fast-math 可能改变舍入误差；需根据 DATA_TYPE（float/double）评估",
+          "kernel launch 开销：每个 tstep 两次 sweep，若再加转置/打包会增加 kernel 数；需要融合（fuse）或使用 CUDA Graphs 降低开销"
+        ],
+        "expected_speedup": "相对单核 CPU：5x–30x（取决于 N、是否解决列访问合并、以及采用 Thomas(串行) 还是 PCR/CR）。相对多核 CPU（OpenMP）：1.5x–6x 更常见；若不做转置/打包，Column Sweep 可能几乎无加速甚至变慢。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.15–0.35 FLOPs/byte（取决于是否将 p/q 改为 1D 以及缓存命中；原始实现因 p/q 大量写回更偏低）",
+        "cache_behavior": "Row Sweep：对 v[i][j]、p[i][j]、q[i][j]、u[i][j] 多为连续访问（j 为内层），缓存友好但工作集大时仍带宽受限。Column Sweep：对 u[j][i]、v[j][i] 为 stride=N 的列访问，导致每次迭代触碰不同 cache line，空间局部性差；同时 p/q 以 p[i][j]、q[i][j] 连续写入（行访问）相对友好，但整体被 u/v 的列访问拖累，并可能产生较高 TLB miss。若将 p/q 改为 1D，可显著减少写流量与缓存污染。",
+        "data_dependencies": [
+          "前向递推：p[i][j] 依赖 p[i][j-1]；q[i][j] 依赖 q[i][j-1] 与 p[i][j-1]（强 loop-carried dependency，阻碍 j 方向并行/向量化）",
+          "回代：v[j][i] 依赖 v[j+1][i]；u[i][j] 依赖 u[i][j+1]（反向依赖）",
+          "i 之间独立：对固定 t，Column Sweep 的每个 i 独立；Row Sweep 的每个 i 独立（因此适合 OpenMP/GPU 以 i 为并行维度）",
+          "tsteps 之间串行：t 迭代存在真实数据依赖（u/v 更新进入下一步）"
+        ]
+      },
+      "cost": 0.046886,
+      "bottleneck_raw": "memory bandwidth + cache/TLB inefficiency (stride access) under loop-carried dependencies"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.05660725
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "program": "heat_3d",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Instruction Overhead (L1/L2 Cache Latency & Redundant Arithmetic)",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03005975,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-80",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with nested loops iterating over the 3D arrays, which is the most computationally intensive part of the code.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 3D arrays with non-contiguous memory access patterns, leading to poor cache utilization and high memory bandwidth usage."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent computations across the 3D grid, which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the kernel_heat_3d function to the GPU, ensuring data transfer between host and device is minimized and overlapped with computation."
+      },
+      "cost": 0.00839125,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "Memory Bandwidth & Instruction Overhead (L1/L2 Cache Latency & Redundant Arithmetic)",
+        "reasoning": "原分析认为瓶颈在于非连续内存访问（non-contiguous memory access），这不完全准确。在最内层循环中，k 维是连续访问的（A[i][j][k]），因此空间局部性良好。真正的瓶颈在于：1. 3D 模板（Stencil）计算中，跨 i 和 j 维度（A[i+1][j][k] 和 A[i][j+1][k]）的访问引入了跨行/跨面的高延迟 Cache Miss；2. 算术强度极低，每个时钟周期需要大量的内存加载，导致严重的内存带宽受限；3. 冗余计算，如多次乘以 SCALAR_VAL(2.0) 和 SCALAR_VAL(0.125) 可以通过代数化简合并。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Loop Tiling (3D Blocking) & Register Blocking",
+          "code_changes": "将 i, j, k 循环进行分块（Tiling），以适应 L1/L2 Cache 大小。同时，在最内层循环使用寄存器缓存 A[i][j][k] 及其邻居，减少重复的内存加载。例如，定义 tile 大小为 Ti, Tj, Tk，并对循环进行重构。",
+          "expected_speedup": "1.5x - 2.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Algebraic Simplification & Vectorization (AVX-512/AVX2)",
+          "code_changes": "化简数学表达式：将原式 `0.125 * (A[i+1] - 2*A + A[i-1]) + 0.125 * (A[j+1] - 2*A + A[j-1]) + 0.125 * (A[k+1] - 2*A + A[k-1]) + A` 化简为 `0.125 * (A[i+1] + A[i-1] + A[j+1] + A[j-1] + A[k+1] + A[k-1]) + 0.25 * A`。使用 `#pragma omp simd` 或编译器向量化指令引导最内层 k 循环进行 SIMD 向量化。",
+          "expected_speedup": "1.8x - 3.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Temporal Wavefront Tiling (时间-空间联合分块)",
+          "code_changes": "打破 t 循环与空间循环的屏障，将时间步 t 与空间维度 i, j 联合分块。在 Cache 中完成多次时间步迭代后再写回主存，彻底消除内存带宽瓶颈。",
+          "expected_speedup": "3.0x - 5.0x",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenACC 进行 3D 线程块映射。将 3D 网格映射到 GPU 的 Grid 和 Block。使用共享内存（Shared Memory）缓存每个 Block 对应的 3D 数据块（包括 Halo 边界区域），以消除对全局内存（Global Memory）的重复冗余访问。利用 Double Buffering（双缓冲区）在 A 和 B 之间交替更新，避免同步开销。",
+        "data_layout": "保持现有的行优先（Row-Major）布局，确保最内层线程（threadIdx.x）映射到 k 维度，以实现全局内存的合并访问（Coalesced Access）。",
+        "challenges": [
+          "Halo Exchange（边界数据交换）：共享内存在加载边界元素时会产生分支分流或复杂的索引计算。",
+          "寄存器压力：3D 模板计算需要保存多个邻居节点，容易导致寄存器溢出（Register Spilling）到 Local Memory。"
+        ],
+        "expected_speedup": "20x - 50x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.11 FLOPs/byte",
+        "cache_behavior": "最内层 k 循环具有完美的空间局部性（Stride-1）。然而，i 和 j 维度的跨步访问（Stride-N 和 Stride-N^2）会导致 L1/L2 缓存行冲突和频繁替换。在未分块的情况下，当 N 较大时，上一行/上一个面的数据在下一次迭代使用前已被驱逐出 Cache。",
+        "data_dependencies": [
+          "时间步依赖：第 t 步的 A 依赖于第 t-1 步的 B，第 t 步的 B 依赖于第 t 步的 A（RAW 依赖）",
+          "空间依赖：计算 [i][j][k] 处的下一状态需要当前状态的 [i±1][j][k]、[i][j±1][k] 和 [i][j][k±1]（7点模板依赖）"
+        ]
+      },
+      "cost": 0.0216685,
+      "bottleneck_raw": "Memory Bandwidth & Instruction Overhead (L1/L2 Cache Latency & Redundant Arithmetic)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03005975
+  }
+}

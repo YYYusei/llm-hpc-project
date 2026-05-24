@@ -1,0 +1,107 @@
+{
+  "program": "jacobi2d",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 82.65909090909092,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0335965,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "program_key": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel() - Forward sweep loop (line 54)",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop performs the main computation of the Jacobi method, iterating over the grid and updating each point based on its neighbors.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel() - Backward sweep loop (line 66)",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop mirrors the forward sweep, performing the same stencil operation but swapping the source and destination arrays.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code is memory-bound due to the high memory traffic relative to the number of floating-point operations. The arithmetic intensity is low (0.10 FLOPs/byte), indicating that the performance is limited by memory bandwidth rather than computational power."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi method is highly suitable for GPU acceleration due to its regular memory access patterns and lack of data dependencies within each iteration, allowing for efficient parallel execution.",
+        "recommended_approach": "Port the jacobi_kernel function to a GPU using CUDA or OpenCL, leveraging the GPU's parallel processing capabilities to handle the independent updates of grid points."
+      },
+      "cost": 0.010031,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "瓶颈分析完全正确。2D Jacobi 算子在每次迭代中需要加载 5 个双精度浮点数并写入 1 个，而仅执行 5 次浮点运算。对于 N=4096，工作集大小为 2 * 4096 * 4096 * 8 字节 = 256 MB，远超现代 CPU 的 L3 缓存容量。因此，数据必须频繁从主内存（DRAM）中读取，受限于内存带宽。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel (CPU 优化)",
+          "technique": "OpenMP 并行化 + 循环展开向量化 (AVX-512/AVX2) + 缓存分块 (Tiling)",
+          "code_changes": "void jacobi_kernel(int tsteps, int n, double *A, double *B) {\n    int t, i, j;\n    for (t = 0; t < tsteps; t++) {\n        #pragma omp parallel for collapse(2) private(j) shared(A, B, n)\n        for (i = 1; i < n - 1; i++) {\n            #pragma omp simd\n            for (j = 1; j < n - 1; j++) {\n                B[i * n + j] = 0.2 * (A[i * n + j] + A[i * n + j - 1] + A[i * n + j + 1] + A[(i + 1) * n + j] + A[(i - 1) * n + j]);\n            }\n        }\n        #pragma omp parallel for collapse(2) private(j) shared(A, B, n)\n        for (i = 1; i < n - 1; i++) {\n            #pragma omp simd\n            for (j = 1; j < n - 1; j++) {\n                A[i * n + j] = 0.2 * (B[i * n + j] + B[i * n + j - 1] + B[i * n + j + 1] + B[(i + 1) * n + j] + B[(i - 1) * n + j]);\n            }\n        }\n    }\n}",
+          "expected_speedup": "4.0x - 8.0x (取决于 CPU 核心数和内存通道数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel (高级 CPU 优化)",
+          "technique": "时间倾斜分块 (Temporal Tile / Diamond Tiling) + 缓冲区指针交换 (Pointer Swap)",
+          "code_changes": "通过将空间分块与时间分块结合，在 L2/L3 缓存中完成多次时间步迭代后再写回主存。同时，在时间步迭代间直接交换 A 和 B 的指针，避免 Backward sweep 的冗余计算，将每次迭代的访存量减半。\n\nvoid jacobi_kernel_opt(int tsteps, int n, double **A_ptr, double **B_ptr) {\n    double *A = *A_ptr;\n    double *B = *B_ptr;\n    // 伪代码：引入时间分块 (BLOCK_I, BLOCK_T)\n    // 并在每步结束时 swap(A, B)\n}",
+          "expected_speedup": "10.0x - 15.0x",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/HIP 进行二维网格并行化。每个线程负责计算一个网格点 (i, j)。利用 GPU 的共享内存 (Shared Memory) 缓存 2D 线程块所需的输入数据（包括边界光晕区 Halo），实现协作式加载，减少对全局内存 (Global Memory) 的重复访问。使用双缓冲指针交换（Pointer Swap）消除 Backward sweep 的显式物理复制。",
+        "data_layout": "保持行优先（Row-Major）的一维线性布局。确保同一 Warp 内的线程访问连续的列元素（j, j+1, j+2...），从而实现全局内存的合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "边界光晕区（Halo Exchange）的共享内存同步：线程块边缘的线程需要加载相邻块的数据，需处理好 __syncthreads() 避免竞争。",
+          "PCIe 传输瓶颈：若频繁在 CPU 和 GPU 之间拷贝数据，传输开销将掩盖计算加速。必须将整个迭代循环（tsteps）完全放在 GPU 端执行。"
+        ],
+        "expected_speedup": "50.0x - 100.0x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.104 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，由于 N=4096，每一行的跨度为 32KB。计算 A[(i+1)*n+j] 和 A[(i-1)*n+j] 会导致严重的 L1/L2 缓存缺失。由于容量限制，当计算到第 i+1 行时，第 i-1 行的数据早已被挤出 L3 缓存，导致重复的 DRAM 带宽消耗。此外，非连续的跨行访问无法有效利用硬件预取器。",
+        "data_dependencies": [
+          "时间步依赖：第 t 步的输出 B 是第 t+1 步输入 A 的前置条件（RAW 依赖）。",
+          "空间无依赖：在单次 Sweep（如 A -> B）内，所有网格点 (i, j) 的计算完全独立，可任意并行化。"
+        ]
+      },
+      "cost": 0.0235655,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0335965
+  }
+}

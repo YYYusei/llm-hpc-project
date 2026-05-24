@@ -1,0 +1,138 @@
+{
+  "program": "fdtd_2d",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 67.53391959798995,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0391615,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (line 66)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "ey update loop (line 73)",
+          "estimated_time_percentage": "30%",
+          "reason": "This loop updates the 'ey' array and involves memory accesses and arithmetic operations, contributing significantly to the runtime.",
+          "confidence": "medium"
+        },
+        {
+          "location": "ex update loop (line 76)",
+          "estimated_time_percentage": "30%",
+          "reason": "This loop updates the 'ex' array and involves memory accesses and arithmetic operations, contributing significantly to the runtime.",
+          "confidence": "medium"
+        },
+        {
+          "location": "hz update loop (line 79)",
+          "estimated_time_percentage": "30%",
+          "reason": "This loop updates the 'hz' array and involves memory accesses and arithmetic operations, contributing significantly to the runtime.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent memory accesses to large arrays, which is typical in stencil computations like FDTD. The performance is likely limited by memory bandwidth rather than computation."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular memory access patterns and independent operations across iterations, making it suitable for GPU acceleration.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the main computational kernel to the GPU, focusing on optimizing memory transfers and kernel execution."
+      },
+      "cost": 0.012227249999999999,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步分析正确。FDTD 2D 是典型的内存带宽受限计算，每个循环迭代包含少量浮点运算（2-3次）但需要访问多个数组元素（4-6次），导致算术强度低。数据访问模式是跨步的，缓存利用率差，特别是对于大数组。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "循环融合和分块",
+          "technique": "将三个独立的更新循环融合，并应用循环分块",
+          "code_changes": "将 ey、ex、hz 更新循环融合为一个循环，并添加分块：\nfor(t = 0; t < _PB_TMAX; t++) {\n  for (j = 0; j < _PB_NY; j++)\n    ey[0][j] = _fict_[t];\n  for (ii = 1; ii < _PB_NX; ii += TILE) {\n    for (jj = 0; jj < _PB_NY; jj += TILE) {\n      for (i = ii; i < min(ii+TILE, _PB_NX); i++) {\n        for (j = jj; j < min(jj+TILE, _PB_NY); j++) {\n          if (j == 0 && i > 0) ey[i][j] = ey[i][j] - 0.5*(hz[i][j]-hz[i-1][j]);\n          else if (i > 0) ey[i][j] = ey[i][j] - 0.5*(hz[i][j]-hz[i-1][j]);\n          if (i == 0 && j > 0) ex[i][j] = ex[i][j] - 0.5*(hz[i][j]-hz[i][j-1]);\n          else if (j > 0) ex[i][j] = ex[i][j] - 0.5*(hz[i][j]-hz[i][j-1]);\n          if (i < _PB_NX-1 && j < _PB_NY-1) hz[i][j] = hz[i][j] - 0.7*(ex[i][j+1] - ex[i][j] + ey[i+1][j] - ey[i][j]);\n        }\n      }\n    }\n  }\n}",
+          "expected_speedup": "1.5-2.5倍 (取决于缓存大小和分块大小)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "数据布局优化",
+          "technique": "数组转置和结构体数组转换",
+          "code_changes": "将三个独立的二维数组合并为结构体数组，并按列优先存储：\ntypedef struct { DATA_TYPE ex, ey, hz; } FieldPoint;\nFieldPoint POLYBENCH_2D(field,NX,NY,nx,ny);\n然后调整所有访问：field[i][j].ex, field[i][j].ey, field[i][j].hz",
+          "expected_speedup": "1.2-1.5倍 (改善空间局部性)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "循环展开和标量替换",
+          "technique": "手动循环展开和寄存器优化",
+          "code_changes": "在内层循环中展开2-4次，并使用局部变量减少内存访问：\nfor (i = 1; i < _PB_NX-1; i+=2) {\n  DATA_TYPE hz_curr = hz[i][j];\n  DATA_TYPE hz_prev = hz[i-1][j];\n  DATA_TYPE hz_next = hz[i+1][j];\n  ey[i][j] = ey[i][j] - 0.5*(hz_curr - hz_prev);\n  ey[i+1][j] = ey[i+1][j] - 0.5*(hz_next - hz_curr);\n  // 类似处理 ex 和 hz 更新\n}",
+          "expected_speedup": "1.1-1.3倍 (减少循环开销和内存访问)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "边界处理优化",
+          "technique": "分离边界和内部计算",
+          "code_changes": "将边界更新（ey[0][j], ex[i][0], hz边界）与内部更新分离：\n// 边界更新\nfor (j = 0; j < _PB_NY; j++) ey[0][j] = _fict_[t];\n// 内部更新（从1到N-1）\nfor (i = 1; i < _PB_NX-1; i++) {\n  for (j = 1; j < _PB_NY-1; j++) {\n    // 所有内部点更新\n  }\n}",
+          "expected_speedup": "1.05-1.1倍 (简化内部循环条件判断)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "二维网格并行化，每个线程处理一个网格点。使用时间步循环外层，每个时间步内同步。考虑使用共享内存进行分块计算以减少全局内存访问。",
+        "data_layout": "使用结构体数组(AoS)或数组结构(SoA)。建议SoA：三个独立数组ex[NX][NY], ey[NX][NY], hz[NX][NY]按行优先存储，便于合并访问。或使用纹理内存存储只读数据。",
+        "challenges": [
+          "时间步间的全局同步需要内核调用间同步",
+          "边界处理需要特殊线程",
+          "共享内存有限，需要仔细分块",
+          "避免bank冲突",
+          "数据依赖限制并行粒度"
+        ],
+        "expected_speedup": "10-50倍 (相比优化后的CPU版本)，具体取决于GPU内存带宽和计算能力。V100/A100上可能达到100倍以上。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.25-0.5 FLOPs/byte (每次更新：2-3次浮点运算，6-12字节内存访问，假设双精度)",
+        "cache_behavior": "差。数组按行存储，但ey更新访问hz[i][j]和hz[i-1][j]（跨行），导致缓存行利用率低。ex更新访问hz[i][j]和hz[i][j-1]（同一行，较好）。hz更新访问ex和ey的相邻元素，有空间局部性但跨数组访问。",
+        "data_dependencies": [
+          "时间依赖：每个时间步依赖前一时间步的ex、ey、hz值",
+          "空间依赖：ey更新依赖hz[i][j]和hz[i-1][j]（垂直邻居）",
+          "空间依赖：ex更新依赖hz[i][j]和hz[i][j-1]（水平邻居）",
+          "空间依赖：hz更新依赖ex[i][j+1]、ex[i][j]、ey[i+1][j]、ey[i][j]"
+        ]
+      },
+      "cost": 0.02693425,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0391615
+  }
+}

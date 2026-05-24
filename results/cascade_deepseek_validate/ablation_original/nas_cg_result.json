@@ -1,0 +1,124 @@
+{
+  "program": "nas_cg",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 83.58133971291866,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.036253,
+  "full_result": {
+    "code_name": "nas_cg",
+    "program_key": "nas_cg",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "sparse_matvec() - line 54",
+          "estimated_time_percentage": "65%",
+          "reason": "This function performs sparse matrix-vector multiplication, which is memory-bound due to irregular memory access patterns and low arithmetic intensity.",
+          "confidence": "high"
+        },
+        {
+          "location": "dot_product() - line 92",
+          "estimated_time_percentage": "15%",
+          "reason": "This function performs a vector inner product, which is memory-bound due to streaming access and low arithmetic intensity.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The primary bottleneck is memory-bound due to irregular memory access patterns in sparse_matvec() and low arithmetic intensity in both sparse_matvec() and dot_product()."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The sparse matrix-vector multiplication can benefit from GPU acceleration due to its parallel nature, but irregular memory access patterns may limit efficiency.",
+        "recommended_approach": "Use libraries like cuSPARSE for efficient sparse matrix operations on the GPU and optimize data transfer between host and device."
+      },
+      "cost": 0.010942750000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步分析正确识别了内存瓶颈。sparse_matvec()中的间接访问模式（x[colidx[j]]）导致缓存效率低下，而dot_product()虽然具有连续访问模式，但算术强度低（2 FLOPs/16字节），同样受限于内存带宽。两个热点函数都表现出内存受限特征。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "sparse_matvec() - 改善缓存局部性",
+          "technique": "稀疏矩阵重排序（RCM或METIS）和循环分块",
+          "code_changes": "在调用sparse_matvec()前对矩阵进行重排序：\n1. 使用RCM（Reverse Cuthill-McKee）算法对矩阵行/列重排序\n2. 对重排序后的矩阵重新生成CSR格式\n3. 对x和y向量应用相同的置换\n\n循环优化：\nfor (int i = 0; i < n; i += BLOCK_SIZE) {\n    int i_end = min(i + BLOCK_SIZE, n);\n    for (int ii = i; ii < i_end; ii++) {\n        double sum = 0.0;\n        for (int j = rowptr[ii]; j < rowptr[ii + 1]; j++) {\n            sum += values[j] * x[colidx[j]];\n        }\n        y[ii] = sum;\n    }\n}",
+          "expected_speedup": "1.5-3倍（取决于矩阵结构）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "sparse_matvec() - 向量化和预取优化",
+          "technique": "SIMD向量化和软件预取指令",
+          "code_changes": "使用编译器内联汇编或intrinsics实现：\n#pragma omp simd reduction(+:sum)\nfor (int j = rowptr[i]; j < rowptr[i + 1]; j++) {\n    __builtin_prefetch(&x[colidx[j + PREFETCH_DISTANCE]], 0, 1);\n    sum += values[j] * x[colidx[j]];\n}\n\n同时使用-ffast-math和-march=native编译选项",
+          "expected_speedup": "1.2-2倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "dot_product() - 循环展开和向量化",
+          "technique": "手动循环展开和SIMD优化",
+          "code_changes": "double sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;\nint i;\nfor (i = 0; i < n - 3; i += 4) {\n    sum0 += x[i] * y[i];\n    sum1 += x[i+1] * y[i+1];\n    sum2 += x[i+2] * y[i+2];\n    sum3 += x[i+3] * y[i+3];\n}\ndouble sum = sum0 + sum1 + sum2 + sum3;\nfor (; i < n; i++) {\n    sum += x[i] * y[i];\n}\nreturn sum;",
+          "expected_speedup": "1.5-2.5倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "整体CG算法 - 融合内核",
+          "technique": "内核融合减少内存流量",
+          "code_changes": "将sparse_matvec()和后续的dot_product()融合：\nvoid fused_spmv_dot(int n, const int *rowptr, const int *colidx,\n                    const double *values, const double *x, double *y, double *dot_result) {\n    double sum_dot = 0.0;\n    for (int i = 0; i < n; i++) {\n        double sum = 0.0;\n        for (int j = rowptr[i]; j < rowptr[i + 1]; j++) {\n            sum += values[j] * x[colidx[j]];\n        }\n        y[i] = sum;\n        sum_dot += y[i] * y[i];  // 假设需要计算y·y\n    }\n    *dot_result = sum_dot;\n}",
+          "expected_speedup": "1.1-1.3倍（减少内存访问）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "混合并行策略：1) 每个线程处理一行（CSR-Scalar），2) 每warp处理一行（CSR-Vector），3) 使用合并的CSR格式（CSR-Stream）",
+        "data_layout": "1. 使用ELLPACK或HYB格式替代CSR以提高合并访问\n2. 对矩阵进行分区，使每个warp处理连续行\n3. 使用纹理内存缓存x向量\n4. 将colidx和values存储在共享内存中",
+        "challenges": [
+          "不规则内存访问导致合并效率低",
+          "负载不平衡（行长度变化）",
+          "归约操作（dot_product）需要同步",
+          "CPU-GPU数据传输开销"
+        ],
+        "expected_speedup": "10-50倍（相对于优化后的CPU版本），但受限于PCIe带宽和矩阵不规则性"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "sparse_matvec(): ~0.25 FLOPs/byte (2 FLOPs/(8+4+8)字节), dot_product(): ~0.125 FLOPs/byte (2 FLOPs/16字节)",
+        "cache_behavior": "sparse_matvec()：L1缓存命中率低（~50-70%），由于x[colidx[j]]的随机访问模式导致TLB压力大。dot_product()：具有较好的空间局部性，但受限于内存带宽。",
+        "data_dependencies": [
+          "sparse_matvec()内循环无依赖，可并行化",
+          "dot_product()存在归约依赖，需要原子操作或归约树",
+          "CG迭代间存在顺序依赖，限制并行粒度"
+        ]
+      },
+      "cost": 0.02531025,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.036253
+  }
+}

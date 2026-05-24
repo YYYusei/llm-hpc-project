@@ -1,0 +1,125 @@
+{
+  "program": "heat_3d",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory bandwidth / cache (3D stencil streaming)",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.051367750000000004,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-80",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel with nested loops iterating over the 3D grid, performing updates on each element.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 3D arrays with non-contiguous memory access patterns, leading to potential cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem is highly parallelizable due to the independent updates of grid points, making it suitable for GPU execution.",
+        "recommended_approach": "Port the kernel to CUDA or OpenCL, using a 3D grid of threads to map directly to the 3D data structure, ensuring coalesced memory access."
+      },
+      "cost": 0.008195250000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory bandwidth / cache (3D stencil streaming)",
+        "reasoning": "kernel_heat_3d 是典型 7-point 3D stencil（两次 sweep：A->B, B->A）。每个网格点更新需要读取中心点及其 6 个邻居并写回 1 个点；在大 N 下工作集远超 LLC，时间步之间仅通过 A/B 交换产生有限复用，整体呈现对内存带宽敏感的流式访问。虽然 k 维是连续的（C 行主序下 A[i][j][k] 的 k 连续），但 i/j 方向邻居跨 stride（±N、±N*N），导致缓存行利用率受限；同时每点计算 FLOPs 相对较少，算术强度低，难以隐藏内存访问成本，因此瓶颈判断为 memory 成立。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d: A->B sweep (lines 54-66)",
+          "technique": "循环重排 + 指针线性化 + 预取/邻居复用（k 方向滑动窗口）以减少重复加载中心点",
+          "code_changes": "1) 将 3D 下标访问改为线性指针并缓存中心值：\n\n// 假设 DATA_TYPE* a = &A[0][0][0]; DATA_TYPE* b = &B[0][0][0];\n// idx = (i*n + j)*n + k\nfor (i=1;i<n-1;i++) {\n  for (j=1;j<n-1;j++) {\n    size_t base = ((size_t)i*n + j)*n;\n    size_t base_im1 = ((size_t)(i-1)*n + j)*n;\n    size_t base_ip1 = ((size_t)(i+1)*n + j)*n;\n    size_t base_jm1 = ((size_t)i*n + (j-1))*n;\n    size_t base_jp1 = ((size_t)i*n + (j+1))*n;\n\n    // k 方向滑动窗口：复用 a[base+k] 作为下一次迭代的 a_km1\n    DATA_TYPE a_km1 = a[base+0];\n    DATA_TYPE a_k   = a[base+1];\n    for (k=1;k<n-1;k++) {\n      DATA_TYPE a_kp1 = a[base+k+1];\n      DATA_TYPE center = a_k;\n      DATA_TYPE lap = (a[base_ip1+k] - (DATA_TYPE)2*center + a[base_im1+k])\n                    + (a[base_jp1+k] - (DATA_TYPE)2*center + a[base_jm1+k])\n                    + (a_kp1        - (DATA_TYPE)2*center + a_km1);\n      b[base+k] = (DATA_TYPE)0.125*lap + center;\n      a_km1 = a_k;\n      a_k = a_kp1;\n    }\n  }\n}\n\n2) 将常量提到循环外（0.125, 2.0），避免重复构造 SCALAR_VAL。\n3) 编译器提示：__restrict__ 限定 A/B 指针，帮助向量化与别名分析。\n4) 可选：对 k 循环加 #pragma omp simd 或编译器向量化指令（在确保无别名后）。",
+          "expected_speedup": "1.1x-1.4x（取决于编译器是否已做 CSE/向量化；主要收益来自减少对 A[i][j][k] 的重复加载与更好的流水）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d: B->A sweep (lines 68-79)",
+          "technique": "与 A->B 同构的线性化 + k 滑动窗口 + restrict + SIMD",
+          "code_changes": "对第二个三重循环做同样改造（将 b 作为输入、a 作为输出），保持相同的 base/base_im1/... 计算与 k 滑动窗口复用。\n\n额外建议：将两个 sweep 抽象成一个内联函数 stencil_step(in, out)，减少代码重复并便于编译器做跨函数优化（LTO）。",
+          "expected_speedup": "1.1x-1.4x（与第一段类似，叠加后整体通常 1.2x-1.6x）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d: 两个 sweep 的整体",
+          "technique": "OpenMP 并行（collapse/分块）+ NUMA 首触碰 + 线程亲和",
+          "code_changes": "1) 在 i/j 维并行，k 保持内层以保证连续访问：\n\n#pragma omp parallel for collapse(2) schedule(static)\nfor (i=1;i<n-1;i++)\n  for (j=1;j<n-1;j++)\n    for (k=1;k<n-1;k++) { ... }\n\n2) 初始化 init_array 也用相同的并行策略做 first-touch，避免 NUMA 远端内存：\n#pragma omp parallel for collapse(2) schedule(static)\nfor (i=0;i<n;i++) for (j=0;j<n;j++) for (k=0;k<n;k++) ...\n\n3) 运行时设置：OMP_PROC_BIND=close, OMP_PLACES=cores（或按平台调优）。",
+          "expected_speedup": "接近内存带宽线性扩展，典型 4-12x（取决于核数与内存通道；最终受带宽上限限制）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_heat_3d: 缓存/带宽效率",
+          "technique": "3D 分块（cache blocking / tiling）提升 i/j 方向邻居复用，降低 LLC miss",
+          "code_changes": "对 i/j/k 做块化（常见：k 小块或保持整行，i/j 做 tile）：\n\nint Ti=8, Tj=8; // 需按 LLC/带宽调参\nfor (t=1;t<=tsteps;t++) {\n  for (ii=1; ii<n-1; ii+=Ti)\n    for (jj=1; jj<n-1; jj+=Tj)\n      for (i=ii; i<min(ii+Ti,n-1); i++)\n        for (j=jj; j<min(jj+Tj,n-1); j++)\n          for (k=1; k<n-1; k++) { ... }\n  // 第二个 sweep 同理\n}\n\n说明：tile 主要让 (i±1,j,k) 与 (i,j±1,k) 的平面数据在缓存中停留更久，减少跨 stride 访问带来的缓存抖动。",
+          "expected_speedup": "1.1x-1.5x（对大 N 更明显；若已完全带宽受限则收益有限）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d: 指令级优化",
+          "technique": "FMA/向量化友好表达式 + 对齐分配",
+          "code_changes": "1) 将表达式改写为更利于 FMA 的形式（编译器通常可做，但显式更稳）：\ncenter = in[idx];\nlap = in[idx+1] + in[idx-1] + in[idx+n] + in[idx-n] + in[idx+n*n] + in[idx-n*n] - (DATA_TYPE)6*center;\nout[idx] = center + (DATA_TYPE)0.125*lap;\n\n2) 确保数组对齐（PolyBench 分配未必保证 64B）：可替换为 aligned_alloc/posix_memalign（若允许改框架），并在指针上使用 __builtin_assume_aligned。\n3) 编译选项：-O3 -march=native -ffast-math（若允许数值放宽）+ -fopenmp。",
+          "expected_speedup": "1.05x-1.2x（主要来自更稳定的向量化与更少的标量开销）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "CUDA/HIP 3D stencil：每个线程负责一个 (i,j,k) 点的更新；每个时间步执行两个 kernel（A->B, B->A）或用指针 swap。采用 3D grid（或将 (i,j) 展平为 2D grid，k 为 x 维）保证 k 方向合并访问。使用 shared memory 做 tile（含 halo）以减少对全局内存的重复读取，尤其是 i/j 方向邻居。",
+        "data_layout": "保持线性连续布局（row-major）：idx = (i*n + j)*n + k。让 threadIdx.x 对应 k（连续维），threadIdx.y 对应 j，threadIdx.z/或 blockIdx.y 对应 i。示例 block：dim3 block(32, 4, 1) 或 (16,8,1)，使 x 维对齐 warp 合并访问。shared memory tile 尺寸为 (Ti+2)*(Tj+2)*(Tk+2)（含 halo），通常 Tk=blockDim.x，Ti=blockDim.y 对应 i 或 j 需按映射调整。",
+        "challenges": [
+          "时间步同步：每个 tsteps 需要两次全局 kernel launch（或使用 CUDA Graphs 降低 launch 开销）；无法在单 kernel 内跨时间步迭代（除非做时间分块/波前，但复杂且受寄存器/共享内存限制）。",
+          "共享内存与寄存器压力：3D tile + halo 会显著增加 shared memory，用不当会降低 occupancy；需要在 block 形状与 tile 大小间权衡。",
+          "边界处理与分支：边界点跳过会引入分支；通常通过只发射内部网格或在 kernel 内做范围判断（轻微开销）。",
+          "内存带宽上限：即便使用 shared memory，整体仍可能受全局带宽限制；收益取决于 tile 复用程度与 L2 命中。"
+        ],
+        "expected_speedup": "相对单核 CPU：通常 20x-100x；相对多核带宽已饱和的 CPU（如 16-64 核）：常见 2x-8x（取决于 GPU/CPU 带宽比、实现是否使用 shared memory tile、以及问题规模）。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "≈ 13 FLOPs / 64 bytes ≈ 0.20 FLOPs/byte（double）; 若 float 则 ≈ 13/32 ≈ 0.41 FLOPs/byte。假设每点 7 次读 + 1 次写，且缓存复用有限（大 N 下近似成立）。",
+        "cache_behavior": "k 维连续访问（单位步长），对 L1/L2 友好；但 i/j 邻居访问跨 stride（±n, ±n*n），导致同一缓存行被使用次数有限。每个时间步两次 sweep，A/B ping-pong 使得写入数组在下一 sweep 作为只读输入，存在一定时间局部性，但当 n^3 远超 LLC 时，跨 sweep 的复用很弱，整体表现为带宽受限 + 较高 LLC miss。分块可提升 i/j 平面在缓存中的驻留时间。",
+        "data_dependencies": [
+          "空间依赖：每个输出点依赖输入数组的 6 个邻居 + 自身（7-point stencil），同一 sweep 内各点之间无写后读/读后写冲突（读 in、写 out）。",
+          "时间依赖：t 与 t+1 之间通过 A/B 交替产生依赖；必须在每个时间步完成 A->B 后再进行 B->A（两个 sweep 之间存在全局同步需求）。",
+          "边界条件：i/j/k=0 或 n-1 不更新（保持初值），计算域为 [1, n-2]^3。"
+        ]
+      },
+      "cost": 0.0431725,
+      "bottleneck_raw": "memory bandwidth / cache (3D stencil streaming)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.051367750000000004
+  }
+}

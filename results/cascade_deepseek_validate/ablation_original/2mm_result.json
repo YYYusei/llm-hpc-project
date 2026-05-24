@@ -1,0 +1,116 @@
+{
+  "program": "2mm",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "memory-bound",
+  "s1_score": 83.81673407482305,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": true,
+    "s1_matches_gt": true,
+    "s2_matches_gt": false,
+    "correction_type": "over-correction"
+  },
+  "cost": 0.028920500000000002,
+  "full_result": {
+    "code_name": "2mm",
+    "program_key": "2mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_2mm, line 66-82",
+          "estimated_time_percentage": "80%",
+          "reason": "This function contains two nested loops that perform matrix multiplications, which are computationally intensive.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_2mm, line 83-90",
+          "estimated_time_percentage": "20%",
+          "reason": "This part of the function performs another set of nested loops for matrix multiplication and addition, which are also computationally intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the nested loops performing matrix multiplications, which involve a large number of floating-point operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves dense matrix multiplications, which are highly parallelizable and suitable for GPU acceleration.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU. This involves copying data to the GPU, performing computations, and then copying the results back."
+      },
+      "cost": 0.0094395,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "memory-bound",
+        "reasoning": "初步分析认为瓶颈是计算密集型，但实际分析显示：1) 两个矩阵乘法循环中，内层循环访问B[k][j]和C[k][j]时都是跨步访问，导致缓存利用率低；2) 临时数组tmp的写入和读取都按行进行，但第二个循环中访问C[k][j]是列访问，缓存局部性差；3) 算术强度较低，每个浮点操作需要多次内存访问。因此实际瓶颈是内存带宽而非计算。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "第一个循环 (tmp = alpha*A*B)",
+          "technique": "循环分块 + 循环交换",
+          "code_changes": "// 分块大小设为适合L1缓存\n#define TILE_SIZE 32\nfor (ii = 0; ii < _PB_NI; ii += TILE_SIZE)\n  for (jj = 0; jj < _PB_NJ; jj += TILE_SIZE)\n    for (kk = 0; kk < _PB_NK; kk += TILE_SIZE)\n      for (i = ii; i < min(ii+TILE_SIZE, _PB_NI); i++)\n        for (j = jj; j < min(jj+TILE_SIZE, _PB_NJ); j++) {\n          DATA_TYPE sum = tmp[i][j];\n          for (k = kk; k < min(kk+TILE_SIZE, _PB_NK); k++)\n            sum += alpha * A[i][k] * B[k][j];\n          tmp[i][j] = sum;\n        }",
+          "expected_speedup": "2-3倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "第二个循环 (D = beta*D + tmp*C)",
+          "technique": "循环交换 + 预取优化",
+          "code_changes": "// 将j循环放在最外层，改善C数组的访问模式\nfor (j = 0; j < _PB_NL; j++)\n  for (i = 0; i < _PB_NI; i++) {\n    DATA_TYPE sum = D[i][j] * beta;\n    for (k = 0; k < _PB_NJ; ++k)\n      sum += tmp[i][k] * C[k][j];\n    D[i][j] = sum;\n  }",
+          "expected_speedup": "1.5-2倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "整体优化",
+          "technique": "矩阵转置 + SIMD向量化",
+          "code_changes": "// 转置C矩阵以改善访问局部性\nDATA_TYPE POLYBENCH_2D(Ct, NL, NJ, nl, nj);\nfor (i = 0; i < _PB_NJ; i++)\n  for (j = 0; j < _PB_NL; j++)\n    Ct[j][i] = C[i][j];\n\n// 使用向量化指令\n#pragma omp simd\nfor (k = 0; k < _PB_NJ; ++k)\n  sum += tmp[i][k] * Ct[j][k];",
+          "expected_speedup": "3-5倍",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "两层并行化：1) 使用CUDA/OpenCL，每个线程块计算一个分块；2) 线程块内使用共享内存缓存数据；3) 使用矩阵乘法优化库如cuBLAS",
+        "data_layout": "1) 保持A、B、C、D为行主序；2) 在GPU上使用纹理内存或常量内存存储alpha和beta；3) 使用pinned memory加速主机-设备数据传输",
+        "challenges": [
+          "临时数组tmp占用大量设备内存",
+          "需要优化内存访问模式以减少bank冲突",
+          "主机-设备数据传输可能成为瓶颈"
+        ],
+        "expected_speedup": "10-50倍（相比优化后的CPU版本）"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.5 FLOPs/byte (假设双精度浮点，每个乘加操作需要3次内存访问)",
+        "cache_behavior": "1) A数组按行访问，缓存友好；2) B数组按列访问，缓存不友好；3) tmp数组按行写入和读取；4) C数组在第二个循环中按列访问，缓存效率极低；5) D数组按行访问，缓存友好",
+        "data_dependencies": [
+          "tmp[i][j]在第一个循环中独立计算，可并行化",
+          "D[i][j]在第二个循环中独立计算，可并行化",
+          "循环间依赖：第二个循环依赖tmp数组的完整计算"
+        ]
+      },
+      "cost": 0.019481000000000002,
+      "bottleneck_raw": "memory-bound"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": true,
+      "s1_matches_gt": true,
+      "s2_matches_gt": false,
+      "correction_type": "over-correction"
+    },
+    "total_cost": 0.028920500000000002
+  }
+}

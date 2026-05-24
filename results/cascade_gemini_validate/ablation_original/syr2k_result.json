@@ -1,0 +1,101 @@
+{
+  "program": "syr2k",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bound & Instruction Pipeline Stall (Bad Loop Nesting)",
+  "s1_score": 66.54758308157099,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0315595,
+  "full_result": {
+    "code_name": "syr2k",
+    "program_key": "syr2k",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_syr2k, line 66",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel with nested loops over large matrices, leading to high execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel involves frequent access to large matrices A, B, and C, which likely leads to memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves large, independent data-parallel operations on matrices, which are well-suited for GPU acceleration.",
+        "recommended_approach": "Port the kernel to CUDA or OpenCL, focusing on optimizing memory access patterns and maximizing occupancy."
+      },
+      "cost": 0.00749525,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "Memory Bound & Instruction Pipeline Stall (Bad Loop Nesting)",
+        "reasoning": "虽然该算法涉及大量矩阵访问，但原始代码中存在严重的循环嵌套顺序问题。在最内层循环中，`j` 是最内层循环变量（`for (j = 0; j <= i; j++)`），而 `C[i][j]`、`A[j][k]` 和 `B[j][k]` 的访问跨越了非连续的内存地址（尤其是 `A` 和 `B` 的第一维 `j` 变化，导致非步长为1的跨步访问）。这导致了极高的 Cache Miss 率。此外，最内层循环对 `C[i][j]` 进行了非连续的写操作。因此，瓶颈不仅是物理内存带宽，更是由于糟糕的循环顺序导致的缓存局部性极差和指令流水线停顿。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_syr2k",
+          "technique": "Loop Interchange & Loop Tiling (循环交换与分块)",
+          "code_changes": "将循环顺序从 (i, k, j) 调整为 (i, j, k)，并引入局部寄存器/累加器。改动如下：\n\n```cpp\n// 1. 预先缩放 C 矩阵\nfor (i = 0; i < _PB_N; i++) {\n  for (j = 0; j <= i; j++) {\n    C[i][j] *= beta;\n  }\n}\n// 2. 交换 k 和 j 循环，使内层对 A 和 B 的访问在第二维（k）上连续，并使用分块（Tiling）\nfor (i = 0; i < _PB_N; i++) {\n  for (j = 0; j <= i; j++) {\n    DATA_TYPE sum = 0;\n    for (k = 0; k < _PB_M; k++) {\n      sum += A[j][k] * alpha * B[i][k] + B[j][k] * alpha * A[i][k];\n    }\n    C[i][j] += sum;\n  }\n}\n```",
+          "expected_speedup": "3.0x - 5.0x (CPU 单线程)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_syr2k",
+          "technique": "OpenMP Parallelism & Vectorization (多线程与向量化)",
+          "code_changes": "在外部循环添加 OpenMP 调度，并对内层 `k` 循环进行 SIMD 向量化：\n\n```cpp\n#pragma omp parallel for private(j, k) shared(A, B, C, alpha, beta)\nfor (int i = 0; i < _PB_N; i++) {\n  for (int j = 0; j <= i; j++) {\n    C[i][j] *= beta;\n  }\n  for (int j = 0; j <= i; j++) {\n    DATA_TYPE sum = 0;\n    #pragma omp simd reduction(+:sum)\n    for (int k = 0; k < _PB_M; k++) {\n      sum += A[j][k] * alpha * B[i][k] + B[j][k] * alpha * A[i][k];\n    }\n    C[i][j] += sum;\n  }\n}\n```",
+          "expected_speedup": "10x - 30x (取决于 CPU 核心数)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/HIP 进行二维网格划分。每个线程块（Thread Block）负责计算 C 矩阵的一个子块（Tile）。利用共享内存（Shared Memory）缓存 A 和 B 的子块，以减少对全局内存（Global Memory）的重复访问。利用对称性，仅计算下三角部分（j <= i）。",
+        "data_layout": "保持行优先（Row-Major）布局。在 GPU 访问时，确保线程束（Warp）内的线程合并访问（Coalesced Access）A 和 B 的列（通过将数据加载到 Shared Memory 中转）。",
+        "challenges": [
+          "负载不均衡：由于仅计算下三角（j <= i），传统的正方形线程块会导致部分线程（j > i 的部分）空闲。需要采用三角形映射算法或动态任务划分。",
+          "共享内存容量限制：需要精细调整 Block Size（如 16x16 或 32x32）以防止 Shared Memory 溢出。"
+        ],
+        "expected_speedup": "50x - 150x (相比于优化前的单线程 CPU 性能)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 (N^2 * M * 5) FLOPs / (N^2 * sizeof(DATA_TYPE) + 2 * N * M * sizeof(DATA_TYPE)) Bytes。当 N, M 较大时，算术强度随维度线性增长，属于典型的 Compute-bound（计算密集型）算法，但前提是必须通过优化消除 Cache Miss 瓶颈。",
+        "cache_behavior": "原始代码中，最内层循环 `j` 导致 `A[j][k]` 和 `B[j][k]` 发生跨行（Stride-N）访问，无法利用 L1/L2 Cache Line 的空间局部性，导致极高的 L1 Cache Miss。优化后，将 `k` 置于最内层，`A[j][k]` 和 `B[j][k]` 的访问变为连续内存访问（Stride-1），完美匹配 Cache Line（64字节），并能触发硬件预取器。",
+        "data_dependencies": [
+          "C[i][j] 存在读后写（RAW）依赖，但在固定的 (i, j) 迭代中，对 k 的累加是关联且可交换的，可以通过引入局部累加器（Reduction）消除依赖。",
+          "A 和 B 矩阵在整个计算过程中为只读，不存在写依赖。"
+        ]
+      },
+      "cost": 0.02406425,
+      "bottleneck_raw": "Memory Bound & Instruction Pipeline Stall (Bad Loop Nesting)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0315595
+  }
+}

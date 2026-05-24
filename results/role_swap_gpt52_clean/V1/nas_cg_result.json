@@ -1,0 +1,130 @@
+{
+  "program": "nas_cg",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory-bound（以 SpMV 的间接访存/低算术强度为主，叠加带宽与延迟）",
+  "s1_score": 83.58133971291866,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0562765,
+  "full_result": {
+    "code_name": "nas_cg",
+    "program_key": "nas_cg",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "sparse_matvec() - line 54",
+          "estimated_time_percentage": "65%",
+          "reason": "This function performs sparse matrix-vector multiplication, which is memory-bound due to irregular memory access patterns and low arithmetic intensity.",
+          "confidence": "high"
+        },
+        {
+          "location": "dot_product() - line 92",
+          "estimated_time_percentage": "15%",
+          "reason": "This function performs a vector inner product, which is memory-bound due to streaming access and low arithmetic intensity.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The primary bottleneck is memory-bound due to irregular memory access patterns in sparse_matvec() and low arithmetic intensity in both sparse_matvec() and dot_product()."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The sparse matrix-vector multiplication can benefit from GPU acceleration, but irregular memory access patterns may limit efficiency.",
+        "recommended_approach": "Use libraries like cuSPARSE for SpMV and optimize data transfer between host and device to minimize overhead."
+      },
+      "cost": 0.01073275,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "memory-bound（以 SpMV 的间接访存/低算术强度为主，叠加带宽与延迟）",
+        "reasoning": "程序时间主要花在 sparse_matvec()（~65%）与 dot_product()（~15%）。SpMV 的每个非零元仅 2 FLOPs（乘+加），但需要读取 values[j]、colidx[j] 并通过 colidx 间接读取 x[colidx[j]]，导致：1) 算术强度极低；2) x[] 访问呈 gather/不规则，缓存命中率低、TLB/LLC 压力大，常由内存延迟与带宽共同限制；3) CSR 行内循环短且分支/边界开销相对明显，向量化困难。dot_product/axpy/scale 属于流式带宽核，主要受内存带宽限制。整体属于典型 CG：SpMV 主导、其余为带宽型向量核。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "sparse_matvec(): 提升 SpMV 吞吐（减少间接访存代价、改善向量化/并行）",
+          "technique": "OpenMP 并行按行划分 + restrict/对齐 + 编译器友好循环；必要时使用 SpMV 专用格式（SELL-C-σ / ELLPACK / 分块CSR）",
+          "code_changes": "1) 为指针添加 restrict 并提示对齐，减少别名阻碍：\n```cpp\nvoid sparse_matvec(int n,\n  const int * __restrict rowptr,\n  const int * __restrict colidx,\n  const double * __restrict values,\n  const double * __restrict x,\n  double * __restrict y)\n{\n  #pragma omp parallel for schedule(static)\n  for (int i=0;i<n;i++) {\n    double sum=0.0;\n    int start=rowptr[i], end=rowptr[i+1];\n    #pragma omp simd reduction(+:sum)\n    for (int j=start;j<end;j++) {\n      sum += values[j] * x[colidx[j]];\n    }\n    y[i]=sum;\n  }\n}\n```\n2) 若矩阵结构接近固定带宽（本生成器确实是 banded），可改为“带宽SpMV”避免 colidx：存储每行固定偏移（-NONZER..+NONZER）与对应 values，内层直接 x[i+offset]，完全规则访问。\n3) 若必须保留稀疏通用性：将 CSR 转换为 SELL-C-σ（按行分桶、行内填充到 C 的倍数）或 ELL（当每行 nnz 近似固定时），以提升连续性与 SIMD/GPU 合并访问。",
+          "expected_speedup": "CPU：仅加 OpenMP+restrict 通常 2×–8×（取决于核数/带宽）；若利用带宽结构去掉 colidx 间接访问，额外 1.5×–3×；SELL/ELL 转换在 nnz/row 近似固定时常见 1.2×–2×",
+          "difficulty": "medium"
+        },
+        {
+          "target": "sparse_matvec(): 降低内存流量（带宽压力）",
+          "technique": "索引压缩（32-bit 已是 int）、值压缩/混合精度、预取与重排（reordering）",
+          "code_changes": "1) 若精度允许：values 用 float 存储、计算用 FP32 或混合精度（累加 FP64）：\n```cpp\n// values 改为 float* 存储\nsum += (double)values_f[j] * x[colidx[j]];\n```\n2) 对列索引做局部重排以提升 x 的局部性：对每行的 (colidx,values) 按 colidx 升序排序（生成后一次性预处理），并可对全局做 RCM/AMD 重排（需要同时重排向量）。\n3) 预取（收益不稳定）：\n```cpp\n__builtin_prefetch(&x[colidx[j+P]], 0, 1);\n```\n其中 P 取 8~32 试验。",
+          "expected_speedup": "混合精度/值压缩：1.2×–2×（受误差容忍与带宽限制）；行内排序/重排：1.05×–1.5×（依赖结构）；预取：0%–15%",
+          "difficulty": "hard"
+        },
+        {
+          "target": "dot_product(): 提升归约效率与向量化",
+          "technique": "OpenMP reduction + SIMD；避免标量依赖链；可选 Kahan/分块归约（精度/性能权衡）",
+          "code_changes": "```cpp\ndouble dot_product(const double* __restrict x,\n                   const double* __restrict y,\n                   int n)\n{\n  double sum = 0.0;\n  #pragma omp parallel for simd reduction(+:sum) schedule(static)\n  for (int i=0;i<n;i++) sum += x[i]*y[i];\n  return sum;\n}\n```\n若需要更高吞吐，可做手动分块累加（多个局部累加器）以减少依赖链。",
+          "expected_speedup": "CPU：2×–10×（取决于线程数与内存带宽；单线程 SIMD 常见 1.2×–2×）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "vec_axpy/vec_scale/初始化循环：减少内存遍历次数",
+          "technique": "核融合（kernel fusion）与复用临时向量；避免频繁 calloc/free",
+          "code_changes": "1) conj_grad 内 r/p/q 每次 calloc/free 代价高（尤其外层 NITER 次调用）。改为在 main 里一次性分配并复用，或在 conj_grad 外传入工作区：\n```cpp\n// main: 分配 r,p,q,ax 并复用\n// conj_grad(..., double* r, double* p, double* q)\n```\n2) 融合更新：将两次 axpy 合并为单循环（减少一次读写 x/r/q/p 的流量）：\n```cpp\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<n;i++) {\n  x[i] += alpha * p[i];\n  r[i] -= alpha * q[i];\n}\n```\n3) p 更新同样并行：\n```cpp\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<n;i++) p[i] = r[i] + beta*p[i];\n```",
+          "expected_speedup": "整体：1.1×–1.4×（取决于向量核占比与内存带宽）；同时可显著降低分配开销与抖动",
+          "difficulty": "medium"
+        },
+        {
+          "target": "整体：提升可扩展性与 NUMA/内存带宽利用",
+          "technique": "NUMA first-touch、线程绑核、HugePages、编译与链接优化",
+          "code_changes": "1) 初始化向量时用 OpenMP 并行 first-touch：\n```cpp\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<n;i++){ x[i]=0.0; b[i]=1.0; }\n```\n2) 运行时：OMP_PROC_BIND=close, OMP_PLACES=cores；numactl --interleave=all（视平台）。\n3) 编译：-O3 -march=native -ffast-math(若允许) -fopenmp；链接 OpenMP。",
+          "expected_speedup": "1.05×–1.3×（多路/NUMA 机器上更明显）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "以 SpMV 为核心上 GPU：每次 CG 迭代将 p/q/r/x 常驻 GPU，避免 PCIe 往返；使用 cuSPARSE/rocSPARSE 的 SpMV（CSR/SELL/HYB）+ 自定义向量核（axpy/scale/dot 的 fused kernels）。并行策略：SpMV 采用 warp-per-row 或 block-per-row（按每行 nnz 分布选择），dot 使用分层归约（warp->block->grid）。",
+        "data_layout": "1) CSR 基础：rowptr(int32)、colidx(int32)、values(float/double)。\n2) 若每行 nnz 近似固定（本例约 2*NONZER+1=23）：优先 ELL 或 SELL-C-σ（C=32/64）以获得合并访问与更高吞吐。\n3) 对 x 向量：保持连续、对齐；可考虑按重排后的列顺序重排 x 以提升局部性（需一致重排 A 与向量）。",
+        "challenges": [
+          "不规则 gather 导致全局内存访问不合并、缓存命中差：用 SELL/ELL、行内排序、结构重排缓解；或使用纹理/只读缓存路径（GPU 依架构）",
+          "行长度不均导致负载不均衡：采用 warp-per-row + 动态分配，或将长行拆分（segmented reduction）",
+          "dot_product 归约开销与同步：使用 CUB/rocPRIM 或融合多个 dot（例如同时算 xax 与 xx）减少 kernel launch 与读带宽",
+          "CPU-GPU 数据传输开销：必须让整个 CG 循环驻留 GPU，仅最终标量/少量结果回传"
+        ],
+        "expected_speedup": "若问题规模足够大且 CG 全驻留 GPU：相对单核 CPU 常见 10×–50×；相对多核带宽饱和的 CPU（如 32–64 核）通常 2×–10×。本例 NA=14000 较小，GPU 可能受启动/占用限制，需增大规模或批量运行才能接近上限。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "SpMV(CSR) 约 0.12–0.20 FLOPs/byte（典型双精度）。估算：每个非零 2 FLOPs；内存流量下界约 values(8B)+colidx(4B)+x(8B)+y 写摊销(8B/nnz_per_row≈~0.35B)≈20–21B => ~0.095–0.10 FLOPs/B；考虑缓存命中/写分配/额外读等，常落在 ~0.12–0.20。dot_product 约 2 FLOPs / (16B 读) = 0.125 FLOPs/B（忽略写回）。axpy 约 2 FLOPs / (24B 读写) ≈ 0.083 FLOPs/B。",
+        "cache_behavior": "sparse_matvec(): values/colidx 顺序流式，易被硬件预取；瓶颈在 x[colidx[j]] 的 gather：当 colidx 跨度大或缺乏局部性时，L1/L2 命中率低，LLC/TLB miss 增多，导致延迟主导；当矩阵接近带状（本生成器），x 访问局部性较好，可通过去掉 colidx 或行内排序进一步提升命中。y[i] 顺序写，写合并友好。dot_product/axpy/scale: 纯流式，通常受内存带宽限制；若 n 较小可落入 LLC 则更接近计算/前端限制。频繁 calloc/free 会触发页分配与清零，造成额外内存带宽与系统开销。",
+        "data_dependencies": [
+          "dot_product() 的 sum 为归约依赖（循环携带依赖），需用 reduction/多累加器打破",
+          "CG 迭代存在算法级串行依赖：rho -> alpha/beta -> 更新 x/r/p -> 下一次 SpMV 与 dot，迭代间不可并行，但每个核内部可并行",
+          "sparse_matvec() 行与行之间独立（可并行），行内 sum 为归约依赖（可 SIMD reduction）"
+        ]
+      },
+      "cost": 0.04554375,
+      "bottleneck_raw": "memory-bound（以 SpMV 的间接访存/低算术强度为主，叠加带宽与延迟）"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0562765
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "program": "jacobi2d",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory bandwidth / memory traffic (streaming stencil)",
+  "s1_score": 82.65909090909092,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.05264175,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "program_key": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel() - Forward sweep loop (line 54)",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop performs the main computation of the Jacobi method, iterating over the grid and updating values, which is memory-bound due to high memory traffic.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel() - Backward sweep loop (line 66)",
+          "estimated_time_percentage": "45%",
+          "reason": "Similar to the forward sweep, this loop also performs the main computation and is memory-bound with high memory traffic.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code is memory-bound due to the low arithmetic intensity of the Jacobi stencil operation, which involves 5 loads and 1 store per grid point, resulting in high memory traffic compared to the number of floating-point operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi method is highly suitable for GPU execution due to its regular memory access patterns and lack of data dependencies within each iteration, allowing for efficient parallelization.",
+        "recommended_approach": "Port the jacobi_kernel function to GPU using CUDA or OpenCL, leveraging the GPU's parallel processing capabilities to handle the independent grid point updates."
+      },
+      "cost": 0.010269,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory bandwidth / memory traffic (streaming stencil)",
+        "reasoning": "两段热点循环(Forward A->B 与 Backward B->A)本质相同，都是5点Jacobi stencil。每个网格点需要读取5个double并写回1个double；在大N下工作集(2*N*N*8)远超LLC，导致数据以流式方式从内存搬运，性能主要受可持续内存带宽限制而非FLOPs。即使考虑缓存复用(相邻j共享north/south/center行数据)，写分配(RFO)与双数组ping-pong导致的读写流量仍然很高，算术强度极低，典型Roofline落在带宽受限区。两段循环各占~45%符合“同构两次扫”的特征。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel() forward/backward sweep：减少写分配与内存流量",
+          "technique": "non-temporal/streaming store 或显式避免RFO；对齐分配；restrict 指针帮助编译器优化",
+          "code_changes": "1) 使用对齐分配(64B)并声明restrict：\n\n// allocation\n#include <immintrin.h>\ndouble *A, *B;\nposix_memalign((void**)&A, 64, (size_t)n*n*sizeof(double));\nposix_memalign((void**)&B, 64, (size_t)n*n*sizeof(double));\n\n// kernel signature\nvoid jacobi_kernel(int tsteps, int n, double * __restrict A, double * __restrict B)\n\n2) 对支持的编译器启用非临时写(示意，需AVX2/AVX-512向量化后更有效)：\n- 让编译器生成streaming store：GCC/Clang可尝试 -O3 -march=native -ffast-math 并配合pragma向量化；或手写intrinsics对B/A写回使用 _mm256_stream_pd/_mm512_stream_pd。\n3) 若不手写intrinsics，可先用编译器选项尝试：\n- GCC: -O3 -march=native -funroll-loops -fno-trapping-math -ffast-math\n- Intel/ICX: -O3 -xHost -qopt-streaming-stores=always\n注意：streaming store适合“写一次不再很快读”的数组；本代码下一半迭代会读B(或A)，因此更适合在每个sweep内部对目的数组使用streaming store，但收益依赖缓存/带宽与读后距离。",
+          "expected_speedup": "1.05x–1.25x（取决于是否能显著降低RFO/写回压力与是否保持向量化）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel() forward/backward sweep：提升SIMD与减少地址计算开销",
+          "technique": "行指针缓存 + j内层向量化 + pragma simd + 常量折叠(乘0.2)",
+          "code_changes": "将i*n重复乘法与多次索引改为行指针，并显式提示向量化：\n\nfor (int i=1;i<n-1;i++) {\n  const double * __restrict a0 = A + (size_t)i*n;\n  const double * __restrict aN = A + (size_t)(i-1)*n;\n  const double * __restrict aS = A + (size_t)(i+1)*n;\n  double * __restrict b0 = B + (size_t)i*n;\n  #pragma omp simd aligned(a0,aN,aS,b0:64)\n  for (int j=1;j<n-1;j++) {\n    b0[j] = 0.2 * (a0[j] + a0[j-1] + a0[j+1] + aS[j] + aN[j]);\n  }\n}\n\n对backward sweep同理。\n说明：\n- 行指针减少地址生成与潜在别名；\n- aligned子句在确实对齐时可帮助编译器生成更宽SIMD；\n- 仍保持原有访问模式(连续j)以利于硬件预取。",
+          "expected_speedup": "1.1x–1.4x（若原先未充分向量化/地址计算占比偏高；纯带宽受限时上限较小）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel() forward/backward sweep：线程级并行与NUMA亲和",
+          "technique": "OpenMP 并行化i维；first-touch初始化；线程绑核；大页(可选)",
+          "code_changes": "1) init_array使用并行first-touch，确保NUMA本地化：\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<n;i++) for (int j=0;j<n;j++) { ... }\n\n2) kernel并行：\n#pragma omp parallel for schedule(static)\nfor (int i=1;i<n-1;i++) { ... }\n\n3) 运行时：\n- OMP_PROC_BIND=close, OMP_PLACES=cores\n- 双路NUMA可用 numactl --interleave=all 或更推荐first-touch + 绑核\n4) 可选：madvise(MADV_HUGEPAGE) 或 transparent hugepage以降低TLB miss。",
+          "expected_speedup": "随内存带宽扩展，典型2x–10x（取决于核数与内存通道；最终受带宽封顶）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel() forward/backward sweep：时间分块/空间分块以提高缓存复用（在多步迭代上）",
+          "technique": "temporal blocking / wavefront（对Jacobi可做多时间步块化，但实现复杂）",
+          "code_changes": "实现思路：对网格做tile (Ti x Tj)，在tile内做k个时间步的更新以复用缓存中的邻域数据；需要处理halo与ping-pong在tile内的多步交换。\n伪代码(概念)：\nfor t in 0..TSTEPS step k:\n  for ii in tiles:\n    for jj in tiles:\n      for tt in 0..k-1:\n        update tile with halos (A->B then swap)\n\n注意：标准Jacobi跨时间步存在依赖(下一步读上一步结果)，但仍可通过tile+halo扩展实现；收益取决于k与cache容量。",
+          "expected_speedup": "1.2x–2.0x（在带宽瓶颈明显且k合适时；否则收益有限）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "forward+backward 两次扫：减少一次全域读写（算法级）",
+          "technique": "合并两次sweep为一次迭代只做一次更新（改变迭代定义）或改为red-black Gauss-Seidel/SSOR（会改变数值性质）",
+          "code_changes": "当前每个t包含A->B再B->A，相当于每个t做了两次Jacobi更新。若允许改变迭代计数语义，可改为每个t只做一次A->B并swap指针：\nfor t:\n  compute B from A\n  swap(A,B)\n这样每步只写一次全域数组，内存流量近似减半；但输出数组位置与TSTEPS语义需调整(最终若在B则再swap/拷贝)。\n\n实现：\nfor (t=0;t<tsteps;t++) {\n  sweep(dst=B, src=A);\n  double* tmp=A; A=B; B=tmp;\n}\n// 若tsteps为偶数，结果在原A；否则在B，需要处理\n",
+          "expected_speedup": "最高接近~2.0x（内存流量减半的上限；实际1.5x–1.9x常见）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "2D网格并行：每个线程更新一个(i,j)内点；每个时间步执行一个kernel完成src->dst，然后swap指针。使用2D thread block(如32x8或16x16)；在block内用shared memory缓存(tile+halo)以减少全局内存读：加载(blkDim.x+2)*(blkDim.y+2)到shared，再计算内部点。对多时间步可做kernel fusion/时间分块(advanced)：在shared中做2~4步更新以提高算术强度，但需要更大halo与寄存器/共享内存。",
+        "data_layout": "保持行主序(row-major)一维数组A[i*n+j]；确保n为连续leading dimension。GPU侧建议使用pitch(如cudaMallocPitch)以改善对齐与合并访问；或保证n为128B对齐倍数。使用double时带宽压力更大，若精度允许可改float将带宽需求减半。",
+        "challenges": [
+          "全局内存带宽仍是上限：即使用shared减少部分读，写流量与必要读仍大，最终受HBM/GDDR带宽限制",
+          "双kernel/每步swap带来kernel launch开销；TSTEPS=500时launch开销可观，需考虑融合或CUDA Graphs",
+          "shared memory tile需要halo加载与边界处理，且double占用更大shared，限制block尺寸与占用率",
+          "若做多时间步时间分块：halo随步数增长，控制流与寄存器压力上升，可能降低occupancy",
+          "PCIe传输：若仅在GPU上迭代并最终只拷回少量结果(残差/校验)，应避免每步回传"
+        ],
+        "expected_speedup": "相对单核CPU可达10x–50x；相对已充分利用内存带宽的多核CPU通常为2x–8x（取决于CPU内存带宽、GPU带宽、是否使用shared tile与是否减少launch开销）"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "≈0.10 FLOPs/byte（按5 FLOPs、5 load + 1 store = 48B估算；若计入写分配RFO，可能接近 5 FLOPs / 56~64B => 0.08~0.09 FLOPs/byte）",
+        "cache_behavior": "j方向连续访问，硬件预取友好；对A(或B)的三行(i-1,i,i+1)在内层j扫描时有良好空间局部性，理论上可在L1/L2复用。但由于N=4096时单行32KB(double)且需要多行，L1压力大；L2可容纳部分行但整体工作集(两张网格约256MB)远超LLC，跨i推进时数据很快被逐出，整体呈现streaming带宽型。写目的数组为顺序写，若采用普通store会触发write-allocate(RFO)带来额外读流量；若目的数组很快被下一sweep读取，缓存是否保留取决于LLC容量与并行线程数，通常仍以DRAM往返为主。",
+        "data_dependencies": [
+          "单个sweep内：无跨(i,j)的RAW/WAR/WAW依赖（Jacobi读取src、写dst），可完全并行",
+          "时间步之间：t+1依赖t的结果（通过ping-pong数组体现），但同一时间步内无依赖",
+          "边界点(0,n-1)为固定边界条件，不参与更新；tile/并行时需保持边界不写"
+        ]
+      },
+      "cost": 0.04237275,
+      "bottleneck_raw": "memory bandwidth / memory traffic (streaming stencil)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.05264175
+  }
+}

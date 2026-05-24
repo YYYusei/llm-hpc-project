@@ -1,0 +1,132 @@
+{
+  "program": "srad",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "compute",
+  "s1_score": 63.19036697247705,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "compute",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.04150475,
+  "full_result": {
+    "code_name": "srad",
+    "program_key": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Divergence computation with neighbor coefficients and image update",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and each element's computation is independent per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using a grid of threads where each thread computes the diffusion for a single pixel."
+      },
+      "cost": 0.01106875,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步分析正确。该代码确实是计算密集型，主要瓶颈在于：1) 指数函数 exp() 的调用（虽然代码中实际使用的是倒数计算，但数学上等价于指数函数），这是最昂贵的操作；2) 大量的浮点除法和平方根运算；3) 每个像素需要计算4个方向的梯度和拉普拉斯算子。虽然内存访问模式规律，但计算复杂度远高于内存访问。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "减少指数函数计算开销",
+          "technique": "使用查找表或近似函数替代 exp()",
+          "code_changes": "为 c[idx] 的计算创建查找表：\n1. 预计算 qsqr 到 c 的映射表，qsqr 范围 [0, q_max]\n2. 在循环中通过查表获取 c[idx] 的近似值\n3. 使用分段线性插值提高精度\n\n代码修改：\n- 在循环前：double *lut = precompute_lut(q0sqr, q_max, lut_size);\n- 在循环中：int idx_q = (int)((qsqr / q_max) * (lut_size-1));\nc[idx] = lut[idx_q]; // 或使用插值",
+          "expected_speedup": "2-5倍（取决于查找表大小和精度要求）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "减少除法运算",
+          "technique": "使用倒数近似和乘法替代除法",
+          "code_changes": "1. 计算 image[idx] 的倒数并复用：\n   double inv_img = 1.0 / image[idx];\n   double G2 = (dN*dN + dS*dS + dW*dW + dE*dE) * (inv_img * inv_img);\n   double L = (dN + dS + dW + dE) * inv_img;\n\n2. 对于 den 计算中的除法：\n   double inv_den = 1.0 / (den + 1e-15);\n   double qsqr = num * inv_den;",
+          "expected_speedup": "1.2-1.5倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "改善数据局部性",
+          "technique": "循环分块和缓存优化",
+          "code_changes": "将循环分块以适应缓存：\n\nfor (ii = 0; ii < rows; ii += TILE) {\n  for (jj = 0; jj < cols; jj += TILE) {\n    for (i = ii; i < min(ii+TILE, rows); i++) {\n      for (j = jj; j < min(jj+TILE, cols); j++) {\n        // 原计算代码\n      }\n    }\n  }\n}\n\n建议 TILE 大小为 32-64，以适应 L1/L2 缓存。",
+          "expected_speedup": "1.3-2.0倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "减少边界条件检查开销",
+          "technique": "分离边界和内部区域处理",
+          "code_changes": "1. 单独处理边界行和列（i=0, i=rows-1, j=0, j=cols-1）\n2. 内部区域使用简化计算（无需边界检查）：\n   for (i = 1; i < rows-1; i++) {\n     for (j = 1; j < cols-1; j++) {\n       iN = i-1; iS = i+1; jW = j-1; jE = j+1;\n       // 简化计算\n     }\n   }",
+          "expected_speedup": "1.1-1.3倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "向量化优化",
+          "technique": "使用 SIMD 指令（如 AVX2/AVX-512）",
+          "code_changes": "1. 使用编译器自动向量化标志：-O3 -march=native -ffast-math\n2. 手动向量化关键循环：\n   #include <immintrin.h>\n   __m256d img_vec = _mm256_loadu_pd(&image[idx]);\n   __m256d dN_vec = _mm256_sub_pd(imgN_vec, img_vec);\n   // 其他向量运算\n3. 确保数据 32/64 字节对齐",
+          "expected_speedup": "2-4倍（取决于 SIMD 宽度）",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 网格划分：每个线程块处理一个瓦片（如 16×16 或 32×32）\n2. 线程分配：每个像素一个线程\n3. 内存层次：\n   - 使用共享内存缓存瓦片数据（包括 halo 区域）\n   - 使用常量内存存储参数（lambda, q0sqr）\n4. 迭代处理：每个迭代启动一个内核，或使用动态并行",
+        "data_layout": "1. 使用结构体数组（AoS）存储中间变量：\n   struct PixelData { double dN, dS, dW, dE, c; };\n2. 或使用数组结构体（SoA）提高合并访问：\n   double *dN, *dS, *dW, *dE, *c;（分别存储）\n3. 图像数据保持为行优先存储",
+        "challenges": [
+          "边界处理：需要特殊处理边界线程，或使用填充（padding）技术",
+          "共享内存限制：瓦片大小受共享内存容量限制（需包含 halo）",
+          "迭代间同步：每个迭代需要全局同步，可能成为瓶颈",
+          "指数函数：GPU 上 exp() 仍然昂贵，需使用内置快速近似函数"
+        ],
+        "expected_speedup": "CPU 优化后：5-10倍（相比原始 CPU 代码）\nGPU 实现：50-200倍（相比原始 CPU 代码），具体取决于：\n- GPU 架构和计算能力\n- 图像大小和迭代次数\n- 内存带宽利用率"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 15-20 FLOPs/byte（估计）\n- 每个像素计算：4个梯度（8 FLOPs）+ G2（9 FLOPs）+ L（5 FLOPs）+ ICOV（10 FLOPs）+ c（5 FLOPs）+ 更新（5 FLOPs）≈ 42 FLOPs\n- 内存访问：读取 image（5次），写入中间数组（5次）≈ 10个双精度值（80字节）\n- 算术强度 ≈ 42/80 ≈ 0.5 FLOPs/byte（原始）\n- 优化后（重用数据）可提升至 2-3 FLOPs/byte",
+        "cache_behavior": "1. 当前代码：\n   - 跨行访问导致缓存行利用率低（image[i*cols+j] 和 image[(i±1)*cols+j] 可能不在同一缓存行）\n   - 中间数组（dN,dS,dW,dE,c）导致缓存压力大\n   - 每次迭代重新计算所有梯度，未充分利用时间局部性\n\n2. 优化方向：\n   - 循环分块改善空间局部性\n   - 融合循环减少中间数组\n   - 数据布局优化（如结构体数组转数组结构体）",
+        "data_dependencies": [
+          "空间依赖：每个像素依赖其4邻域（N,S,E,W）",
+          "时间依赖：迭代间依赖（k+1 依赖 k 的结果）",
+          "流依赖：Phase 2 依赖 Phase 1 计算的 c[] 数组",
+          "反依赖：Phase 1 和 Phase 2 可并行执行不同像素（使用双缓冲）"
+        ]
+      },
+      "cost": 0.030435999999999998,
+      "bottleneck_raw": "compute"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "compute",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.04150475
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "program": "trmm",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "CPU 缓存未命中与非连续内存访问（Memory Bandwidth & Cache Locality）",
+  "s1_score": 65.00675675675676,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03398325,
+  "full_result": {
+    "code_name": "trmm",
+    "program_key": "trmm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_trmm, line 56",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the matrix operations occur, involving nested loops over large matrices.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The performance is likely limited by memory bandwidth due to the frequent access to matrix elements in a non-contiguous manner, especially in the innermost loop accessing B[k][j]."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves large matrix operations which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the kernel_trmm function to use CUDA or OpenCL, focusing on parallelizing the outer loops and optimizing memory access patterns for coalesced reads."
+      },
+      "cost": 0.00747775,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "CPU 缓存未命中与非连续内存访问（Memory Bandwidth & Cache Locality）",
+        "reasoning": "gpt-4o 的分析中指出 innermost loop 访问 B[k][j] 是非连续的，这在 C 语言（行优先存储）中是不准确的。实际上，当固定 j 且 k 递增时，B[k][j] 的跨步为 N（即跨行访问），这确实导致了非连续访问和极差的 Cache 局部性。此外，A[k][i] 的访问跨步为 M。因此，真正的瓶颈在于不合理的循环嵌套顺序（i-j-k）导致了 B[k][j] 和 A[k][i] 在最内层循环中均以非步长为 1 的方式访问，造成严重的 L1/L2 Cache Miss，而非单纯的带宽限制。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_trmm",
+          "technique": "循环重组与分块 (Loop Permutation & Tiling)",
+          "code_changes": "将原有的 i-j-k 循环结构重构。由于 B[i][j] 的更新依赖于 k > i 的 B[k][j]，直接交换循环需要注意数据依赖。可以通过引入临时数组或调整计算顺序，将 j 移至最外层，并对 i 和 k 进行分块（Tiling），使得最内层循环对 B 的访问在空间上连续。优化后的核心计算结构如下：\n\n```c\n// 引入分块与局部累加\nfor (int j = 0; j < _PB_N; j++) {\n  for (int i = 0; i < _PB_M; i++) {\n    DATA_TYPE sum = 0.0;\n    for (int k = i + 1; k < _PB_M; k++) {\n       sum += A[k][i] * B[k][j];\n    }\n    B[i][j] = alpha * (B[i][j] + sum);\n  }\n}\n```\n进一步使用 SIMD 向量化，对 j 进行展开（Unrolling）：\n```c\n// 向量化版本：将 j 循环作为内层或进行向量化\nfor (int i = 0; i < _PB_M; i++) {\n  for (int k = i + 1; k < _PB_M; k++) {\n    #pragma omp simd\n    for (int j = 0; j < _PB_N; j++) {\n       B[i][j] += A[k][i] * B[k][j];\n    }\n  }\n  for (int j = 0; j < _PB_N; j++) {\n     B[i][j] *= alpha;\n  }\n}\n```",
+          "expected_speedup": "3.0x - 8.0x (取决于编译器自动向量化和 CPU 架构)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_trmm",
+          "technique": "多线程并行化 (OpenMP Multi-threading)",
+          "code_changes": "在重构后的循环外层添加 OpenMP 指导语句：\n\n```c\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int i = 0; i < _PB_M; i++) {\n  for (int j = 0; j < _PB_N; j++) {\n    DATA_TYPE sum = 0.0;\n    for (int k = i + 1; k < _PB_M; k++) {\n       sum += A[k][i] * B[k][j];\n    }\n    B[i][j] = alpha * (B[i][j] + sum);\n  }\n}\n```",
+          "expected_speedup": "4.0x - 12.0x (在多核 CPU 上)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 进行二维网格划分。每个线程块（Thread Block）负责计算输出矩阵 B 的一个子块（Tile）。利用共享内存（Shared Memory）缓存 A 的子块和 B 的子块，以消除全局内存（Global Memory）的非连续访问。由于 A 是下三角矩阵（且转置），可以利用合并内存访问（Coalesced Memory Access）来加载 B 矩阵。",
+        "data_layout": "保持现有的行优先（Row-Major）布局。在 GPU 端，确保线程束（Warp）内的线程访问连续的 `j` 维度，以实现对 B 矩阵的合并内存访问（Coalesced Access）。",
+        "challenges": [
+          "非对称循环范围：由于 `k` 的初始值为 `i+1`，每个线程的工作量不均衡（负载不均）。解决方案：采用动态任务划分，或者在 CUDA Kernel 中使用统一的循环上限 `M`，并通过分支预测或掩码跳过无效计算，或者使用一维线性映射平衡线程块负载。",
+          "共享内存容量限制：大矩阵分块时需要合理选择 Tile 大小（如 16x16 或 32x32），避免寄存器溢出（Register Spilling）。"
+        ],
+        "expected_speedup": "20x - 50x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.25 FLOPs/byte。对于大小为 M*N 的矩阵，总计算量约为 M^2 * N 次浮点乘加（FLOPs），而数据传输量（A 和 B 的读写）约为 (M^2 + 2*M*N) * sizeof(DATA_TYPE) 字节。这属于典型的内存受限型（Memory-bound）内核。",
+        "cache_behavior": "在原始代码中，最内层循环 `k` 递增。`A[k][i]` 的访问跨步为 M，`B[k][j]` 的访问跨步为 N。在 M 和 N 较大时，每次迭代都会发生 L1/L2 Cache Miss。通过将 `j` 放在最内层，`B[k][j]` 和 `B[i][j]` 的访问将变为连续的（步长为 1），从而最大化空间局部性并触发硬件预取（Hardware Prefetching）。",
+        "data_dependencies": [
+          "写后读 (RAW) 依赖：B[i][j] 的最终值取决于 alpha * (B[i][j] + sum)，在计算 sum 时需要读取 B[k][j] (k > i)。由于 k > i，在计算 B[i][j] 时，所依赖的 B[k][j] 尚未被更新（因为 i 是从小到大遍历，B[k][j] 的更新在后续的 i 迭代中）。因此，k 循环内部不存在循环携带依赖，可以安全地进行重组和向量化。"
+        ]
+      },
+      "cost": 0.026505499999999998,
+      "bottleneck_raw": "CPU 缓存未命中与非连续内存访问（Memory Bandwidth & Cache Locality）"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03398325
+  }
+}
