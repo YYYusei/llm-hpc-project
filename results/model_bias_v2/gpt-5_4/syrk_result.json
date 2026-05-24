@@ -1,0 +1,45 @@
+{
+  "program": "syrk",
+  "model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The arithmetic intensity is modest in the current loop ordering. In the main loop, A[i][k] is reused well, but A[j][k] is accessed down a column of a row-major matrix, creating strided loads with poor cache-line utilization. C[i][j] is repeatedly loaded/stored across k iterations, generating substantial memory traffic. The kernel has significant floating-point work, but the current data access pattern is the main limiter on modern CPUs unless a cache-blocked BLAS implementation is used.",
+  "ground_truth": "compute",
+  "correct": false,
+  "eval_score": 72.5203109327984,
+  "cost": 0.0225015,
+  "stage1": {
+    "model": "gpt-5.4",
+    "hotspots": [
+      {
+        "location": "kernel_syrk(), inner update loop: for (k = 0; k < _PB_M; k++) { for (j = 0; j <= i; j++) C[i][j] += alpha * A[i][k] * A[j][k]; }",
+        "estimated_time_percentage": "90-98%",
+        "reason": "This is the dominant O(n^2*m) computation. For each i,k pair, the loop streams over C[i][0..i] and A[0..i][k], performing a rank-1 style update on the lower triangle. It executes vastly more floating-point operations than initialization or printing during timed region.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_syrk(), scaling loop: for (j = 0; j <= i; j++) C[i][j] *= beta;",
+        "estimated_time_percentage": "2-8%",
+        "reason": "This loop performs O(n^2) work and touches the full lower triangle of C. It is much smaller than the main update loop but still contributes due to memory traffic over C.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_syrk(), repeated access pattern A[j][k] inside inner j-loop",
+        "estimated_time_percentage": "included in main hotspot",
+        "reason": "Although not a separate loop, this access is performance-critical because with row-major storage A[j][k] is accessed with large stride as j varies, causing poor spatial locality and limiting cache/vector efficiency.",
+        "confidence": "high"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The arithmetic intensity is modest in the current loop ordering. In the main loop, A[i][k] is reused well, but A[j][k] is accessed down a column of a row-major matrix, creating strided loads with poor cache-line utilization. C[i][j] is repeatedly loaded/stored across k iterations, generating substantial memory traffic. The kernel has significant floating-point work, but the current data access pattern is the main limiter on modern CPUs unless a cache-blocked BLAS implementation is used."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "SYRK is a dense linear algebra kernel with abundant parallelism and regular computation. GPUs handle matrix-multiply-like operations very well, especially when implemented as blocked matrix products. The triangular output reduces some work but does not prevent efficient acceleration.",
+      "recommended_approach": "Use cuBLAS/rocBLAS SYRK if available. Otherwise, implement a tiled GPU kernel that computes C = alpha*A*A^T + beta*C using shared-memory tiles of A, accumulating only the lower triangle. For best performance, compute via GEMM-style blocking and optionally form the full product then keep/store only the lower triangular part."
+    },
+    "cost": 0.0225015,
+    "bottleneck_raw": "memory"
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "program": "2mm",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 69.16253791708796,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.037948749999999996,
+  "full_result": {
+    "code_name": "2mm",
+    "program_key": "2mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_2mm: tmp computation loop nest (i=0..NI-1, j=0..NJ-1, k=0..NK-1) around lines ~86-95",
+          "estimated_time_percentage": "45-60%",
+          "reason": "Dense GEMM-like multiply-accumulate: tmp[i][j] += alpha*A[i][k]*B[k][j]. High operation count O(NI*NJ*NK) and poor spatial locality for B (accessing B[k][j] with k as inner loop causes large-stride/streaming through rows/columns depending on layout), leading to heavy memory traffic and limited cache reuse without blocking.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_2mm: D update loop nest (i=0..NI-1, j=0..NL-1, k=0..NJ-1) around lines ~96-104",
+          "estimated_time_percentage": "40-55%",
+          "reason": "Second GEMM-like multiply-accumulate: D[i][j] += tmp[i][k]*C[k][j] plus D scaling. Operation count O(NI*NL*NJ). Similar locality issue for C (C[k][j] with k inner) and repeated loads/stores of D[i][j] if not kept in a register across k.",
+          "confidence": "high"
+        },
+        {
+          "location": "print_array (full D scan + fprintf) around lines ~52-67 (only if timing includes DCE/printing)",
+          "estimated_time_percentage": "0-90% (depends on whether printing is enabled/redirected and whether included in measured region)",
+          "reason": "I/O via fprintf in a doubly-nested loop is extremely slow compared to compute; however PolyBench typically excludes this from the timed kernel region. If enabled and measured, it dominates runtime and is communication/I/O-bound.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "Both main kernels are matrix-multiply-like but written as naive triple loops without cache blocking. This yields low arithmetic intensity due to repeatedly streaming B and C with limited reuse in caches (especially for larger problem sizes), making performance primarily limited by memory bandwidth and cache misses rather than peak FLOPs. With effective blocking/BLAS, the bottleneck can shift toward compute."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel consists of two large dense matrix multiplications (GEMM-like), which map extremely well to GPUs due to high parallelism and availability of highly optimized GEMM implementations. Naive GPU kernels without tiling would be bandwidth-limited, but using vendor libraries achieves near-peak performance.",
+        "recommended_approach": "Use cuBLAS/rocBLAS: compute tmp = alpha*A*B, then D = beta*D + tmp*C. Keep all matrices resident on device; use column-major or row-major interfaces consistently (or transpose flags). If custom kernels are required, implement tiled shared-memory GEMM for each multiply and fuse beta scaling into the epilogue of the second GEMM."
+      },
+      "cost": 0.026209749999999997,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the naive implementation of matrix multiplications without cache blocking. This results in low arithmetic intensity and high memory bandwidth usage, which is typical for such patterns without optimization."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_2mm: tmp computation loop nest",
+          "technique": "Cache blocking (tiling)",
+          "code_changes": "Introduce loop tiling for the i, j, and k loops to improve cache reuse. For example, use tile sizes that fit into L1 or L2 cache.",
+          "expected_speedup": "2x-3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_2mm: D update loop nest",
+          "technique": "Cache blocking (tiling) and loop unrolling",
+          "code_changes": "Apply similar tiling as the tmp computation loop and consider unrolling the innermost loop to reduce loop overhead and increase instruction-level parallelism.",
+          "expected_speedup": "2x-3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "print_array",
+          "technique": "Conditional compilation or asynchronous I/O",
+          "code_changes": "Use conditional compilation to exclude print_array from performance-critical builds or implement asynchronous I/O to overlap computation with output.",
+          "expected_speedup": "Varies (up to 90% if I/O is a bottleneck)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use cuBLAS or similar library for GEMM operations to leverage optimized GPU matrix multiplication routines.",
+        "data_layout": "Ensure matrices are stored in column-major order to match GPU memory access patterns, or use library-specific data layouts.",
+        "challenges": [
+          "Data transfer between host and device",
+          "Kernel launch overhead"
+        ],
+        "expected_speedup": "5x-20x depending on GPU architecture and problem size"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "Approximately 0.5 FLOPs/byte",
+        "cache_behavior": "Without blocking, the cache lines are not effectively reused, leading to frequent cache misses and high memory bandwidth usage.",
+        "data_dependencies": [
+          "tmp[i][j] depends on A[i][k] and B[k][j]",
+          "D[i][j] depends on tmp[i][k] and C[k][j]"
+        ]
+      },
+      "cost": 0.011739,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.037948749999999996
+  }
+}

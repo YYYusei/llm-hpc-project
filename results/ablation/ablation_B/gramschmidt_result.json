@@ -1,0 +1,122 @@
+{
+  "program": "gramschmidt",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 51.774096385542165,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.04009425,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt(): outer loop k with inner j/i updates (lines ~86-110)",
+          "estimated_time_percentage": "80-92%",
+          "reason": "Dominant O(m*n^2) work: for each k, for each j>k it performs two full-length (i=0..m-1) passes: (1) dot product R[k][j] += Q[i][k]*A[i][j] and (2) rank-1 update A[i][j] -= Q[i][k]*R[k][j]. This streams through large portions of A and Q repeatedly, causing high memory traffic and limited cache reuse.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt(): norm and normalization for each k (lines ~79-85)",
+          "estimated_time_percentage": "8-18%",
+          "reason": "O(m*n) work: computes nrm = sum_i A[i][k]^2, sqrt, then scales column into Q. Less total FLOPs than the j-loop but still touches full columns of A and Q; sqrt/div can add latency but overall smaller than the O(m*n^2) section.",
+          "confidence": "high"
+        },
+        {
+          "location": "print_array(): dumping R and Q (lines ~33-67) [only if not excluded from timing by harness]",
+          "estimated_time_percentage": "0-70% (depends on whether I/O is timed and output enabled)",
+          "reason": "Potentially massive formatted I/O over n^2 + m*n elements; can dominate wall time if included. In PolyBench, timing typically excludes this, but in real runs it can be the main cost.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The main kernel is dominated by streaming accesses over A and Q with low temporal locality: each (k,j) pair reads A[:,j] and Q[:,k] and then writes A[:,j]. Arithmetic intensity is modest (a few FLOPs per multiple loads/stores), so performance is typically limited by memory bandwidth and cache behavior rather than peak compute. The sqrt/div are minor relative to the bandwidth-heavy O(m*n^2) updates."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The dominant work per k is a dot-product panel (Q[:,k]^T * A[:,k+1:]) plus a rank-1 update (A[:,k+1:] -= Q[:,k]*Rrow). These map well to GPU kernels/BLAS (GEMV/GER) and can achieve high throughput. However, k is sequential, so the GPU will be launched n times; performance depends on batching/paneling to amortize launch overhead and on keeping A/Q resident on device.",
+        "recommended_approach": "Keep A, Q, R on GPU for the full kernel. For each k: (1) compute nrm via a reduction kernel (or cublasDnrm2 on A[:,k]); (2) scale to form Q[:,k] (cublasDcopy + cublasDscal or custom kernel); (3) compute R[k,k+1:] = Q[:,k]^T * A[:,k+1:] using cublasGEMV with an Apanel (or cublasGEMM treating Qcol as m×1 and Apanel as m×(n-k-1)); (4) update Apanel with cublasGER (rank-1 update). Use panel/blocking over j to increase GEMM usage (preferred) and reduce kernel launches; consider using cuBLAS GEMM for both steps by batching multiple k values only if algorithmic changes (e.g., blocked Gram-Schmidt) are acceptable."
+      },
+      "cost": 0.028098,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the low arithmetic intensity and high memory bandwidth requirements. The operations involve streaming accesses with low temporal locality, which are typical indicators of memory-bound performance."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_gramschmidt() outer loop",
+          "technique": "Loop unrolling and blocking",
+          "code_changes": "Unroll the inner loops over 'i' and 'j' to improve data locality and reduce loop overhead. Apply blocking to the 'i' loop to enhance cache reuse.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_gramschmidt() norm calculation",
+          "technique": "Vectorization",
+          "code_changes": "Use SIMD instructions to vectorize the norm calculation loop over 'i'.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_gramschmidt() normalization",
+          "technique": "Pre-computation and reuse",
+          "code_changes": "Pre-compute 1/R[k][k] and reuse it in the normalization loop to reduce division operations.",
+          "expected_speedup": "1.1x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use CUDA or OpenCL to parallelize the dot-product and rank-1 update operations. Each 'k' iteration can be a separate kernel launch.",
+        "data_layout": "Use a column-major layout for A and Q to improve coalesced memory access on the GPU.",
+        "challenges": [
+          "Kernel launch overhead due to sequential 'k' iterations",
+          "Ensuring data residency on the GPU to minimize data transfer overhead"
+        ],
+        "expected_speedup": "5x - 10x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "O(2m*n^2 / (m*n + m*n^2))",
+        "cache_behavior": "The cache behavior is suboptimal due to the streaming access pattern. Blocking and loop unrolling can help improve cache line utilization.",
+        "data_dependencies": [
+          "R[k][k] depends on A[i][k]",
+          "Q[i][k] depends on R[k][k]",
+          "R[k][j] depends on Q[i][k] and A[i][j]",
+          "A[i][j] depends on Q[i][k] and R[k][j]"
+        ]
+      },
+      "cost": 0.01199625,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.04009425
+  }
+}

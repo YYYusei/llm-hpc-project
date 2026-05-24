@@ -1,0 +1,45 @@
+{
+  "program": "gramschmidt",
+  "model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The main j-loop performs low-to-moderate arithmetic per byte moved: it streams A[:,j] and Q[:,k] for the dot product and then streams A[:,j] again for the update. Q[:,k] is reused across many j but is typically too large for registers and only partially cache-resident; A is read/modified with poor temporal locality across j and k. This makes performance largely limited by memory bandwidth/cache behavior rather than peak FLOPs, especially for large m,n.",
+  "ground_truth": "compute",
+  "correct": false,
+  "eval_score": 52.15060240963856,
+  "cost": 0.027804000000000002,
+  "stage1": {
+    "model": "gpt-5.2",
+    "hotspots": [
+      {
+        "location": "kernel_gramschmidt(): outer loop k with inner j/i updates (lines ~86-110)",
+        "estimated_time_percentage": "85-95%",
+        "reason": "Dominant O(m*n^2) work: for each k, for each j>k it performs a dot product over i (R[k][j] += Q[i][k]*A[i][j]) and then an axpy-style update over i (A[i][j] -= Q[i][k]*R[k][j]). These stream through large columns of A/Q repeatedly and drive most runtime.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_gramschmidt(): norm and normalization for each k (nrm accumulation + Q column compute) (lines ~88-95)",
+        "estimated_time_percentage": "5-12%",
+        "reason": "O(m*n) work: reduction nrm += A[i][k]^2 plus division Q[i][k]=A[i][k]/R[k][k]. Includes a sqrt and a full column pass; smaller than the j-loop but still significant.",
+        "confidence": "high"
+      },
+      {
+        "location": "print_array(): dumping R and Q (lines ~41-74) (only if enabled in the benchmark run)",
+        "estimated_time_percentage": "0-80% (configuration-dependent)",
+        "reason": "If I/O is not excluded from timing or if DCE printing is executed in a measured context, fprintf in nested loops can dominate. In PolyBench timing, kernel is timed separately, but overall program wall time can still be dominated by output for large sizes.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The main j-loop performs low-to-moderate arithmetic per byte moved: it streams A[:,j] and Q[:,k] for the dot product and then streams A[:,j] again for the update. Q[:,k] is reused across many j but is typically too large for registers and only partially cache-resident; A is read/modified with poor temporal locality across j and k. This makes performance largely limited by memory bandwidth/cache behavior rather than peak FLOPs, especially for large m,n."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The dominant work is dense linear algebra (dot products and rank-1 updates) with high parallelism over i and j. However, the algorithm has a sequential dependency over k, and the per-k operations are memory-bandwidth sensitive unless blocked into BLAS-3. GPUs perform best if the computation is reformulated into larger GEMM-like kernels to raise arithmetic intensity and reduce kernel launch overhead.",
+      "recommended_approach": "Use a blocked Gram-Schmidt/QR approach: for each block of columns, compute panel factorization on CPU or GPU, then update the trailing matrix with GEMM on GPU (cuBLAS). Alternatively, for each k, compute r = Qk^T * A_trailing via cuBLAS GEMV and update A_trailing via cuBLAS GER, but prefer batching/blocked updates to amortize launches. Keep A/Q/R resident on device, and overlap k-iteration panel work with trailing updates using streams if blocking is used."
+    },
+    "cost": 0.027804000000000002,
+    "bottleneck_raw": "memory"
+  }
+}

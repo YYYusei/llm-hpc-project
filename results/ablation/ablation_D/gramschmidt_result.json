@@ -1,0 +1,169 @@
+{
+  "program": "gramschmidt",
+  "config": "Ablation D (5.4→5.4)",
+  "s1_model": "gpt-5.4",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 49.13855421686747,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.08027424999999999,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.4",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt: inner j-loop update over A[i][j] (for j = k+1..n-1, for i = 0..m-1), line ~88",
+          "estimated_time_percentage": "45-55%",
+          "reason": "This doubly nested loop performs O(m*n^2/2) work and repeatedly reads/writes A column elements with low temporal reuse. Each iteration does a small amount of arithmetic per memory access, making it a dominant runtime contributor.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt: inner j-loop dot product for R[k][j] (for j = k+1..n-1, for i = 0..m-1), line ~85",
+          "estimated_time_percentage": "30-40%",
+          "reason": "This loop also performs O(m*n^2/2) work. It streams through Q[:,k] and A[:,j] for every j, causing repeated loads of Q[:,k] and A columns. The arithmetic intensity is low-to-moderate, so memory traffic is substantial.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt: norm computation and Q normalization (for i = 0..m-1), lines ~79-83",
+          "estimated_time_percentage": "10-20%",
+          "reason": "These loops are only O(m*n), so asymptotically smaller than the j-loops, but still nontrivial. The norm loop is a reduction over a column and the normalization loop performs a division per element, which is relatively expensive.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt: SQRT_FUN(nrm), line ~82",
+          "estimated_time_percentage": "1-3%",
+          "reason": "Square root is a high-latency scalar operation, but it is executed only once per k iteration, so total impact is limited compared with the O(m*n^2) loops.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The dominant work is in the O(m*n^2) dot-product and matrix-update loops. These loops stream through columns of A and Q with relatively low arithmetic intensity and repeated memory traffic, especially reloading Q[:,k] for many j values and updating A in place. In C row-major layout, accesses like A[i][j] with i varying are strided by N, which further hurts cache efficiency and vectorization. There is no inter-process communication, so communication is not a factor. While some floating-point work exists, the access pattern and data movement are the main limiting factors."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel has substantial data parallelism within each k iteration: norm reduction over i, dot products for all j > k, and independent updates of A[:,j]. However, the outer k-loop is sequential, and the algorithm is dominated by memory traffic with strided accesses in the current layout. GPU acceleration is feasible but benefits strongly from reformulating the computation into blocked operations with better locality.",
+        "recommended_approach": "Port a blocked QR/Gram-Schmidt variant rather than the scalar loop nest directly. Use GPU kernels or cuBLAS/cuSOLVER for reductions, matrix-vector products, and panel updates. Store data in column-major or transposed form, keep panels resident on device memory, parallelize across i and j within each k or block of k, and use shared memory/register tiling for Q[:,k] and A panels."
+      },
+      "cost": 0.027286,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步判断基本正确：该实现的主瓶颈是内存访问效率而非纯计算吞吐。原因有三点：1) 在 C 默认行主序下，A[i][k]、Q[i][k] 这类按列访问的步长为 N，导致 norm、Q 归一化、dot-product 三类热点都存在跨行跨 cache line 的访存；2) 对每个固定 k，Q[:,k] 会在所有 j>k 的 dot/update 中被重复读取，A[:,j] 也被先读用于点积、再读写用于更新，数据复用差；3) 算法虽有 O(m*n^2) FLOPs，但每次浮点操作伴随较高的数据搬运，尤其当前代码未做 blocking/packing，难以把数据留在 cache 中。需要补充的是：该瓶颈不是“完全由带宽决定”的简单 streaming 场景，而是“低到中等算术强度 + 大步长访问 + 缓存/TLB 不友好 + 向量化受限”的综合内存层次瓶颈。外层 k 循环存在真实数据依赖，因此整体并行度受限，但每个 k 内部仍有较强列并行。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "修复按列访问导致的跨步访存，优化 norm/Q 归一化/dot/update 全部热点",
+          "technique": "数据布局变换：将 A/Q 改为列主存储或显式转置存储",
+          "code_changes": "将二维数组从逻辑上的 A[m][n], Q[m][n] 改为一维列主数组，例如 A[k*m + i]、Q[k*m + i]；对应内核改写为：for (k) { colA_k=&A[k*m]; colQ_k=&Q[k*m]; nrm=0; for(i) nrm+=colA_k[i]*colA_k[i]; R[k*n+k]=sqrt(nrm); inv=1.0/R[k*n+k]; for(i) colQ_k[i]=colA_k[i]*inv; for(j=k+1;j<n;j++){ colA_j=&A[j*m]; r=0; for(i) r+=colQ_k[i]*colA_j[i]; R[k*n+j]=r; for(i) colA_j[i]-=colQ_k[i]*r; } }。若不想全局改接口，可在 kernel 前构造 At[n][m]、Qt[n][m]，计算后再按需转回。",
+          "expected_speedup": "CPU 上通常 1.8x-3.5x；若原问题规模较大且 N 导致严重 stride miss，可更高",
+          "difficulty": "medium"
+        },
+        {
+          "target": "降低 Q[:,k] 和 A[:,j] 的重复内存流量，提升 cache 命中率",
+          "technique": "对 j 维做 blocking/tiling，并在块内融合 dot 与 update",
+          "code_changes": "在固定 k 下，将 j 循环改为分块：for (jb=k+1; jb<n; jb+=BJ) { jend=min(n,jb+BJ); DATA_TYPE rbuf[BJ]; 初始化为0；第一阶段：for(i=0;i<m;i++){ q=Qcol[i]; for(j=jb;j<jend;j++) rbuf[j-jb]+=q*Acol(j)[i]; } 第二阶段：写回 R[k][j]=rbuf[...]；第三阶段：for(i=0;i<m;i++){ q=Qcol[i]; for(j=jb;j<jend;j++) Acol(j)[i]-=q*rbuf[j-jb]; } }。若采用列主布局，Acol(j)[i] 连续，块内可显著提升局部性。",
+          "expected_speedup": "1.3x-2.2x；与布局优化叠加后收益更稳定",
+          "difficulty": "medium"
+        },
+        {
+          "target": "提升 dot-product 与 update 的 SIMD 利用率",
+          "technique": "显式向量化：restrict、对齐、pragma omp simd、FMA 友好写法",
+          "code_changes": "将 kernel 参数改为 restrict 指针形式，例如 DATA_TYPE * __restrict__ A, * __restrict__ Q, * __restrict__ R；对列指针使用 __builtin_assume_aligned(ptr, 64)；在 i 循环上加 #pragma omp simd reduction(+:nrm) 和 #pragma omp simd reduction(+:r)；update 写成 aij = fma(-q, r, aij) 或 Acol_j[i] -= q * r；编译使用 -O3 -march=native -ffast-math（若允许数值语义放宽）。",
+          "expected_speedup": "1.2x-1.8x；若原先因 stride 无法向量化，则需先配合布局优化",
+          "difficulty": "easy"
+        },
+        {
+          "target": "减少归一化阶段除法开销并改善流水线",
+          "technique": "预计算倒数，用乘法替代逐元素除法",
+          "code_changes": "将 for(i) Q[i][k] = A[i][k] / R[k][k]; 改为 inv_rkk = 1.0 / R[k][k]; for(i) Qcol[i] = Acol_k[i] * inv_rkk; 同时将 R[k][k] 存入局部标量，避免重复加载。",
+          "expected_speedup": "1.02x-1.08x（局部优化）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "减少每个 k 内对 Q[:,k] 的重复读取",
+          "technique": "缓存/打包当前列 Q[:,k] 到连续缓冲区",
+          "code_changes": "若暂时不能改全局布局，可在每个 k 开始后执行 for(i) qbuf[i]=Q[i][k]; 后续 dot/update 全部使用 qbuf[i]。同理可对 A[:,k] 的 norm/normalize 使用临时连续缓冲。这样至少把最热的 Q[:,k] 从 stride 访问变为连续访问。",
+          "expected_speedup": "1.1x-1.5x；在不改布局时是低风险补救方案",
+          "difficulty": "easy"
+        },
+        {
+          "target": "提高多核 CPU 利用率",
+          "technique": "在每个固定 k 内并行化 j 维；norm 用 reduction",
+          "code_changes": "使用 OpenMP：norm 阶段 #pragma omp parallel for reduction(+:nrm)；dot/update 阶段可写为 #pragma omp parallel for private(i) schedule(static) for (j=k+1;j<n;j++) { r=0; for(i) r+=Qcol[i]*Acol_j[i]; R[k][j]=r; for(i) Acol_j[i]-=Qcol[i]*r; }。若采用列主布局，每个线程处理不同列 j，写 A[:,j] 无冲突。",
+          "expected_speedup": "4-12 线程下约 2x-6x；受外层 k 串行和内存带宽限制",
+          "difficulty": "easy"
+        },
+        {
+          "target": "把 Level-1/2 BLAS 风格操作提升为更高效内核",
+          "technique": "块化 Modified Gram-Schmidt / Householder QR，转化为 GEMV/GEMM/BLAS 调用",
+          "code_changes": "算法级重构：按列块 panel 处理，panel 内做正交化，随后用矩阵乘法更新 trailing matrix。若允许改变算法，优先改为 Householder QR：使用 LAPACK geqrf / orgqr 或 vendor BLAS。若必须保持 MGS，可采用 block MGS：一次处理 b 列，形成 Q_panel，再对剩余列做 R_block = Q_panel^T * A_trail，A_trail -= Q_panel * R_block。",
+          "expected_speedup": "相对原始实现 2x-8x；调用高性能 BLAS 时通常收益最大",
+          "difficulty": "hard"
+        },
+        {
+          "target": "改善数值稳定性并避免优化后误差放大",
+          "technique": "必要时采用 reorthogonalization 或切换 Householder",
+          "code_changes": "若输入矩阵病态，MGS 在激进向量化/fast-math 下可能损失正交性。可在每个 k 对 trailing columns 增加一次再正交化，或直接改用 Householder QR。若保留 MGS，建议在性能版与参考版之间做 ||I-Q^TQ|| 和 ||A-QR|| 校验。",
+          "expected_speedup": "0.8x-1.0x（这是稳健性优化，不是加速项）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "适合，但建议不要直接照搬当前逐列逐标量实现，而应采用“每个 k 的多阶段 GPU kernel + 列主布局 + 分块 trailing update”。具体策略：1) norm 阶段：对当前列 A[:,k] 做并行归约得到 R[k][k]；2) normalize 阶段：并行生成 Q[:,k]；3) trailing columns 阶段：对所有 j>k 并行计算 R[k][j] = Q[:,k]^T A[:,j]，再执行 A[:,j] -= Q[:,k] * R[k][j]。更高效的做法是把多个 j 组成 tile，由 thread block 共同加载 Q[:,k] 分片到 shared memory，对多个列同时做 dot 和 update。若进一步块化算法，可把 trailing update 转成 GEMV/GEMM 风格，直接利用 cuBLAS。",
+        "data_layout": "强烈建议使用列主布局（Fortran/BLAS 风格）或显式存储转置矩阵 At[n][m]、Qt[n][m]，使线程沿 i 维访问时连续。GPU 上若一个 warp 处理同一列的连续 i 元素，则可实现合并访存。对于 trailing update，可采用二维 tile：列块 j_tile × 行块 i_tile；Q[:,k] 的 i_tile 分片放入 shared memory，A 的对应 tile 连续读取并更新。R 仍按常规二维存储即可，因其体量较小。",
+        "challenges": [
+          "外层 k 循环串行，限制全局并行度；解决方案是增大每个 k 内的并行工作量，并采用 blocked QR 减少 kernel launch 与同步开销",
+          "原始 MGS 属低算术强度，若不做 blocking/共享内存复用，GPU 可能受显存带宽限制；解决方案是 tile 化并尽量把 trailing update 转成 GEMM 类操作",
+          "dot-product 需要归约，归约效率和数值误差都需关注；解决方案是 warp-level reduction + block reduction，并在需要时使用 pairwise/Kahan 补偿",
+          "若直接使用行主序，按列访问会导致非合并访存；解决方案是改列主或转置存储",
+          "kernel 间同步频繁：norm -> normalize -> dot -> update 每个 k 都要同步；解决方案是使用 CUDA Graphs、persistent kernels 或 block QR 降低启动开销",
+          "数值稳定性：MGS 在 GPU 上并行归约顺序变化会带来结果差异；解决方案是容忍小幅非确定性，或改用 Householder QR/cuSOLVER"
+        ],
+        "expected_speedup": "相对当前单线程 CPU 基线：直接朴素 GPU 移植约 3x-10x；采用列主布局 + shared-memory tiling + block QR/cuBLAS 后常见可达 10x-30x。若对比已优化的多核 CPU 版本，则更现实的范围约 2x-8x。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "原始实现按热点估算：norm 约 2 FLOPs / 16 bytes = 0.125 FLOPs/byte（读 A 列）；Q 归一化约 1 FLOP / 24 bytes ≈ 0.042 FLOPs/byte（读 A、写 Q，若计入 R 标量影响可忽略）；dot-product 约 2 FLOPs / 16 bytes = 0.125 FLOPs/byte（读 Q 和 A）；update 约 2 FLOPs / 24 bytes ≈ 0.083 FLOPs/byte（读 A、读 Q、写 A，R 标量可缓存）。若把 dot+update 合并看，每个 (i,j) 大致 4 FLOPs / 40 bytes ≈ 0.10 FLOPs/byte。考虑缓存复用后有效值可能提升到 0.15-0.30 FLOPs/byte，但总体仍属低算术强度、偏内存受限内核。采用列主布局 + j-blocking 后，Q[:,k] 与若干 A[:,j] 的复用增强，有效算术强度可提升约 1.5x-3x。",
+        "cache_behavior": "当前代码在行主序下对列访问极不友好：1) A[i][k]、Q[i][k] 随 i 递增时地址步长为 N*sizeof(DATA_TYPE)，容易每次访问触及新 cache line，空间局部性差；2) 对固定 k，Q[:,k] 在所有 j 循环中被重复扫描，若 m 大于 LLC 可容纳范围，则会反复从更低层缓存甚至内存取回；3) A[:,j] 在 dot 和 update 两个循环中被两次遍历，若两阶段之间间隔较长或 j 范围大，第一次读取的数据难以保留到第二次使用；4) stride 访问还会增加 TLB miss 风险，并削弱硬件预取器效果；5) R 很小，通常不构成瓶颈。若改为列主布局，则 A[:,j]、Q[:,k] 都变为连续访问，SIMD、预取、cache line 利用率都会明显改善；进一步做 j-blocking 可让一批列在 cache 中完成 dot 与 update，减少 A 的往返流量。",
+        "data_dependencies": [
+          "外层 k 循环存在真实依赖：第 k 步会更新 A[:, j>k]，第 k+1 步的 norm 依赖这些更新后的列，因此 k 不能简单并行",
+          "在固定 k 下，R[k][j] 的 dot-product 对不同 j 相互独立，可并行",
+          "在固定 k 和 j 下，A[:,j] 的 update 依赖先前计算出的 R[k][j]，因此同一列内必须先归约得到标量 r 再执行更新",
+          "norm 归约对 i 存在 reduction 依赖，但可用并行归约/SIMD reduction 处理",
+          "Q[:,k] 在当前 k 内只写一次、随后只读，是广播型只读数据，适合缓存/共享内存/寄存器复用",
+          "A[:,j] 在不同 j 之间无写冲突，因此 j 维是最自然的线程并行维度"
+        ]
+      },
+      "cost": 0.052988249999999994,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.08027424999999999
+  }
+}

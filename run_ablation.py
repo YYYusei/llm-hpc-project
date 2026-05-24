@@ -50,6 +50,13 @@ BENCHMARK_SOURCES = {
     "lulesh":     "benchmarks/lulesh/lulesh_simplified.c",
     "nas_cg":     "benchmarks/nas_cg/cg.c",
     "jacobi2d":   "benchmarks/jacobi2d/jacobi2d.c",
+    "gemm":        "benchmarks/gemm/gemm.c",
+    "2mm":         "benchmarks/2mm/2mm.c",
+    "3mm":         "benchmarks/3mm/3mm.c",
+    "syrk":        "benchmarks/syrk/syrk.c",
+    "syr2k":       "benchmarks/syr2k/syr2k.c",
+    "doitgen":     "benchmarks/doitgen/doitgen.c",
+    "gramschmidt": "benchmarks/gramschmidt/gramschmidt.c",
 }
 
 # Config name used for prompt building / benchmark registry
@@ -63,6 +70,13 @@ CONFIG_NAME_MAP = {
     "lulesh":     "lulesh",
     "nas_cg":     "nas_cg",
     "jacobi2d":   "jacobi2d",
+    "gemm":        "gemm",
+    "2mm":         "2mm",
+    "3mm":         "3mm",
+    "syrk":        "syrk",
+    "syr2k":       "syr2k",
+    "doitgen":     "doitgen",
+    "gramschmidt": "gramschmidt",
 }
 
 ABLATION_CONFIGS = {

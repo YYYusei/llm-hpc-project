@@ -167,6 +167,13 @@ GROUND_TRUTH = {
     'lulesh':     'memory',
     'nas_cg':     'memory',
     'jacobi2d':   'memory',
+    'gemm':        'compute',
+    '2mm':         'compute',
+    '3mm':         'compute',
+    'syrk':        'compute',
+    'syr2k':       'compute',
+    'doitgen':     'compute',
+    'gramschmidt': 'compute',
 }
 
 

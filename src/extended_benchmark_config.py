@@ -234,6 +234,185 @@ EXTENDED_DEFINITIONS = {
         structure_keywords=["jacobi", "stencil", "laplace", "5-point",
                             "ping-pong", "iteration", "grid", "convergence"],
     ),
+
+    # ============ PolyBench compute-bound 扩展 (2026-05, 平衡偏置) ============
+    # 全部 VTune hotspots 实测(见扩展回填表 A),GT 由稠密线代算法特性 + AI 判定为 compute。
+
+    # -------- GEMM (PolyBench, EXTRALARGE) --------
+    # VTune: kernel_gemm 98.9%
+    "gemm": BenchmarkDefinition(
+        name="gemm",
+        full_name="GEMM - General Dense Matrix Multiply (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["gemm.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_gemm",
+                location_patterns=[r"kernel_gemm", r"gemm", r"matrix.*multiply", r"C\[i\]\[j\]"],
+                time_percentage=98.9,  # VTune measured
+                bottleneck_type="compute",  # dense GEMM: O(N^3) FLOPs / O(N^2) data, high AI, FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "triple loop", "inner product"],
+                memory_patterns=["row-major", "blocked access", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Embarrassingly parallel dense matmul. Tiling + shared memory + register "
+                  "blocking give near-peak GPU throughput. Classic compute-bound GPU workload.",
+        function_keywords=["kernel_gemm", "init_array"],
+        structure_keywords=["gemm", "matrix multiply", "dense", "BLAS", "alpha", "beta", "GEMM"],
+    ),
+
+    # -------- 2MM (PolyBench, LARGE) --------
+    # VTune: kernel_2mm 98.9%
+    "2mm": BenchmarkDefinition(
+        name="2mm",
+        full_name="2MM - Two Chained Dense Matrix Multiplies (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["2mm.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_2mm",
+                location_patterns=[r"kernel_2mm", r"2mm", r"matrix.*multiply", r"tmp", r"D\[i\]\[j\]"],
+                time_percentage=98.9,  # VTune measured
+                bottleneck_type="compute",  # two chained GEMMs (D = A.B.C), FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "two matmul", "chained"],
+                memory_patterns=["row-major", "intermediate tmp matrix", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Two chained GEMMs. Each is independently tile-parallelisable; intermediate "
+                  "matrix can stay in GPU memory. Compute-bound, high GPU suitability.",
+        function_keywords=["kernel_2mm", "init_array"],
+        structure_keywords=["2mm", "two matrix multiply", "chained", "dense", "tmp", "alpha", "beta"],
+    ),
+
+    # -------- 3MM (PolyBench, LARGE) --------
+    # VTune: kernel_3mm 99.4%
+    "3mm": BenchmarkDefinition(
+        name="3mm",
+        full_name="3MM - Three Chained Dense Matrix Multiplies (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["3mm.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_3mm",
+                location_patterns=[r"kernel_3mm", r"3mm", r"matrix.*multiply", r"E\[i\]\[j\]", r"G\[i\]\[j\]"],
+                time_percentage=99.4,  # VTune measured
+                bottleneck_type="compute",  # three chained GEMMs (G = (A.B).(C.D)), FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "three matmul", "chained"],
+                memory_patterns=["row-major", "two intermediate matrices", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Three chained GEMMs. Same parallelisation as GEMM applied three times; "
+                  "intermediates reside on device. Compute-bound, high GPU suitability.",
+        function_keywords=["kernel_3mm", "init_array"],
+        structure_keywords=["3mm", "three matrix multiply", "chained", "dense", "E", "F", "G"],
+    ),
+
+    # -------- SYRK (PolyBench, EXTRALARGE) --------
+    # VTune: kernel_syrk 99.7%
+    "syrk": BenchmarkDefinition(
+        name="syrk",
+        full_name="SYRK - Symmetric Rank-k Update (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["syrk.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_syrk",
+                location_patterns=[r"kernel_syrk", r"syrk", r"rank.*k", r"C\[i\]\[j\]"],
+                time_percentage=99.7,  # VTune measured
+                bottleneck_type="compute",  # C = alpha*A*A^T + beta*C, BLAS-3, FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "rank-k update"],
+                memory_patterns=["row-major", "symmetric update", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Symmetric rank-k update (BLAS-3). Triangular output halves work but remains "
+                  "compute-bound; tile-parallelisable. High GPU suitability.",
+        function_keywords=["kernel_syrk", "init_array"],
+        structure_keywords=["syrk", "rank-k", "symmetric", "dense", "BLAS", "alpha", "beta"],
+    ),
+
+    # -------- SYR2K (PolyBench, LARGE) --------
+    # VTune: kernel_syr2k 99.3%
+    "syr2k": BenchmarkDefinition(
+        name="syr2k",
+        full_name="SYR2K - Symmetric Rank-2k Update (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["syr2k.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_syr2k",
+                location_patterns=[r"kernel_syr2k", r"syr2k", r"rank.*2k", r"C\[i\]\[j\]"],
+                time_percentage=99.3,  # VTune measured
+                bottleneck_type="compute",  # C = alpha*A*B^T + alpha*B*A^T + beta*C, BLAS-3, FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "rank-2k update"],
+                memory_patterns=["row-major", "symmetric update", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Symmetric rank-2k update (BLAS-3). Two coupled products; compute-bound and "
+                  "tile-parallelisable. High GPU suitability.",
+        function_keywords=["kernel_syr2k", "init_array"],
+        structure_keywords=["syr2k", "rank-2k", "symmetric", "dense", "BLAS", "alpha", "beta"],
+    ),
+
+    # -------- DOITGEN (PolyBench, EXTRALARGE) --------
+    # VTune: kernel_doitgen 97.7%
+    "doitgen": BenchmarkDefinition(
+        name="doitgen",
+        full_name="Doitgen - Multiresolution ADI Tensor Contraction (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["doitgen.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_doitgen",
+                location_patterns=[r"kernel_doitgen", r"doitgen", r"tensor", r"sum", r"A\[r\]\[q\]\[p\]"],
+                time_percentage=97.7,  # VTune measured
+                bottleneck_type="compute",  # 3D tensor x matrix contraction, high reuse, FLOP-bound
+                loop_keywords=["r loop", "q loop", "p loop", "s loop", "tensor contraction"],
+                memory_patterns=["3D tensor", "contraction over s", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Multiresolution tensor contraction (tensor x matrix). High arithmetic intensity, "
+                  "parallel over outer tensor indices. Compute-bound, suitable for GPU.",
+        function_keywords=["kernel_doitgen", "init_array"],
+        structure_keywords=["doitgen", "tensor", "contraction", "multiresolution", "ADI", "sum"],
+    ),
+
+    # -------- GRAMSCHMIDT (PolyBench, LARGE) --------
+    # VTune: kernel_gramschmidt 99.6%
+    "gramschmidt": BenchmarkDefinition(
+        name="gramschmidt",
+        full_name="Gram-Schmidt - QR Decomposition via Orthonormalisation (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["gramschmidt.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_gramschmidt",
+                location_patterns=[r"kernel_gramschmidt", r"gramschmidt", r"gram.*schmidt", r"orthogonal", r"QR"],
+                time_percentage=99.6,  # VTune measured
+                bottleneck_type="compute",  # QR orthonormalisation, FLOP-dense but column-carried dependency
+                loop_keywords=["k loop", "i loop", "j loop", "projection", "normalisation"],
+                memory_patterns=["column access", "projection", "running orthogonalisation"]
+            ),
+        ],
+        gpu_suitable=False,
+        gpu_notes="QR via classical Gram-Schmidt. Compute-dense but has column-by-column dependency "
+                  "(each column orthogonalised against all previous), limiting naive parallelism. "
+                  "Partial GPU suitability: within-column ops parallel, but the outer column loop is serial.",
+        function_keywords=["kernel_gramschmidt", "init_array"],
+        structure_keywords=["gramschmidt", "QR", "orthogonal", "orthonormal", "projection", "Q", "R"],
+    ),
 }
 
 

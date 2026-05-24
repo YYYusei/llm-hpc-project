@@ -1,0 +1,120 @@
+{
+  "program": "doitgen",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 72.65890481064484,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03601325,
+  "full_result": {
+    "code_name": "doitgen",
+    "program_key": "doitgen",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_doitgen(): nested loops r/q/p/s (matrix-vector multiply per (r,q))",
+          "estimated_time_percentage": "90-98%",
+          "reason": "Dominant O(nr*nq*np*np) work: for each (r,q), computes sum[p] = Σ_s A[r][q][s]*C4[s][p] for all p. This is effectively a GEMV/GEMM-like kernel with high total FLOPs and repeated memory accesses to C4 and A.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_doitgen(): loop writing back A[r][q][p] = sum[p]",
+          "estimated_time_percentage": "2-8%",
+          "reason": "Streams through sum and writes A; lower arithmetic intensity but still touches np elements per (r,q). Often limited by store bandwidth and cache behavior.",
+          "confidence": "medium"
+        },
+        {
+          "location": "print_array(): triple loop with fprintf",
+          "estimated_time_percentage": "0-50% (depends on whether timing includes it / runtime environment)",
+          "reason": "Heavy I/O (fprintf per element) can dominate wall time if executed in a real run; PolyBench timing typically excludes it, but overall program runtime may be I/O-bound when printing is enabled.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The core kernel performs ~2*np*np FLOPs per (r,q) while reading A[r][q][s] (np elements) and repeatedly accessing C4[s][p] (np*np elements). With the current loop order (p outer, s inner), C4 is accessed with a large stride in memory (C4[s][p] with s varying), reducing spatial locality and vectorization efficiency, and increasing cache/TLB misses. Arithmetic intensity is moderate, but effective performance is typically limited by memory hierarchy behavior (cache misses/poor locality) rather than peak compute."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel is a dense linear-algebra operation equivalent to multiplying many independent vectors/matrices by a constant matrix C4. It has abundant parallelism across (r,q,p) and benefits from high memory bandwidth and fused multiply-add throughput on GPUs. Performance depends on arranging memory accesses so threads read C4 and A coalesced and reuse C4 via shared/constant memory or via GEMM.",
+        "recommended_approach": "Reshape A into a 2D matrix A2 of shape (nr*nq, np) and compute A2 = A2 * C4 using cuBLAS (GEMM). This maximizes reuse of C4 and uses highly tuned kernels. If writing a custom kernel, use s-outer/p-inner accumulation, tile C4 into shared memory, keep partial sums in registers, and parallelize over (row=(r,q), p) with coalesced loads/stores."
+      },
+      "cost": 0.025166749999999998,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck due to poor spatial locality and inefficient memory access patterns, particularly with the C4 matrix. The nested loop structure results in non-coalesced memory accesses, leading to cache misses and reduced performance."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_doitgen",
+          "technique": "Loop interchange and blocking",
+          "code_changes": "Interchange the loops to have 's' as the outer loop and 'p' as the inner loop. Implement loop blocking to improve cache utilization.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_doitgen",
+          "technique": "Use of temporary buffers",
+          "code_changes": "Introduce temporary buffers to store intermediate results and reduce redundant memory accesses.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "print_array",
+          "technique": "Conditional compilation",
+          "code_changes": "Use preprocessor directives to exclude 'print_array' from timing measurements in performance-critical builds.",
+          "expected_speedup": "Varies based on environment",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use CUDA to parallelize across (r, q, p) dimensions. Each thread block computes a portion of the output matrix A, with threads within a block computing elements of A[r][q][p].",
+        "data_layout": "Transform C4 to a column-major order or use shared memory to improve coalesced access patterns.",
+        "challenges": [
+          "Managing shared memory usage",
+          "Ensuring coalesced memory accesses"
+        ],
+        "expected_speedup": "5x - 10x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "2*np*np / (np + np*np) = 2 / (1 + np)",
+        "cache_behavior": "The current loop order results in poor cache line utilization due to non-contiguous memory accesses, especially for the C4 matrix. Loop interchange and blocking can improve cache line hits.",
+        "data_dependencies": [
+          "A[r][q][s] -> sum[p]",
+          "sum[p] -> A[r][q][p]"
+        ]
+      },
+      "cost": 0.0108465,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03601325
+  }
+}

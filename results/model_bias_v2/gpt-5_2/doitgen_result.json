@@ -1,0 +1,51 @@
+{
+  "program": "doitgen",
+  "model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The core kernel performs ~2*np^2 FLOPs per (r,q) but streams A[r][q,:] and repeatedly reads C4 with limited temporal locality unless blocked; for realistic NP sizes C4 does not fit in L1 and may not fit in LLC, causing high bandwidth demand. The arithmetic intensity is moderate and often insufficient to fully utilize peak FLOPs on modern CPUs without cache blocking and vectorization, making performance primarily limited by memory hierarchy (cache/DRAM bandwidth and latency).",
+  "ground_truth": "compute",
+  "correct": false,
+  "eval_score": 72.27507676560901,
+  "cost": 0.02574075,
+  "stage1": {
+    "model": "gpt-5.2",
+    "hotspots": [
+      {
+        "location": "kernel_doitgen(): nested loops r/q/p/s (sum[p] += A[r][q][s] * C4[s][p])",
+        "estimated_time_percentage": "85-95%",
+        "reason": "This is the O(nr*nq*np*np) matrix-vector-like accumulation (for each (r,q), computes sum = A[r][q,:] * C4). It dominates FLOPs and memory traffic; repeatedly streams A[r][q][s] and accesses C4[s][p] with poor cache reuse across p unless blocked.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_doitgen(): copy-back loop (A[r][q][p] = sum[p])",
+        "estimated_time_percentage": "3-8%",
+        "reason": "Extra full pass over p writing A; adds memory bandwidth pressure and store traffic (and potential write-allocate) after the compute loop.",
+        "confidence": "high"
+      },
+      {
+        "location": "init_array(): triple loop initializing A and double loop initializing C4",
+        "estimated_time_percentage": "1-5%",
+        "reason": "Linear initialization over large arrays; typically small compared to kernel but can be noticeable for small problem sizes or when timing includes initialization (here it does not).",
+        "confidence": "medium"
+      },
+      {
+        "location": "print_array(): full scan with fprintf",
+        "estimated_time_percentage": "variable (can exceed kernel if enabled for large sizes)",
+        "reason": "I/O-bound full traversal with formatted printing; extremely slow relative to computation. In PolyBench runs this is often disabled or redirected, but if executed it can dominate wall time.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The core kernel performs ~2*np^2 FLOPs per (r,q) but streams A[r][q,:] and repeatedly reads C4 with limited temporal locality unless blocked; for realistic NP sizes C4 does not fit in L1 and may not fit in LLC, causing high bandwidth demand. The arithmetic intensity is moderate and often insufficient to fully utilize peak FLOPs on modern CPUs without cache blocking and vectorization, making performance primarily limited by memory hierarchy (cache/DRAM bandwidth and latency)."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The kernel is essentially a dense matrix multiplication: (nr*nq x np) times (np x np). This has high parallelism and can achieve high throughput on GPUs, especially when NP is large enough to amortize memory transfers. C4 is reused across many (r,q) rows, which is favorable for GPU caching/constant memory.",
+      "recommended_approach": "Flatten A to a 2D matrix M with rows = nr*nq and cols = np, then compute M = M * C4 using cuBLAS/rocBLAS GEMM. Keep C4 resident on device; transfer A once, run GEMM, transfer back if needed. If writing a custom kernel, use tiling in shared memory for C4 tiles and register accumulation for output tiles; map threads to (row, p) output elements."
+    },
+    "cost": 0.02574075,
+    "bottleneck_raw": "memory"
+  }
+}

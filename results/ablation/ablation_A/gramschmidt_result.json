@@ -1,0 +1,150 @@
+{
+  "program": "gramschmidt",
+  "config": "Ablation A (5.2→5.2)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 48.76204819277109,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.08435875,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt(): inner update loop A[i][j] = A[i][j] - Q[i][k] * R[k][j] (inside for k, for j=k+1..N-1, for i=0..M-1)",
+          "estimated_time_percentage": "40-55%",
+          "reason": "Dominant O(M*N^2) work; streams through A[:,j] with a read-modify-write each iteration and reuses Q[:,k] across j, causing high memory traffic and limited arithmetic intensity.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt(): dot product R[k][j] += Q[i][k] * A[i][j] (inside for k, for j=k+1..N-1, for i=0..M-1)",
+          "estimated_time_percentage": "30-45%",
+          "reason": "Second dominant O(M*N^2) work; for each (k,j) performs a reduction over i reading Q[:,k] and A[:,j]; reduction limits vectorization and is bandwidth-sensitive due to streaming loads.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_gramschmidt(): column norm and normalization (nrm += A[i][k]^2; Q[i][k]=A[i][k]/R[k][k]) (inside for k, for i=0..M-1)",
+          "estimated_time_percentage": "5-15%",
+          "reason": "O(M*N) work; includes SQRT and division plus streaming through A[:,k] and writing Q[:,k]. Typically smaller than the O(M*N^2) parts unless N is small.",
+          "confidence": "medium"
+        },
+        {
+          "location": "print_array(): fprintf loops over R and Q",
+          "estimated_time_percentage": "0-90% (depends on whether I/O is enabled in the measured run)",
+          "reason": "If executed/timed, formatted I/O dominates runtime; in PolyBench timing usually excludes this, but in real runs it can dwarf compute.",
+          "confidence": "low"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The main kernel is dominated by two O(M*N^2) streaming loops that repeatedly read A and Q and write/update A with low-to-moderate arithmetic intensity (few FLOPs per multiple memory accesses). Reductions and scalar dependencies further limit peak compute utilization, making performance primarily constrained by memory bandwidth and cache reuse rather than raw FLOP throughput."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The dominant work is matrix-vector products and rank-1 updates over large 2D arrays, which map well to GPU kernels/BLAS. However, the outer loop over k is inherently sequential with dependencies (A is updated each k), so performance depends on batching work per k (large M and N) and using high-throughput BLAS-2/3 operations to amortize kernel launch overhead and memory transfers.",
+        "recommended_approach": "Keep A, Q, R resident on the GPU. For each k: (1) compute nrm via a reduction kernel on A[:,k]; (2) compute Q[:,k] by scaling A[:,k]; (3) compute R[k,k+1:] using cuBLAS GEMV (or GEMM with a 1xM vector) on A[:,k+1:]; (4) update A[:,k+1:] with cuBLAS GER (rank-1 update) or GEMM. Use streams to overlap reductions and BLAS where possible; consider a blocked QR algorithm to increase GEMM usage for better GPU efficiency."
+      },
+      "cost": 0.028042,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "对 kernel_gramschmidt 的判断基本正确：主耗时来自两段 O(M*(N-k)) 的列向量点积与随后的 rank-1 更新（A[:,j] -= Q[:,k]*R[k,j]），每次迭代 k 都会对 A 的剩余列做一次全列流式读写，算术强度偏低且受缓存复用限制，整体更接近带宽/内存层次瓶颈而非纯算力瓶颈。需要补充的是：若启用 print_array（PolyBench 的 DCE 输出），I/O 会完全主导时间，任何计算优化都被掩盖；性能评测必须关闭/隔离 I/O。另一个细节：点积阶段对 A[:,j] 的读取与更新阶段再次读取 A[:,j]，导致同一列在短时间内被读两遍（若不在缓存中则是额外带宽压力），这是可优化点。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "避免 I/O 干扰计时（print_array 导致 0-90% 波动）",
+          "technique": "基准测试隔离：关闭 DCE 输出或将输出移出计时路径；使用校验哈希替代全量 fprintf",
+          "code_changes": "1) 编译时关闭 PolyBench dump：在编译选项中定义 POLYBENCH_DUMP_ARRAYS=0 或移除 polybench_prevent_dce(print_array(...))。\n2) 若必须防 DCE：改为计算轻量校验和：\n   volatile DATA_TYPE checksum=0; for(i)for(j) checksum += Q[i][j]*1e-9 + R[i][j]*1e-9; printf(\"%e\\n\", (double)checksum);\n   并确保该段不在计时区间内。",
+          "expected_speedup": "若当前 run 启用输出：可达 10x-100x（取决于输出量与文件系统）；若已禁用输出：无影响",
+          "difficulty": "easy"
+        },
+        {
+          "target": "热点1/2：点积 R[k][j] += Q[i][k]*A[i][j] 与更新 A[i][j] -= Q[i][k]*R[k][j] 的内存带宽与重复读 A",
+          "technique": "块化(j-blocking)+融合点积与更新（在块内先算 R[k,j] 再立刻更新 A[:,j]），提升 A 的缓存复用；同时对 i 维向量化与并行化",
+          "code_changes": "核心思路：对 j 做分块 JB，使 A 的一小块列驻留在 LLC/L2；对每个 j 块：先计算该块所有 R[k][j]（对 i 做向量化/并行归约），再用同一块数据更新 A。\n示例（伪代码，保持数值顺序不变：先算完 R 再更新 A）：\n\nconst int JB=32; // 依据缓存调参\nfor (k=0;k<n;k++) {\n  // nrm + normalize 同原逻辑\n  ...\n  for (int jb=k+1; jb<n; jb+=JB) {\n    int jend = (jb+JB<n)? jb+JB : n;\n    // 1) 计算 R[k][j] for j in [jb,jend)\n    for (int j=jb;j<jend;j++) R[k][j]=0;\n    // i 维归约：可 OpenMP + SIMD\n    #pragma omp parallel for\n    for (int j=jb;j<jend;j++) {\n      DATA_TYPE sum=0;\n      #pragma omp simd reduction(+:sum)\n      for (int i=0;i<m;i++) sum += Q[i][k]*A[i][j];\n      R[k][j]=sum;\n    }\n    // 2) 更新 A[:,j]\n    #pragma omp parallel for collapse(2)\n    for (int j=jb;j<jend;j++) {\n      DATA_TYPE rkj = R[k][j];\n      #pragma omp simd\n      for (int i=0;i<m;i++) A[i][j] -= Q[i][k]*rkj;\n    }\n  }\n}\n\n进一步：将 Q[:,k] 复制到对齐的临时缓冲 qk[i]（连续内存）以改善访存与向量化：\nfor(i) qk[i]=Q[i][k]; 然后用 qk[i] 替代 Q[i][k]。",
+          "expected_speedup": "CPU 上常见 1.3x-2.5x（取决于 M,N、缓存大小、是否原本已被编译器良好向量化）；若原实现频繁内存带宽饱和且 A 不能驻留缓存，块化收益更明显",
+          "difficulty": "medium"
+        },
+        {
+          "target": "热点2：点积归约的并行与向量化效率（R[k][j]）",
+          "technique": "OpenMP 并行化跨 j；SIMD reduction across i；对齐与 restrict；避免别名阻碍向量化",
+          "code_changes": "1) 给指针加 restrict（若改为指针形式）并确保 64B 对齐分配。\n2) 在点积循环加入：\n   #pragma omp parallel for schedule(static)\n   for (j=k+1;j<n;j++) { sum=0; #pragma omp simd reduction(+:sum) for(i=0;i<m;i++) sum += Q[i][k]*A[i][j]; R[k][j]=sum; }\n3) 编译选项：-O3 -march=native -ffast-math(若允许)；或对 sqrt/div 保持精度则不启用 fast-math。\n4) 若 DATA_TYPE 为 double，考虑使用 FMA：sum = fma(qk, a, sum)。",
+          "expected_speedup": "多核：接近 min(核数, (n-k-1)) 的并行加速，但受带宽限制通常 2x-8x；单核 SIMD：1.2x-2x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "热点1：更新 A 的写带宽与写分配开销",
+          "technique": "SIMD + 写合并；在可行时使用 non-temporal store（流式写）减少写分配；或通过块化让写命中缓存",
+          "code_changes": "1) 保持块化（见上）优先。\n2) 若 M 很大且 A 更新后短期不再读（对同一 k 的后续 j 不读同一元素，但下一次 k 会读 A[:,k]，与当前更新列不同），可对 A[:,j] 更新使用编译器内建/pragma 触发 streaming store（依赖编译器）：例如 ICC/ICX 的 #pragma vector nontemporal(A) 或使用 _mm_stream_pd（需手写 intrinsics 且对齐）。\n3) 仅在确认不会破坏后续缓存复用时启用（否则可能变慢）。",
+          "expected_speedup": "1.05x-1.3x（高度依赖平台与是否写分配成为瓶颈）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "列范数与归一化（nrm、Q[:,k]）的带宽与除法开销",
+          "technique": "融合两遍遍历为一遍（先算 nrm，再用 invRkk 归一化仍需第二遍；但可减少一次除法为乘法）；SIMD reduction；使用 rsqrt 近似（若允许）",
+          "code_changes": "1) 计算 Rkk 后用倒数：\n   DATA_TYPE inv = 1.0 / R[k][k];\n   #pragma omp simd\n   for(i=0;i<m;i++) Q[i][k] = A[i][k] * inv;\n2) nrm 循环：#pragma omp simd reduction(+:nrm)\n3) 若允许近似：inv = rsqrt(nrm)（float 更常见），double 需牛顿迭代；注意数值误差。",
+          "expected_speedup": "该段占比小：整体 1.02x-1.10x；但可降低除法成本并改善向量化",
+          "difficulty": "easy"
+        },
+        {
+          "target": "算法级：将 MGS 映射到 BLAS-2/3 以提升算术强度与缓存复用",
+          "technique": "用 GEMV/GER 或阻塞 Gram-Schmidt（block MGS）转为 GEMM（BLAS-3）",
+          "code_changes": "两级方案：\nA) 直接 BLAS-2：\n  - R[k,k]=||A[:,k]||2 (nrm2)\n  - Q[:,k]=A[:,k]/Rkk (scal/copy)\n  - 对剩余列：r = Q[:,k]^T * A[:,k+1:] (gemv with multiple RHS 等价于 GEMV/或用 GEMM 1x(M) * (M x (N-k-1)))\n  - A[:,k+1:] -= Q[:,k] * r (ger)\nB) Block MGS（推荐）：每次处理 b 列，形成 Q_block (Mxb)，对 trailing matrix 做：\n  - R_block = Q_block^T * A_trail  (GEMM)\n  - A_trail -= Q_block * R_block   (GEMM)\n这样把主要工作从 BLAS-2 提升到 BLAS-3，显著提高算术强度与缓存命中。\n实现可调用 OpenBLAS/MKL/BLIS；或在 GPU 上用 cuBLAS。",
+          "expected_speedup": "CPU：2x-10x（取决于 b、矩阵尺寸与 BLAS 质量）；GPU：通常更高（见 GPU 部分）",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "保持 k 串行（在 GPU 上为一个小循环），把每个 k 的两大操作变成高吞吐 kernel/BLAS：\n1) 计算 Rkk 与 Q[:,k]：用 cuBLAS nrm2 + scal/copy（或自定义 kernel：并行归约求 nrm，再并行归一化）。\n2) 计算 r = Q[:,k]^T * A[:,k+1:]：将其视为 1xM 向量乘 Mx(N-k-1) 矩阵，调用 cublasGemmEx（GEMM： (1xM)*(MxT)=1xT）或 cublasGemvStridedBatched（不如 GEMM 通用）。\n3) 更新 A[:,k+1:] -= Q[:,k] * r：调用 GEMM（Mx1 * 1xT）或 GER。\n更优：采用 block MGS（每次处理 b 列），把 trailing update 变成两次 GEMM（Qb^T*Atrail 与 Qb*Rblock），显著提高 GPU 利用率并减少 kernel launch 次数。",
+        "data_layout": "建议在 GPU 上使用列主序（Fortran order）或显式转置存储，使得对列向量 A[:,j]、Q[:,k] 的访问连续合并（coalesced）。\n- 若继续用 C 行主序：访问 A[i][j]（固定 j，变 i）是大步长，GPU 全局内存合并差。\n- 方案：在 host 侧初始化后转置 A/Q（或直接按列主序分配与填充），并用 cuBLAS 的 column-major 接口；或使用 cublasSetMathMode + leading dimension 正确设置。",
+        "challenges": [
+          "k 串行导致频繁小规模操作：当 N 不大或 (N-k-1) 很小时，GEMV/GER 变成小 kernel，launch 开销与低占用显著；用 block MGS（b=16/32/64）把工作提升到 GEMM 可缓解",
+          "数值稳定性：MGS/块化会改变浮点累加顺序；若需要与参考输出严格一致需谨慎（可能需要 Kahan/分层归约，代价是性能）",
+          "数据传输：必须把整个分解过程放在 GPU 上，避免每个 k 往返拷贝；仅在开始拷贝 A，结束拷贝 Q/R（或只拷贝校验值）",
+          "内存布局转换成本：转置一次 O(MN) 通常可接受，但对小问题可能得不偿失；可直接以列主序生成数据避免转置"
+        ],
+        "expected_speedup": "若 M,N 足够大（例如 M>=4096 且 N>=512）并采用 block MGS + GEMM：相对单核 CPU 常见 10x-50x；相对多核高性能 BLAS CPU（MKL/BLIS）常见 2x-10x。若 N 较小或未块化（大量 BLAS-2）：可能仅 1.5x-5x，甚至受 launch 开销影响不明显。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "以主循环（对每个 k 的 j>k 部分）估算：\n- 点积：每个 (i,j) 约 2 FLOPs（mul+add），读 Q[i,k] 与 A[i,j]（若 double：16B），写 R[k,j] 可忽略到每列一次；AI≈2/16=0.125 FLOPs/byte。\n- 更新：每个 (i,j) 约 2 FLOPs（mul+sub），读 A[i,j] 与 Q[i,k]（16B）并写 A[i,j]（8B，且可能触发写分配额外读），保守按 24B 计：AI≈2/24≈0.083 FLOPs/byte。\n两者合计（若 A 在点积与更新间不能复用）：每个 (i,j) 约 4 FLOPs，读 Q 两次(16B) + 读 A 两次(16B) + 写 A 一次(8B) ≈40B => AI≈0.10 FLOPs/byte（非常偏带宽）。若通过块化使 A 在缓存中复用，可把 A 的第二次读大幅减少，AI 可提升到 ~0.13-0.16，但仍偏低。",
+        "cache_behavior": "A 与 Q 为行主序（C contiguous in j）。内层 i 循环访问 A[i][j] 是跨行步长 N 的访问（stride-N），对缓存/预取不友好；而对固定 k 的 Q[i][k] 同样是 stride-N。结果是：\n1) i 内层时每次触及不同 cache line，空间局部性差；\n2) Q[:,k] 会被重复使用于所有 j>k，但由于 stride 访问与容量限制，难以在 L1/L2 保持；\n3) A[:,j] 在点积与更新之间若不做块化，可能无法留在缓存，导致同一列被读两遍。\n优化方向：交换数据布局（列主序/SoA）、或引入 qk 连续缓冲、或对 j 分块以提升 A 的短期复用；更进一步用 block MGS 转 GEMM 让访问变为更连续的块访问。",
+        "data_dependencies": [
+          "外层 k 串行依赖：第 k 步会更新 A[:,j>k]，第 k+1 步的 nrm 读取 A[:,k+1] 依赖前一步更新结果，故 k 不能简单并行",
+          "同一 (k,j) 内：R[k,j] 必须先完成归约后才能用于更新 A[:,j]（点积 -> 更新的顺序依赖）",
+          "nrm 与 Q[:,k]：R[k,k]=sqrt(sum(A[:,k]^2)) 完成后才能归一化得到 Q[:,k]"
+        ]
+      },
+      "cost": 0.05631675,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.08435875
+  }
+}

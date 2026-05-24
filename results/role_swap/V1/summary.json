@@ -3,1048 +3,900 @@
     "key": "V1",
     "label": "Role-Swap V1 Neutral"
   },
-  "timestamp": "2026-04-17T14:24:04.358512",
+  "timestamp": "2026-05-24T03:01:08.602441",
   "programs_tested": [
-    "minimd",
-    "hpcg_spmv",
-    "hpcg_symgs",
-    "abinit",
-    "hotspot",
-    "srad",
-    "lulesh",
-    "nas_cg",
-    "jacobi2d"
+    "gemm",
+    "2mm",
+    "3mm",
+    "syrk",
+    "syr2k",
+    "doitgen",
+    "gramschmidt"
   ],
   "results": {
-    "minimd": {
-      "program": "minimd",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "compute",
-      "s2_bottleneck_raw": "memory+sync bound（带分支的邻居遍历导致的带宽/延迟受限 + OpenMP 原子更新导致的同步受限），而非纯 compute-bound",
-      "s2_primary": "compute",
-      "ground_truth": "compute",
-      "s1_matches_gt": true,
-      "s2_matches_gt": true,
-      "changed": false,
-      "s2_reasoning": "从源码看，热点都在邻居表双重循环。每个 pair 需要：1) 读取 j 的坐标 x[j*PAD+0..2]（跨粒子、近似随机访问，缓存命中率低）；2) 读取 type[j] 并索引 epsilon/sigma6/cutforcesq（小表可缓存，但 type_ij 计算与间接访问仍有开销）；3) 条件分支 if(rsq < cutforcesq[type_ij]) 造成分支预测失败与 SIMD 掩码化；4) halfneigh_threaded 中对 f[j] 的 3 次 atomic（以及对 f[i] 的 atomic）引入严重的同步与缓存行争用（尤其当邻居共享 j 时）。LJ 计算本身 F",
-      "cost": 0.06651225,
+    "gemm": {
+      "program": "gemm",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory (带一定计算瓶颈的混合型；朴素实现下以带宽/缓存未命中为主)",
+      "s1_score": 66.57507583417593,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.054510750000000004,
       "full_result": {
-        "code_name": "minimd",
+        "code_name": "gemm",
+        "program_key": "gemm",
         "prompt_type": "zero_shot",
         "stage1": {
           "model": "gpt-4o",
           "hotspots": [
             {
-              "location": "ForceLJ::compute_original (line 78)",
-              "estimated_time_percentage": "40%",
-              "reason": "This function is the original, non-optimized version of the force computation and lacks vectorization and parallelization.",
+              "location": "kernel_gemm (line 61)",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel performing matrix multiplication, which is typically the most time-consuming operation in such benchmarks.",
               "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The performance is likely limited by memory bandwidth due to the large number of memory accesses required for matrix multiplication, especially accessing matrices A, B, and C."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "Matrix multiplication is highly parallelizable and can benefit significantly from the massive parallelism offered by GPUs.",
+            "recommended_approach": "Use CUDA or OpenCL to implement the matrix multiplication on the GPU, ensuring coalesced memory accesses and using shared memory to reduce global memory bandwidth requirements."
+          },
+          "cost": 0.00793275,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory (带一定计算瓶颈的混合型；朴素实现下以带宽/缓存未命中为主)",
+            "reasoning": "kernel_gemm 采用 i-k-j 的三重循环：对固定 i,k，内层 j 顺序访问 B[k][j] 与 C[i][j]（连续、可向量化），但 A[i][k] 被重复使用而 B 的每一行会被所有 i 重复读取。若矩阵规模使得 B 不能常驻 LLC，则 B 的流量接近 O(ni*nk*nj)（每个 i 都要再读一遍 B），导致内存带宽压力巨大；同时 C 每次更新都发生读-改-写（RMW），在未做寄存器分块/缓存分块时会产生大量写回与缓存行反复占用。理论上 GEMM 算术强度很高，但该朴素实现无法有效提升 B 的跨 i 复用与 C 的寄存器累加，实际算术强度被“重复搬运 B + 频繁触碰 C”显著拉低，因此表现为 memory-bound（尤其在大尺寸、单线程或低并行度时更明显）。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "热点 kernel_gemm：减少对 B 的重复内存流量（提升跨 i 复用）",
+              "technique": "Cache blocking / tiling（按 i/j/k 分块），使 B 的 k×j 子块在缓存中被多个 i 子块复用",
+              "code_changes": "将三重循环改为分块循环（示例，块大小需按 L1/L2/LLC 调参）：\n\n// 选择块大小（示例）\nconst int Ti=64, Tj=128, Tk=64;\nfor (int ii=0; ii<_PB_NI; ii+=Ti)\n  for (int jj=0; jj<_PB_NJ; jj+=Tj) {\n    // 先对 C 子块做 beta 缩放\n    for (int i=ii; i<min(ii+Ti,_PB_NI); ++i)\n      for (int j=jj; j<min(jj+Tj,_PB_NJ); ++j)\n        C[i][j] *= beta;\n\n    for (int kk=0; kk<_PB_NK; kk+=Tk)\n      for (int i=ii; i<min(ii+Ti,_PB_NI); ++i)\n        for (int k=kk; k<min(kk+Tk,_PB_NK); ++k) {\n          DATA_TYPE aik = alpha * A[i][k];\n          // j 连续，利于向量化\n          for (int j=jj; j<min(jj+Tj,_PB_NJ); ++j)\n            C[i][j] += aik * B[k][j];\n        }\n  }\n",
+              "expected_speedup": "2x–8x（取决于尺寸是否超 LLC、块大小是否合适、以及是否多线程；大矩阵更明显）",
+              "difficulty": "medium"
             },
             {
-              "location": "ForceLJ::compute_halfneigh (line 144)",
+              "target": "热点 kernel_gemm：降低 C 的读改写次数、提高寄存器复用",
+              "technique": "Register blocking / micro-kernel（对 j 维做小向量块，累加在寄存器，最后一次性写回）",
+              "code_changes": "在最内层对 j 做 4/8/16 元素寄存器累加（配合编译器自动向量化或显式 SIMD）。示例（以 8 为例，伪代码）：\n\nfor (int i=...)\n  for (int j=jj; j<jend; j+=8) {\n    vec c = load(C[i][j..j+7]) * beta; // 或先整体 beta 缩放后这里直接 load\n    for (int k=kk; k<kend; ++k) {\n      scalar aik = alpha*A[i][k];\n      vec b = load(B[k][j..j+7]);\n      c = fma(aik, b, c);\n    }\n    store(C[i][j..j+7], c);\n  }\n\n若保留原结构，也至少将 A[i][k] 提前：\nDATA_TYPE aik = alpha * A[i][k];\nfor (j=0; j<_PB_NJ; ++j) C[i][j] += aik * B[k][j];\n",
+              "expected_speedup": "1.3x–3x（在已分块基础上；若未分块，收益受 B 流量限制）",
+              "difficulty": "hard"
+            },
+            {
+              "target": "热点 kernel_gemm：提升 SIMD 向量化与 FMA 利用率",
+              "technique": "编译器向量化友好改写 + pragma + restrict/alignment",
+              "code_changes": "1) 提前提取 aik（如上）减少内层标量加载；2) 为指针添加 restrict（若可改接口）：\n\nvoid kernel_gemm(...,\n  DATA_TYPE (* restrict C)[NJ],\n  const DATA_TYPE (* restrict A)[NK],\n  const DATA_TYPE (* restrict B)[NJ])\n\n3) 加向量化提示（视编译器）：\n#pragma omp simd\nfor (j=jj; j<jend; ++j) C[i][j] += aik * B[k][j];\n\n4) 确保对齐分配（PolyBench 通常已对齐，但可确认/强化）。",
+              "expected_speedup": "1.1x–2x（取决于是否原本未向量化、以及是否能生成 FMA/AVX2/AVX-512）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点 kernel_gemm：利用多核并行",
+              "technique": "OpenMP 并行化（按 i 或 ii×jj tile 并行），避免写冲突",
+              "code_changes": "推荐对外层 tile 并行（更利于 NUMA/缓存局部性）：\n\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int ii=0; ii<_PB_NI; ii+=Ti)\n  for (int jj=0; jj<_PB_NJ; jj+=Tj) {\n    ... // 该 tile 内只写 C[ii:ii+Ti, jj:jj+Tj]，无数据竞争\n  }\n\n若不分块，至少：\n#pragma omp parallel for schedule(static)\nfor (int i=0; i<_PB_NI; ++i) { ... }\n",
+              "expected_speedup": "按核数近线性到受带宽/LLC 限制：4核 3x–4x；32核 10x–25x（取决于是否已分块、NUMA、内存带宽）",
+              "difficulty": "easy/medium"
+            },
+            {
+              "target": "热点 kernel_gemm：避免手写 GEMM，直接获得峰值性能",
+              "technique": "调用优化 BLAS（OpenBLAS/MKL/BLIS）或编译器/库的 GEMM",
+              "code_changes": "用 cblas_dgemm/cblas_sgemm（取决于 DATA_TYPE）替换 kernel_gemm：\n\ncblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,\n            ni, nj, nk,\n            alpha, &A[0][0], nk,\n                   &B[0][0], nj,\n            beta,  &C[0][0], nj);\n\n注意 leading dimension 与 RowMajor/ColMajor 匹配。",
+              "expected_speedup": "5x–30x（相对朴素实现；取决于 CPU、线程数、矩阵规模）",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "采用标准 GEMM 并行：2D thread-block 覆盖 C 的 tile（例如 128x128 或 64x64 输出块），每个 block 在 k 维度循环分段（Tk），将 A_tile 与 B_tile 载入 shared memory（或使用 tensor core/WMMA 路径），线程在寄存器中累加多个 C 元素（register tiling），最后写回全局内存。beta 缩放可融合到写回阶段：C = alpha*acc + beta*C（避免单独遍历 C）。",
+            "data_layout": "优先使用连续行主序（当前 C/C++ 默认行主序与代码一致）。GPU 上建议：\n- 保持 B 按行连续以便对 B[k][j] 做合并访问；\n- 若使用 cuBLAS，按其接口选择 RowMajor/ColMajor（cuBLAS 默认列主序，常见做法是传入转置参数或在主机侧存为列主序）。\n- 对齐与 leading dimension 设为 128/256 的倍数有利于访存与张量核对齐（视硬件）。",
+            "challenges": [
+              "全局内存带宽与数据搬运：若不做 shared memory 分块，B 会被大量重复读取，性能会被带宽限制；解决：block-level tiling + shared memory + 合并访问。",
+              "寄存器/共享内存资源约束导致占用率下降：tile 过大可能降低 occupancy；解决：调参（BM/BN/BK、每线程计算的输出元素数）、使用半精度/TF32 tensor core（若允许精度）。",
+              "数值精度与可重复性：并行归约改变加法顺序；解决：接受浮点非结合性，或使用更高精度累加/确定性模式（会降速）。",
+              "主机-设备传输开销：小矩阵或频繁调用时 PCIe 传输占主导；解决：批处理、数据常驻 GPU、使用流与异步拷贝。"
+            ],
+            "expected_speedup": "相对当前朴素 CPU 单线程：20x–200x（取决于矩阵规模与 GPU 型号）；相对已优化多线程 BLAS：2x–10x（取决于 CPU/GPU 峰值与数据传输是否可忽略）。最佳实践是直接调用 cuBLAS GEMM（或 CUTLASS）以接近峰值。"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "理论上（理想缓存复用）≈ (2*ni*nj*nk) / (sizeof(T)*(ni*nk + nk*nj + ni*nj)) FLOPs/byte；当 ni≈nj≈nk=N 时 ≈ (2N^3)/(3N^2*sizeof(T)) = (2/3)*(N/sizeof(T))。以 double(8B) 为例：≈ N/12 FLOPs/byte（N=1024 时约 85 FLOPs/byte，强计算密集）。但朴素实现若 B 无法在 LLC 复用、近似每个 i 都重读 B：字节量≈sizeof(T)*(ni*nk + ni*nk*nj + 2*ni*nj)（忽略写分配细节），则 AI≈ (2*ni*nj*nk)/(sizeof(T)*ni*nk*nj)=2/sizeof(T)，double 下约 0.25 FLOPs/byte（明显 memory-bound）。实际介于两者之间，取决于 B 是否能驻留 LLC 以及分块/并行策略。",
+            "cache_behavior": "访问模式：\n- A[i][k]：对固定 i，k 递增，顺序访问一行 A，局部性好；且 A[i][k] 在内层 j 被重复使用（应驻留寄存器/L1）。\n- B[k][j]：对固定 k，j 递增，顺序访问一行 B，单次内层局部性好；但跨 i 会重复扫描 B 的所有行，若 B 规模 > LLC，则每个 i 都会导致 B 的缓存失效与内存回流，成为主要带宽消耗。\n- C[i][j]：对固定 i，j 递增，顺序访问一行 C；但在 k 循环中反复更新同一行 C，若不做寄存器分块，C 行会在 L1/L2 中反复读改写，产生写回压力；若线程并行且多个线程处理不同 i，C 不共享但会竞争 LLC/内存带宽。\n结论：朴素实现的关键问题是 B 的跨 i 复用差（容量未命中）与 C 的 RMW 频繁；分块可将 B 子块与 C 子块工作集压入 L2/L1，显著降低内存流量。",
+            "data_dependencies": [
+              "C[i][j] 在 k 维度存在循环携带依赖（reduction）：C[i][j] = beta*C[i][j] + sum_k alpha*A[i][k]*B[k][j]；因此 k 循环不可随意重排但可做归约/分块/向量化（reduction 形式）。",
+              "不同 (i,j) 元素之间相互独立：C[i1][j1] 与 C[i2][j2] 无依赖，适合按 i/j/tile 并行；并行时需保证每个线程写不同的 C 子块避免竞争。"
+            ]
+          },
+          "cost": 0.046578,
+          "bottleneck_raw": "memory (带一定计算瓶颈的混合型；朴素实现下以带宽/缓存未命中为主)"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.054510750000000004
+      }
+    },
+    "2mm": {
+      "program": "2mm",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "compute",
+      "s2_bottleneck_raw": "memory (DRAM bandwidth + cache locality) dominated GEMM-like kernels; compute-bound only when matrices are small enough to fit in cache or when using highly-tuned blocked/BLAS kernels",
+      "s1_score": 81.57507583417592,
+      "classification": {
+        "s1_primary": "compute",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": true,
+        "s1_matches_gt": true,
+        "s2_matches_gt": false,
+        "correction_type": "over-correction"
+      },
+      "cost": 0.053982249999999996,
+      "full_result": {
+        "code_name": "2mm",
+        "program_key": "2mm",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_2mm, line 66-84",
+              "estimated_time_percentage": "90%",
+              "reason": "This function contains two nested loops that perform matrix multiplications, which are computationally intensive.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "compute",
+            "reasoning": "The primary bottleneck is compute-bound due to the nested loops performing matrix multiplications, which involve a large number of floating-point operations."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The matrix multiplication operations are highly parallelizable and can benefit from the massive parallelism offered by GPUs.",
+            "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU. Ensure data transfer between CPU and GPU is minimized by keeping data on the GPU as much as possible."
+          },
+          "cost": 0.0087115,
+          "bottleneck_raw": "compute"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory (DRAM bandwidth + cache locality) dominated GEMM-like kernels; compute-bound only when matrices are small enough to fit in cache or when using highly-tuned blocked/BLAS kernels",
+            "reasoning": "源码中两段三重循环分别实现 tmp = alpha*A*B 与 D = beta*D + tmp*C，本质是两次矩阵乘（GEMM）。当前实现为朴素 i-j-k 顺序：对 B[k][j] 与 C[k][j] 的访问在内层 k 上是跨行(stride=NJ/NL)的，导致缓存命中率差、频繁从内存取数；同时 alpha 在内层重复乘、tmp/D 的读写也缺少寄存器累加与块化复用。理论算术强度在未块化时约 0.25 FLOPs/byte（double）量级，远低于现代 CPU 的机器平衡点，因此整体更接近带宽/缓存受限；若改为块化/调用 BLAS 后，数据复用显著提升，才可能转为 compute-bound。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "热点1: tmp = alpha*A*B (kernel_2mm line 66-74)",
+              "technique": "循环重排 + 寄存器累加 + 将 alpha 提前融合（减少内层乘法）",
+              "code_changes": "将 i-j-k 改为 i-k-j（或 i-k 外层、j 内层），使 B[k][j] 在 j 上连续访问；同时对 tmp[i][j] 做寄存器累加并一次性写回。示例：\n\nfor (int i=0;i<_PB_NI;i++)\n  for (int j=0;j<_PB_NJ;j++) tmp[i][j]=0;\nfor (int i=0;i<_PB_NI;i++) {\n  for (int k=0;k<_PB_NK;k++) {\n    DATA_TYPE a = alpha * A[i][k];\n    #pragma omp simd\n    for (int j=0;j<_PB_NJ;j++) {\n      tmp[i][j] += a * B[k][j];\n    }\n  }\n}\n\n并建议为 A/B/tmp 指针加 restrict（若可）以帮助向量化：\nvoid kernel_2mm(..., DATA_TYPE (*restrict tmp)[NJ], ...)",
+              "expected_speedup": "1.3x-2.5x（取决于尺寸与是否触发向量化/缓存命中改善）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点1: tmp = alpha*A*B",
+              "technique": "Cache blocking/tiling（L1/L2 友好）+ 向量化（SIMD）",
+              "code_changes": "对 i/j/k 做分块，典型选择：Ti≈(L2可容纳的A块行数)、Tj≈(L2可容纳的B块列数)、Tk≈共享维度块。示例（伪代码，需按 NI/NJ/NK 宏展开）：\n\nconst int Ti=32, Tj=128, Tk=32;\nfor (int ii=0; ii<_PB_NI; ii+=Ti)\n  for (int kk=0; kk<_PB_NK; kk+=Tk)\n    for (int jj=0; jj<_PB_NJ; jj+=Tj)\n      for (int i=ii; i<min(ii+Ti,_PB_NI); i++)\n        for (int k=kk; k<min(kk+Tk,_PB_NK); k++) {\n          DATA_TYPE a = alpha*A[i][k];\n          #pragma omp simd\n          for (int j=jj; j<min(jj+Tj,_PB_NJ); j++)\n            tmp[i][j] += a*B[k][j];\n        }\n\n并配合编译选项：-O3 -march=native -ffast-math（若允许）",
+              "expected_speedup": "2x-6x（相对朴素实现；大矩阵收益更明显）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点2: D = beta*D + tmp*C (kernel_2mm line 75-83)",
+              "technique": "循环重排 + 将 beta 缩放融合到累加（减少一次遍历/写回）",
+              "code_changes": "当前先 D[i][j]*=beta 再 k 累加。可改为寄存器中初始化为 beta*D[i][j]，避免额外写回与潜在写分配开销：\n\nfor (int i=0;i<_PB_NI;i++)\n  for (int j=0;j<_PB_NL;j++) {\n    DATA_TYPE acc = beta * D[i][j];\n    #pragma omp simd reduction(+:acc) // 对标量不合适；更推荐 j 向量化\n    for (int k=0;k<_PB_NJ;k++) acc += tmp[i][k]*C[k][j];\n    D[i][j] = acc;\n  }\n\n更进一步：改为 i-k-j 顺序以让 C[k][j] 在 j 上连续：\nfor i\n  for j D[i][j]=beta*D[i][j];\nfor i\n  for k\n    for j D[i][j]+=tmp[i][k]*C[k][j];",
+              "expected_speedup": "1.2x-2.2x",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点2: D = beta*D + tmp*C",
+              "technique": "Cache blocking/tiling + 向量化（SIMD）",
+              "code_changes": "与热点1同理，对 (i,k,j) 做块化，优先让 j 为最内层以连续访问 C[k][j] 与 D[i][j]：\n\nconst int Ti=32, Tj=128, Tk=32;\nfor (int ii=0; ii<_PB_NI; ii+=Ti)\n  for (int kk=0; kk<_PB_NJ; kk+=Tk)\n    for (int jj=0; jj<_PB_NL; jj+=Tj)\n      for (int i=ii; i<min(ii+Ti,_PB_NI); i++)\n        for (int k=kk; k<min(kk+Tk,_PB_NJ); k++) {\n          DATA_TYPE t = tmp[i][k];\n          #pragma omp simd\n          for (int j=jj; j<min(jj+Tj,_PB_NL); j++)\n            D[i][j] += t * C[k][j];\n        }\n\n并在进入该阶段前做一次 D*=beta（或在块内初始化）。",
+              "expected_speedup": "2x-6x（相对朴素实现）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "整体: 两次 GEMM",
+              "technique": "调用高性能 BLAS（dgemm/sgemm）或 oneDNN/MKL/OpenBLAS；利用线程并行与微内核",
+              "code_changes": "用 cblas_*gemm 替换两段循环：\n1) tmp = alpha*A*B：cblas_dgemm(RowMajor, NoTrans, NoTrans, NI, NJ, NK, alpha, A, NK, B, NJ, 0.0, tmp, NJ)\n2) D = beta*D + tmp*C：cblas_dgemm(RowMajor, NoTrans, NoTrans, NI, NL, NJ, 1.0, tmp, NJ, C, NL, beta, D, NL)\n\n需要确保数据为连续行主序并传入正确 leading dimension。",
+              "expected_speedup": "5x-30x（取决于 CPU、线程数、矩阵规模；通常远超手写块化）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "整体: 多核并行",
+              "technique": "OpenMP 并行化外层 + 合理的 collapse/schedule + NUMA first-touch",
+              "code_changes": "对块化后的外层 ii/jj 并行：\n#pragma omp parallel for collapse(2) schedule(static)\nfor (ii=0; ii<...; ii+=Ti)\n  for (jj=0; jj<...; jj+=Tj) ...\n\n并在初始化时并行 first-touch（init_array 可并行）以改善 NUMA：\n#pragma omp parallel for collapse(2) schedule(static)\nfor i ... for j ... A[i][j]=...\n",
+              "expected_speedup": "按核数近线性到受带宽限制（例如 4x-20x），与块化/BLAS 叠加",
+              "difficulty": "medium"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "将两段计算映射为两次 GEMM：tmp = alpha*A*B 与 D = beta*D + tmp*C。优先使用 cuBLAS/rocBLAS 的 gemmEx（或 cublasGemmStridedBatched 若有批处理）。若必须自写 kernel：采用 2D thread block（如 16x16/32x8），每个 block 计算 D/tm p 的一个 tile；K 维分块，A/B/C tile 进入 shared memory，寄存器累加，最后写回全局内存。",
+            "data_layout": "保持行主序可行，但需与所用 BLAS 的布局匹配（cuBLAS 默认列主序；可通过转置参数或改用 cublasLt/设置 RowMajor 接口封装）。建议：\n- 若用 cuBLAS：将数据按列主序存储或在调用时交换操作数并设置转置以等效实现 RowMajor。\n- 对齐与连续：使用 cudaMallocPitch 或保证 leading dimension 为 128B 对齐；避免非对齐访问。\n- 若自写：让最内层维度（j）连续，确保全局内存 coalescing。",
+            "challenges": [
+              "两次 GEMM 中间结果 tmp 体积大，写回/再读回会带来额外带宽与显存占用；可用 cublasLt 的 epilogue/fusion 或自写 fused kernel（在共享 K 分块时直接累加到 D）但实现复杂",
+              "布局转换（RowMajor vs ColMajor）与 leading dimension 处理容易出错；需要严格验证索引与转置参数",
+              "当矩阵较小或 PCIe 传输占比高时，GPU 加速受限；需将数据常驻 GPU、避免频繁 host-device 拷贝"
+            ],
+            "expected_speedup": "10x-100x（相对单线程 CPU 朴素实现）；相对多线程 MKL/OpenBLAS 通常 2x-10x，取决于矩阵规模、GPU 型号与是否能融合/减少 tmp 往返"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "≈0.25 FLOPs/byte（double，朴素实现的下界估计；若考虑缓存复用可略高，但未块化时通常仍 <1）。估算：两次 GEMM 总 FLOPs ≈ 2*NI*NJ*NK + 2*NI*NL*NJ。内存流量下界按每次乘加读取 A/B/C/tmp/D 并写 tmp/D 估算，约为 O(N^2) 写 + O(N^3) 读的有效流量；在实际缓存未命中下接近该下界，导致低算术强度。",
+            "cache_behavior": "A[i][k] 在内层 k 连续（好）；但 B[k][j] 在内层 k 变化时跨行访问（Row-major 下 stride=NJ），空间局部性差，易导致 L1/L2 miss；第二段同理，C[k][j] 在内层 k 跨行 stride=NL。tmp 的写入是连续的（按 j），但在第二段读取 tmp[i][k] 时对固定 i、k 是连续标量复用不足。整体表现为：对 B/C 的访问模式主导缓存失效与带宽压力。块化/重排后可让 B/C 在最内层 j 连续，从而显著提升缓存命中与预取效率。",
+            "data_dependencies": [
+              "tmp[i][j] 在第一段对 k 有归约依赖（reduction），不同 (i,j) 之间独立，可并行；需要避免并行写同一 tmp 元素",
+              "D[i][j] 在第二段对 k 有归约依赖；不同 (i,j) 独立，可并行；若采用 i-k-j 更新需保证每个 (i,j) 仅由一个线程更新或使用块级私有累加/原子（不推荐）"
+            ]
+          },
+          "cost": 0.04527075,
+          "bottleneck_raw": "memory (DRAM bandwidth + cache locality) dominated GEMM-like kernels; compute-bound only when matrices are small enough to fit in cache or when using highly-tuned blocked/BLAS kernels"
+        },
+        "classification": {
+          "s1_primary": "compute",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": true,
+          "s1_matches_gt": true,
+          "s2_matches_gt": false,
+          "correction_type": "over-correction"
+        },
+        "total_cost": 0.053982249999999996
+      }
+    },
+    "3mm": {
+      "program": "3mm",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "compute",
+      "s2_bottleneck_raw": "memory (带宽/缓存局部性受限的 GEMM-like 三重矩阵乘链)",
+      "s1_score": 78.5135814889336,
+      "classification": {
+        "s1_primary": "compute",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": true,
+        "s1_matches_gt": true,
+        "s2_matches_gt": false,
+        "correction_type": "over-correction"
+      },
+      "cost": 0.05545225,
+      "full_result": {
+        "code_name": "3mm",
+        "program_key": "3mm",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_3mm: E := A*B loop (line 61)",
               "estimated_time_percentage": "30%",
-              "reason": "This function is optimized for vectorization but still involves significant computation and memory access.",
+              "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
               "confidence": "high"
             },
             {
-              "location": "ForceLJ::compute_halfneigh_threaded (line 204)",
+              "location": "kernel_3mm: F := C*D loop (line 68)",
+              "estimated_time_percentage": "30%",
+              "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
+              "confidence": "high"
+            },
+            {
+              "location": "kernel_3mm: G := E*F loop (line 75)",
+              "estimated_time_percentage": "30%",
+              "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "compute",
+            "reasoning": "The primary operations are matrix multiplications, which are compute-intensive due to the large number of arithmetic operations required."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "Matrix multiplication is highly parallelizable and can benefit from the massive parallelism offered by GPUs.",
+            "recommended_approach": "Use CUDA or OpenCL to offload matrix multiplication to the GPU, ensuring data is transferred efficiently between host and device."
+          },
+          "cost": 0.0111545,
+          "bottleneck_raw": "compute"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory (带宽/缓存局部性受限的 GEMM-like 三重矩阵乘链)",
+            "reasoning": "虽然三段都是 O(n^3) 乘加，表面看 compute-heavy，但该实现是朴素 i-j-k 顺序：A[i][k] 连续、B[k][j]/D[k][j]/F[k][j] 按列跨行访问（row-major 下 stride=leading_dim），导致对右操作数矩阵的访问几乎不复用、缓存命中率低、频繁从更低层缓存/内存取数。对每次 FMA（2 FLOPs）往往需要加载 A 元素 + B 元素（以及最终写回 C），在未分块时算术强度接近 0.25 FLOPs/byte（double）量级，远低于现代 CPU 峰值所需的 AI，因此整体更接近带宽/缓存受限而非纯 compute 受限。三段乘法之间还存在 E、F 的中间结果写回再读出，进一步增加内存流量。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "热点1: E := A*B（i-j-k）",
+              "technique": "Cache blocking/tiling + k-inner micro-kernel + 向量化 + OpenMP 并行；或直接调用 BLAS dgemm",
+              "code_changes": "方案A（推荐，最少代码）：用 BLAS 替换三重循环。\n// 需要把 PolyBench 2D 宏展开为连续内存并提供 leading dimensions\n// E(ni x nj) = A(ni x nk) * B(nk x nj)\n// cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,\n//             ni, nj, nk, 1.0, &A[0][0], nk, &B[0][0], nj, 0.0, &E[0][0], nj);\n\n方案B（保留手写）：分块并调整循环次序以提升 B 的复用。\nconst int Ti=64, Tj=64, Tk=64;\n#pragma omp parallel for collapse(2) schedule(static)\nfor (int ii=0; ii<_PB_NI; ii+=Ti)\n  for (int jj=0; jj<_PB_NJ; jj+=Tj) {\n    for (int i=ii; i<min(ii+Ti,_PB_NI); ++i)\n      for (int j=jj; j<min(jj+Tj,_PB_NJ); ++j)\n        E[i][j]=0;\n    for (int kk=0; kk<_PB_NK; kk+=Tk)\n      for (int i=ii; i<min(ii+Ti,_PB_NI); ++i)\n        for (int k=kk; k<min(kk+Tk,_PB_NK); ++k) {\n          DATA_TYPE aik = A[i][k];\n          #pragma omp simd\n          for (int j=jj; j<min(jj+Tj,_PB_NJ); ++j)\n            E[i][j] += aik * B[k][j];\n        }\n  }\n要点：把 j 放到最内层并对 j 向量化；对 (ii,jj) 分块让 B[k][j] 在 L1/L2 内复用；对 (ii,jj) 并行避免写冲突。",
+              "expected_speedup": "CPU: 2x-10x（手写分块通常 2x-5x；调用高性能 BLAS 常见 5x-10x+，取决于尺寸与线程数）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点2: F := C*D（i-j-k）",
+              "technique": "同上：分块 + 向量化 + OpenMP；或 BLAS dgemm；必要时对 D 做转置以消除 stride 访问",
+              "code_changes": "方案A：BLAS\n// F(nj x nl) = C(nj x nm) * D(nm x nl)\n// cblas_dgemm(RowMajor, NoTrans, NoTrans, nj, nl, nm, 1.0, &C[0][0], nm, &D[0][0], nl, 0.0, &F[0][0], nl);\n\n方案B：若不分块，至少转置 D 以改善访问（把 D[k][j] 的列访问变为行访问）：\n// 预处理一次：DT(nl x nm)\nfor (int k=0;k<_PB_NM;++k)\n  for (int j=0;j<_PB_NL;++j)\n    DT[j][k]=D[k][j];\n// 计算：F[i][j]+=C[i][k]*DT[j][k]\nfor (int i=0;i<_PB_NJ;++i)\n  for (int j=0;j<_PB_NL;++j){\n    DATA_TYPE sum=0;\n    #pragma omp simd reduction(+:sum)\n    for (int k=0;k<_PB_NM;++k)\n      sum += C[i][k]*DT[j][k];\n    F[i][j]=sum;\n  }\n更优：结合分块（同热点1的 ii/jj/kk 结构）。",
+              "expected_speedup": "CPU: 1.5x-8x（仅转置常见 1.5x-3x；分块/BLAS 可到 5x-8x+）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点3: G := E*F（i-j-k）",
+              "technique": "分块 + 向量化 + OpenMP；或 BLAS dgemm；并考虑融合/流水减少中间结果写回（高级）",
+              "code_changes": "方案A：BLAS\n// G(ni x nl) = E(ni x nj) * F(nj x nl)\n// cblas_dgemm(RowMajor, NoTrans, NoTrans, ni, nl, nj, 1.0, &E[0][0], nj, &F[0][0], nl, 0.0, &G[0][0], nl);\n\n方案B：手写分块同热点1（把 j 最内层，k 次内层，块内复用 F[k][j]）。\n\n方案C（hard，高级）：链式乘法融合/重排以减少写回 E/F（例如用分块流水：计算 E_block 后立刻参与 G_block 累加，避免 E 全量落内存；同理对 F）。需要三层块调度与临时缓冲，复杂且易受容量限制。",
+              "expected_speedup": "CPU: 2x-10x（BLAS 通常最高；融合在内存压力大且尺寸合适时可额外 1.1x-1.5x）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "全局：编译器与数据对齐/别名",
+              "technique": "restrict/对齐/编译选项/避免不必要的标量转换，提升向量化与预取",
+              "code_changes": "1) 给指针加 restrict（若改为平铺 1D 指针传参更容易）：\nvoid kernel_3mm(..., DATA_TYPE * restrict A, ...)\n2) 确保 64B 对齐分配（PolyBench 可配置或改用 aligned_alloc）。\n3) 编译：-O3 -march=native -ffast-math(可选) -fopenmp；ICC/ICX/Clang 也可。\n4) 在内层 j 循环加 #pragma omp simd 并确保无别名。",
+              "expected_speedup": "CPU: 1.1x-1.5x（通常作为分块/BLAS 的补充）",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "将三段矩阵乘法映射为 3 次 GEMM：E=A*B，F=C*D，G=E*F。优先使用 cuBLAS/rocBLAS（cublasGemmEx / cublasDgemm），在 GPU 上分别调用三次；若追求极致可用 CUDA Graph 把三次 GEMM + 中间缓冲串起来减少 launch 开销。若必须自写 kernel：采用 2D thread-block tiling（如 128x128 输出块），在 shared memory 中缓存 A_tile 与 B_tile，warp-level MMA（Tensor Core，若用 FP16/BF16/TF32）或常规 FMA（FP64）。",
+            "data_layout": "GPU 上建议使用连续线性内存并显式 leading dimension；保持 row-major 也可，但 cuBLAS 默认 column-major：\n- 方案1：在调用 cuBLAS 时用 CUBLAS_OP_T 组合把 row-major 视作转置的 column-major（常用技巧），避免显式转置。\n- 方案2：统一改为 column-major 存储（或在 Host 侧一次性转置 A/B/C/D），使三次 GEMM 都是 NoTrans。\n另外：尽量让矩阵维度对齐到 8/16（取决于数据类型）以提升向量化与 Tensor Core 利用率。",
+            "challenges": [
+              "中间矩阵 E(ni*nj) 与 F(nj*nl) 可能很大：显存占用与带宽压力；可用分块流水/分批 GEMM（batched/strided）或在可能时融合计算以减少落盘",
+              "数据传输开销：若只运行一次 kernel_3mm，PCIe 传输可能掩盖收益；需要把初始化/多次迭代放到 GPU 上或重复执行以摊薄传输",
+              "FP64 性能限制：消费级 GPU 的 FP64 吞吐较低；若允许精度放宽，可用 TF32/FP16/BF16 + 累加到 FP32/FP64（GEMMEx）获得数量级提升",
+              "维度不规则导致 tile 边界处理与分支；通过 padding 或使用库函数可规避"
+            ],
+            "expected_speedup": "相对单核 CPU：20x-200x（取决于尺寸与精度）；相对多核 CPU + MKL/OpenBLAS：2x-20x（FP32/TF32/FP16 更高，纯 FP64 通常更接近 2x-8x）"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "约 0.25 FLOPs/byte（double，朴素实现的下界估计）；分块后可提升到 ~1-8+ FLOPs/byte（取决于块大小与缓存命中，接近 GEMM 的高复用时可显著提高）",
+            "cache_behavior": "朴素 i-j-k：\n- A[i][k]：k 连续，空间局部性好；同一 A 行在不同 j 上被重复使用，但由于 j 在 k 外层，A 行可在缓存中复用（较好）。\n- B[k][j] / D[k][j] / F[k][j]：对固定 j，k 变化导致按列访问（row-major 下 stride=NJ/NL），空间局部性差；同一 B 行在不同 i 上可复用，但 i 在最外层导致跨越时间长，常被逐出。\n- E/F 中间结果：E、F 全量写回内存后在第三段再读入，产生额外读写流量与缓存污染。\n- 写入 E/F/G：按 [i][j] 连续写，写合并友好，但会占用带宽。\n分块后：把 (k,j) 的访问限制在小块内，使 B/D/F 的行片段驻留 L1/L2，显著降低 LLC/内存访问；同时 j 内层便于 SIMD 连续加载。",
+            "data_dependencies": [
+              "循环内：E[i][j]、F[i][j]、G[i][j] 对 k 维度存在归约依赖（reduction），但不同 (i,j) 之间相互独立，可并行",
+              "跨阶段：G 依赖完整的 E 与 F（若不做融合/流水），因此三段默认是阶段性串行；阶段内可并行"
+            ]
+          },
+          "cost": 0.044297750000000004,
+          "bottleneck_raw": "memory (带宽/缓存局部性受限的 GEMM-like 三重矩阵乘链)"
+        },
+        "classification": {
+          "s1_primary": "compute",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": true,
+          "s1_matches_gt": true,
+          "s2_matches_gt": false,
+          "correction_type": "over-correction"
+        },
+        "total_cost": 0.05545225
+      }
+    },
+    "syrk": {
+      "program": "syrk",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory-bandwidth + poor locality (cache/TLB) dominated, with secondary compute under-utilization due to low arithmetic intensity and non-contiguous access",
+      "s1_score": 66.52031093279838,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.051688,
+      "full_result": {
+        "code_name": "syrk",
+        "program_key": "syrk",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_syrk, line 61",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the matrices.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The performance is likely limited by memory bandwidth due to the repeated access to matrix elements in a non-contiguous manner, especially in the innermost loop."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The computation involves a large number of independent operations on matrix elements, which is well-suited for the parallel architecture of GPUs.",
+            "recommended_approach": "Port the kernel to CUDA or OpenCL, focusing on optimizing memory access patterns and maximizing occupancy by using shared memory for tiles."
+          },
+          "cost": 0.0077332500000000005,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory-bandwidth + poor locality (cache/TLB) dominated, with secondary compute under-utilization due to low arithmetic intensity and non-contiguous access",
+            "reasoning": "kernel_syrk 的主循环为 C[i][j] += alpha*A[i][k]*A[j][k]（j<=i）。对固定 i,k，A[i][k] 可复用，但 A[j][k] 随 j 变化且在 C 行主序存储下访问模式为 A[j][k] 的“按行跨步”访问（stride = M），导致 L1/L2 命中率低、硬件预取困难、TLB 压力大。与此同时对 C[i][j] 的更新在 k 循环内反复读-改-写同一批元素，若不做寄存器/块化会产生大量写回与缓存行反复占用。整体算术强度接近 SYRK 的理论下界（~0.25 FLOP/byte 量级，取决于是否能把 C 块留在缓存/寄存器），因此在多数 CPU 上更容易被内存带宽与缓存效率限制，而不是峰值 FLOPs。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "热点 kernel_syrk：减少 A[j][k] 跨步访问带来的缓存/TLB miss；提升数据复用",
+              "technique": "数据布局变换：预转置/打包 A，使内层访问连续；将计算改写为 GEMM/SYRK 调用（BLAS）",
+              "code_changes": "1) 预先构造 AT[k][j] = A[j][k]（尺寸 MxN），使内层 j 访问 AT[k][j] 连续：\n\n// allocate AT[M][N]\nPOLYBENCH_2D_ARRAY_DECL(AT,DATA_TYPE,M,N,m,n);\nfor (int j=0;j<n;j++)\n  for (int k=0;k<m;k++)\n    AT[k][j]=A[j][k];\n\n// kernel: for i: scale C; then for k: for j<=i: C[i][j]+=alpha*A[i][k]*AT[k][j]\nfor (i=0;i<n;i++) {\n  for (j=0;j<=i;j++) C[i][j]*=beta;\n  for (k=0;k<m;k++) {\n    DATA_TYPE aik = A[i][k];\n    for (j=0;j<=i;j++)\n      C[i][j] += alpha * aik * AT[k][j];\n  }\n}\n\n2) 更推荐：直接调用高性能 BLAS（如 OpenBLAS/MKL/BLIS）的 syrk：\n// C := alpha*A*A^T + beta*C (lower)\n// cblas_dsyrk(CblasRowMajor, CblasLower, CblasNoTrans, n, m, alpha, &A[0][0], m, beta, &C[0][0], n);\n",
+              "expected_speedup": "2x-10x（取决于 n,m、CPU、是否使用 MKL/BLIS；BLAS 通常可接近带宽/计算峰值并显著优于朴素三重循环）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点 kernel_syrk：降低对 C 的反复读写；提高寄存器复用与向量化效率",
+              "technique": "块化/寄存器阻塞（j 分块）+ 向量化（SIMD）+ 将 beta 缩放融合到主循环（或保持单独缩放但块内驻留）",
+              "code_changes": "示例：对 j 做块化，让 C(i, j..jB) 在寄存器/缓存中累加，减少写回频率，并利于 SIMD。\n\nconst int JB = 64; // 依据缓存/向量宽度调参\nfor (int i=0;i<n;i++) {\n  for (int jb=0; jb<=i; jb+=JB) {\n    int jend = (jb+JB-1<=i)? (jb+JB-1): i;\n    // scale block once\n    for (int j=jb;j<=jend;j++) C[i][j] *= beta;\n\n    for (int k=0;k<m;k++) {\n      DATA_TYPE aik = A[i][k];\n      // pragma to help vectorization on contiguous C[i][j]\n      #pragma omp simd\n      for (int j=jb;j<=jend;j++) {\n        C[i][j] += alpha * aik * A[j][k];\n      }\n    }\n  }\n}\n\n进一步：若配合 AT（上一个优化）则内层 A[j][k] 改为 AT[k][j]，向量化更稳定。",
+              "expected_speedup": "1.3x-3x（单核/单 NUMA 域；若原本向量化失败或缓存抖动严重，收益更高）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点 kernel_syrk：利用多核并行，避免写冲突并保持负载均衡",
+              "technique": "OpenMP 并行化外层 i（或 i 分块）+ 合理调度；必要时 NUMA first-touch 初始化",
+              "code_changes": "并行 i（每个线程写不同的 C[i][0..i]，无数据竞争）：\n\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<n;i++) {\n  for (int j=0;j<=i;j++) C[i][j] *= beta;\n  for (int k=0;k<m;k++) {\n    DATA_TYPE aik = A[i][k];\n    #pragma omp simd\n    for (int j=0;j<=i;j++)\n      C[i][j] += alpha * aik * A[j][k];\n  }\n}\n\n若 i 负载不均（小 i 工作少），可用 schedule(guided) 或对 i 做块化后静态分配。\nNUMA：在 init_array 中用并行 first-touch 初始化 A/C。",
+              "expected_speedup": "按核数近似扩展但受带宽限制：2x-8x（常见双路/多核下最终受内存带宽封顶）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点 kernel_syrk：减少分支与三角形边界开销；提升流水与预取",
+              "technique": "将下三角存储压缩/或改为全矩阵计算后再取下三角；软件预取（谨慎）",
+              "code_changes": "选项 A（简单）：计算完整 C（j=0..n-1）用 GEMM，然后只在输出/校验时使用下三角；代价是 2x 计算量但更规则、向量化/BLAS 更强。\n\n选项 B：保持三角但把 j<=i 的边界改为块级边界（见块化），减少每次循环的比较与短循环。\n\n软件预取（仅在未转置且带宽未饱和时可能有益）：\n__builtin_prefetch(&A[j+PREFDIST][k], 0, 1);\n",
+              "expected_speedup": "0.9x-2x（取决于是否能换来更高效的 GEMM；若用 BLAS 通常不需要此项）",
+              "difficulty": "hard"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "将其视为 SYRK（C = alpha*A*A^T + beta*C，下三角）。最佳策略是调用 cuBLAS/rocBLAS 的 syrk（或 gemm + 三角拷贝/掩码）。若手写 kernel：采用 2D tile（如 128x128 的 C tile），每个 thread block 负责一个 (iTile, jTile) 且仅处理 i>=j 的 tiles；在 k 维度分块，把 A 的两个子块加载到 shared memory，做 tile GEMM 累加到寄存器，最后乘 beta 并写回 C（仅下三角元素）。",
+            "data_layout": "1) 使用行主序时，建议在 GPU 侧使用转置/packed：存 A 与 A^T（或在加载到 shared 时做转置）以保证两侧操作数都能合并访问（coalesced）。\n2) C 仅存下三角可节省带宽，但实现复杂；更常见做法是存完整 C（或至少完整 tile）并在写回时用条件屏蔽 i>=j。\n3) 对齐与 leading dimension 选择为 128/256 的倍数以改善合并访问与避免 bank conflict。",
+            "challenges": [
+              "下三角边界导致线程分歧与负载不均：通过 tile 级别只发射 iTile>=jTile 的 blocks，块内再用掩码写回减少分歧",
+              "全局内存带宽压力：必须用 shared-memory tiling（类似 GEMM）提升 A 的复用，否则会被带宽限制",
+              "数值可重复性：并行归约改变累加顺序，结果与 CPU 可能有微小差异；需要容忍误差或使用更稳定的累加（如 Kahan，代价大）",
+              "beta 缩放与写回：避免单独 kernel 先缩放 C（额外带宽）；在主 kernel 写回时融合 beta"
+            ],
+            "expected_speedup": "相对单核 CPU：10x-100x；相对多核优化后 CPU（MKL/BLIS）：2x-10x（取决于矩阵规模、GPU/CPU 带宽与峰值、PCIe 传输是否计入计时）。"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "约 0.20-0.35 FLOPs/byte（double 情况）。估算：主更新约 2*sum_{i=0}^{n-1}(i+1)*m ≈ m*n*(n+1) FLOPs。若 A 流量近似读 n*m 元素一次（理想复用）+ C 读写约 2*(n*(n+1)/2) 元素，则字节数约 8*(n*m + n*(n+1))；AI ≈ (m*n*(n+1)) / (8*(n*m + n*(n+1))) = (m*(n+1)) / (8*(m + (n+1)))，当 m≈n 时约 (n)/(16n)=0.0625?（这是过于保守/取决于 C 是否在缓存中反复读写）。若不块化导致 C 在 k 循环中频繁写回、A[j][k] 复用差，实际有效 AI 更低并更偏带宽受限；若用块化/BLAS 让 C 块驻留缓存并提升 A 复用，AI 可接近 ~0.25-0.35。",
+            "cache_behavior": "1) A[i][k]：对固定 i，k 连续，行内访问良好，易被预取。\n2) A[j][k]：对固定 k，j 变化导致按行跨步访问（stride=M*sizeof(DATA_TYPE)），当 M 较大时每次迭代触及不同 cache line，空间局部性差；跨页跳跃会增加 TLB miss。\n3) C[i][j]：对固定 i，j 连续（好），但在 k 循环内对同一段 C[i][0..i] 反复累加；若 i 较大且未分块，C 行可能超过 L1/L2，导致容量/冲突 miss 与写回压力。\n4) 三角形边界 j<=i 造成短向量与不规则循环长度，影响编译器自动向量化与线程负载均衡。",
+            "data_dependencies": [
+              "C[i][j] 在 k 维度上存在归约依赖（reduction）：C[i][j] = beta*C[i][j] + sum_k alpha*A[i][k]*A[j][k]；需要保证对同一 (i,j) 的累加顺序或使用并行归约/分块累加",
+              "不同 i 行之间对 C 写入互不重叠（仅写 C[i][0..i]），因此 i 维可并行；但读取 A[j][k] 在多线程下会产生共享读带宽竞争",
+              "若尝试并行化 k：会对同一 C[i][j] 产生写冲突，需要私有累加缓冲（tile-local）后再归并"
+            ]
+          },
+          "cost": 0.04395475,
+          "bottleneck_raw": "memory-bandwidth + poor locality (cache/TLB) dominated, with secondary compute under-utilization due to low arithmetic intensity and non-contiguous access"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.051688
+      }
+    },
+    "syr2k": {
+      "program": "syr2k",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory (bandwidth + cache locality) with secondary compute underutilization",
+      "s1_score": 66.54758308157099,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.0495215,
+      "full_result": {
+        "code_name": "syr2k",
+        "program_key": "syr2k",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_syr2k, line 66",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over large matrices.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The kernel involves accessing large matrices A, B, and C in a nested loop structure, which is likely to be limited by memory bandwidth and cache performance rather than pure computation."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The computation involves large, independent data-parallel operations on matrices, which are well-suited for GPU acceleration.",
+            "recommended_approach": "Port the kernel to use CUDA or OpenCL, focusing on optimizing memory access patterns and maximizing occupancy by using shared memory for block-level data reuse."
+          },
+          "cost": 0.007901249999999999,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory (bandwidth + cache locality) with secondary compute underutilization",
+            "reasoning": "kernel_syr2k 的主循环为 i-k-j（内层 j<=i），每次更新 C[i][j] 需要读取/写回 C[i][j]，并读取 A[j][k], B[j][k]（随 j 变化，跨行访问）以及 A[i][k], B[i][k]（对固定 i,k 为标量可复用）。对每个 (i,j,k) 仅做少量 FLOPs（约 5 FLOPs：2 mul + 2 mul + 1 add，若把 alpha 预乘则更少），但会触发多次内存访问，且 A/B 的访问模式对缓存不友好（j 维度跨行导致低空间局部性）。因此整体更可能受内存带宽与缓存未命中限制；同时内层存在对 C[i][j] 的循环携带依赖（累加），限制向量化/并行化方式，需要通过重排/分块来提升数据复用与SIMD效率。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "热点 kernel_syr2k：减少对 C 的反复读写（寄存器累加）",
+              "technique": "loop interchange + scalar replacement (register accumulation)",
+              "code_changes": "将 i-k-j 改为 i-j-k，使每个 C[i][j] 在寄存器中完成 beta 缩放与 k 累加，最后一次性写回；同时预计算 aalpha=alpha, 或将 alpha 融合到 A/B 的乘法中。\n\n示例：\nfor (int i=0;i<_PB_N;i++) {\n  for (int j=0;j<=i;j++) {\n    DATA_TYPE cij = C[i][j]*beta;\n    for (int k=0;k<_PB_M;k++) {\n      cij += alpha*(A[j][k]*B[i][k] + B[j][k]*A[i][k]);\n    }\n    C[i][j]=cij;\n  }\n}\n",
+              "expected_speedup": "1.2x-2.0x（取决于 C 是否原本频繁回写导致写分配/写回压力）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "热点 kernel_syr2k：提升 A/B 访问局部性与缓存复用",
+              "technique": "cache blocking / tiling over (i,j,k) + pack panels",
+              "code_changes": "对 i-j 形成块（Ti,Tj），对 k 形成块 Tk；在每个块内复用 A/B 的 k-panel，减少对 A[j][k],B[j][k] 的重复从内存加载。可选：对 A_block(j,k) 与 B_block(j,k) 做临时打包为连续内存（pack）以提升带宽与SIMD。\n\n伪代码：\nfor (ii=0; ii<N; ii+=Ti)\n for (jj=0; jj<=ii; jj+=Tj)\n  for (kk=0; kk<M; kk+=Tk) {\n    // 可选 pack A[jj:jj+Tj][kk:kk+Tk], B[...] 到连续缓冲\n    for (i=ii; i<min(ii+Ti,N); i++)\n      for (j=jj; j<min(jj+Tj,i+1); j++) {\n        DATA_TYPE cij = (kk==0)? C[i][j]*beta : C[i][j];\n        for (k=kk; k<min(kk+Tk,M); k++)\n          cij += alpha*(A[j][k]*B[i][k] + B[j][k]*A[i][k]);\n        C[i][j]=cij;\n      }\n  }\n",
+              "expected_speedup": "1.5x-3.0x（大尺寸 N/M 时更明显；取决于 LLC 容量与带宽）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点 kernel_syr2k：SIMD 向量化与减少标量重复加载",
+              "technique": "hoist invariants + restrict + pragma simd + alignment",
+              "code_changes": "1) 将 A[i][k], B[i][k] 在 j 循环外（或 k 循环内）提升为标量，避免重复加载；2) 为 A/B/C 指针添加 restrict（若允许）并确保对齐；3) 在 k 内循环上尝试向量化（更适合 i-j-k 版本），或在分块后对 k 维做 #pragma omp simd。\n\n示例（在 i-j-k 结构中）：\nfor (int k=0;k<M;k++) {\n  // 编译器更易向量化 k\n}\n并在函数签名中（若可改）：\nvoid kernel_syr2k(..., DATA_TYPE (* restrict C)[N], DATA_TYPE (* restrict A)[M], DATA_TYPE (* restrict B)[M])\n",
+              "expected_speedup": "1.1x-1.8x（取决于编译器是否成功向量化与内存瓶颈程度）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "热点 kernel_syr2k：多核并行（CPU）",
+              "technique": "OpenMP parallel for + schedule(static) + collapse/2D blocking",
+              "code_changes": "并行化 i（或 ii 块）维度；每个线程写不同的 C[i][j] 区域无冲突。注意 j<=i 的三角形边界，推荐按 i 或按块并行。\n\n示例：\n#pragma omp parallel for schedule(static)\nfor (int i=0;i<_PB_N;i++) {\n  for (int j=0;j<=i;j++) {\n    DATA_TYPE cij = C[i][j]*beta;\n    for (int k=0;k<_PB_M;k++)\n      cij += alpha*(A[j][k]*B[i][k] + B[j][k]*A[i][k]);\n    C[i][j]=cij;\n  }\n}\n",
+              "expected_speedup": "按核数近线性但受带宽限制：2x-10x（典型双路服务器可能 3x-6x）",
+              "difficulty": "easy"
+            },
+            {
+              "target": "整体：用高性能 BLAS 替代手写内核",
+              "technique": "call vendor BLAS (cblas_dsyr2k/ssyr2k) or GEMM-based reformulation",
+              "code_changes": "直接调用 BLAS syr2k（下三角、非转置）：cblas_dsyr2k(CblasRowMajor, CblasLower, CblasNoTrans, N, M, alpha, A, lda, B, ldb, beta, C, ldc)。若数据布局不匹配（PolyBench 常为行主序），需确认 BLAS 接口与 leading dimension。\n",
+              "expected_speedup": "2x-20x（取决于库、线程数、是否触发高度优化的微内核与打包）",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "将更新视为下三角的 rank-2k 更新：C = beta*C + alpha*A*B^T + alpha*B*A^T（仅计算 j<=i）。GPU 上采用 2D thread-block 覆盖 C 的 tile（例如 32x32），每个 block 负责一个 (i_tile, j_tile) 且满足下三角条件；在 k 维做分块（Ktile），将 A/B 的子块加载到 shared memory（或使用 WMMA/TensorCore 若为 FP16/TF32），对 Ktile 做累加，最后写回 C。对称/三角只计算一半，或计算全矩阵后再掩码写回（通常前者更省带宽）。",
+            "data_layout": "建议使用列主序或显式转置/打包以匹配 GEMM 访问模式：\n- 若保持行主序：在 GPU kernel 内按 tile 方式协同加载，确保对 global memory 访问合并（coalesced），必要时将 A、B 预转置为 (M x N) 以便按连续 k 访问。\n- C 仅存下三角可用压缩存储（节省一半空间），但会增加索引复杂度；多数情况下保持完整 NxN 存储、仅写下三角更简单且性能更稳。",
+            "challenges": [
+              "下三角边界导致线程块部分无效：需对 tile 做掩码或仅调度满足 j_tile<=i_tile 的 blocks（可用 grid 映射或分段 launch）。",
+              "带宽压力与 shared memory 容量：Ktile 选择需在复用与占用率之间权衡；过大导致 shared memory 过高降低 occupancy，过小则复用不足。",
+              "数值一致性与原子操作：每个 C 元素由单个线程负责累加可避免原子；若采用分裂 K 维并行（多个 block 累加同一 C tile）则需要原子或分阶段归约，通常不推荐。"
+            ],
+            "expected_speedup": "相对单线程 CPU：10x-80x；相对多核优化 CPU（MKL/OpenBLAS）：2x-10x（取决于 N/M、GPU/CPU 带宽与是否使用 cuBLAS syr2k/gemm）。"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "≈ 0.3–0.8 FLOPs/byte（取决于缓存复用）。估算：每个 (i,j,k) 约 5 FLOPs。若 A[j][k],B[j][k],A[i][k],B[i][k] 都从内存来且 C 每次读改写：字节≈(4 loads + 1 load + 1 store)*sizeof(DATA_TYPE)=6*8=48B（double）→ AI≈5/48≈0.10；但实际 A[i][k],B[i][k] 可在 (i,k) 固定时复用，且 C 可寄存器累加（每 (i,j) 仅 1 次读+1 次写），则摊销后字节可降到 ~8–16B/iter 量级，AI 上升到 ~0.3–0.8。总体仍偏低，典型为带宽受限。",
+            "cache_behavior": "1) C：按 j 递增写下三角，行内连续（良好空间局部性），但原始 i-k-j 结构会在每个 k 对同一 C[i][j] 反复读写，导致写回/写分配压力；改为 i-j-k 可显著改善。\n2) A/B：访问 A[j][k],B[j][k] 在内层 j 变化时跨行跳跃（行主序下步长为 M），空间局部性差，易造成 L1/L2 miss；而 A[i][k],B[i][k] 对固定 i,k 可复用（可提升到寄存器）。\n3) 分块后：k-panel 打包可把 A/B 的访问变为连续流，提高预取效率并减少 TLB 压力；同时让工作集适配 L2/LLC，提升复用。",
+            "data_dependencies": [
+              "C[i][j] 在 k 循环上存在循环携带依赖（累加归约）：C(i,j)_{k+1} 依赖 C(i,j)_k；需用寄存器累加/归约处理以利向量化与并行。",
+              "不同 (i,j) 的 C 元素之间无数据依赖（写不同地址），因此可在 i 或块级并行；仅需处理 j<=i 的边界与避免写上三角。"
+            ]
+          },
+          "cost": 0.041620250000000004,
+          "bottleneck_raw": "memory (bandwidth + cache locality) with secondary compute underutilization"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.0495215
+      }
+    },
+    "doitgen": {
+      "program": "doitgen",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory (bandwidth + cache locality) / 次要: compute(当NP较小且C4可驻留缓存时)",
+      "s1_score": 66.65890481064484,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.05014975000000001,
+      "full_result": {
+        "code_name": "doitgen",
+        "program_key": "doitgen",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_doitgen (lines 54-70)",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over large data structures.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The kernel involves multiple nested loops accessing large 3D and 2D arrays, which suggests that memory access patterns and data movement are likely the primary bottlenecks."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The kernel consists of regular, data-parallel operations over large arrays, which are well-suited for GPU execution.",
+            "recommended_approach": "Port the kernel to CUDA or OpenCL, focusing on optimizing memory access patterns and maximizing occupancy by using shared memory and coalesced accesses."
+          },
+          "cost": 0.0076825,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gpt-5.2",
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory (bandwidth + cache locality) / 次要: compute(当NP较小且C4可驻留缓存时)",
+            "reasoning": "kernel_doitgen 本质是对每个 (r,q) 做一次 A[r][q,:] 向量与 C4[:,:] 的矩阵乘：sum[p]=Σ_s A[r][q][s]*C4[s][p]，随后写回 A[r][q,p]。对每个 (r,q) 需要读取 A 向量 NP 次(每个s一次)并对每个p重复使用；但当前循环顺序为 p 外、s 内，导致 A[r][q][s] 在不同 p 上被重复加载(缓存未必能保住整个向量)，同时对 C4 的访问是按列(p固定、s递增)在C行主序下为跨行大步长访问，空间局部性差、易触发大量cache miss/TLB miss。sum 数组每个 (r,q) 重复清零与写回，且存在写后读/写回A的额外带宽。整体算术强度中等偏低，性能通常受内存层次结构与向量化受限影响；若 NP 足够小使 C4 常驻 LLC/L2，则瓶颈可能转向FMA吞吐。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "kernel_doitgen: 改善C4访问局部性 + 促进SIMD向量化",
+              "technique": "循环交换(将s外提、p内层) + 使用局部寄存器/向量累加",
+              "code_changes": "将计算改为先清零sum，然后对每个s取a=A[r][q][s]，再对p做sum[p]+=a*C4[s][p]。这样C4按行连续访问，sum顺序写，易SIMD。\n\n示例:\nfor (p=0;p<np;p++) sum[p]=0;\nfor (s=0;s<np;s++) {\n  DATA_TYPE a = A[r][q][s];\n  #pragma omp simd\n  for (p=0;p<np;p++)\n    sum[p] += a * C4[s][p];\n}\nfor (p=0;p<np;p++) A[r][q][p]=sum[p];",
+              "expected_speedup": "1.5x-4x (取决于NP与缓存/向量宽度；通常显著降低C4 miss并提升SIMD效率)",
+              "difficulty": "easy"
+            },
+            {
+              "target": "kernel_doitgen: 减少sum清零/写回开销与提升寄存器复用",
+              "technique": "分块/寄存器阻塞(p维tile) + 局部数组(小tile)累加后一次性写回",
+              "code_changes": "对p做tile，例如PT=32/64：\nfor (p0=0;p0<np;p0+=PT){\n  DATA_TYPE acc[PT]; // 若PT为编译期常量可完全寄存器化/向量化\n  for (pp=0;pp<PT && p0+pp<np;pp++) acc[pp]=0;\n  for (s=0;s<np;s++){\n    DATA_TYPE a=A[r][q][s];\n    #pragma omp simd\n    for (pp=0;pp<PT && p0+pp<np;pp++)\n      acc[pp]+=a*C4[s][p0+pp];\n  }\n  for (pp=0;pp<PT && p0+pp<np;pp++) A[r][q][p0+pp]=acc[pp];\n}\n这样可完全去掉sum数组(或仅作为可选缓冲)，减少一次sum写+一次sum读的流量。",
+              "expected_speedup": "1.2x-2.5x (在内存受限时更明显；同时降低sum带宽与提升寄存器命中)",
+              "difficulty": "medium"
+            },
+            {
+              "target": "kernel_doitgen: 多核并行",
+              "technique": "OpenMP 并行化外层(r,q) + 合理collapse与线程私有sum/acc",
+              "code_changes": "并行(r,q)维度，避免sum共享：\n#pragma omp parallel for collapse(2) private(p,s) schedule(static)\nfor (r=0;r<nr;r++)\n  for (q=0;q<nq;q++) {\n    // 使用上面“去sum数组”的acc tile，或声明sum为线程私有缓冲\n  }\n若仍使用sum数组：改为在parallel区域内分配 thread-local sum (malloc/alloca) 或使用PolyBench提供的临时数组宏。",
+              "expected_speedup": "接近线性到受内存带宽限制 (例如8核可达4x-8x；若带宽饱和则更低)",
+              "difficulty": "easy"
+            },
+            {
+              "target": "kernel_doitgen: 提升编译器向量化与别名分析",
+              "technique": "restrict/对齐/编译选项 + pragma omp simd",
+              "code_changes": "在函数签名中为A/C4/sum添加restrict(若可保证无别名)，并确保对齐：\nvoid kernel_doitgen(... DATA_TYPE (*restrict A)[NQ][NP], DATA_TYPE (*restrict C4)[NP], DATA_TYPE *restrict sum)\n并在内层p循环加 #pragma omp simd aligned(C4,sum:64)\n编译：-O3 -march=native -ffast-math(若允许) -fopenmp-simd",
+              "expected_speedup": "1.1x-1.8x (取决于原始向量化是否失败/是否受限于对齐与别名)",
+              "difficulty": "easy"
+            },
+            {
+              "target": "kernel_doitgen: 利用高性能BLAS",
+              "technique": "将每个(r,q)的向量-矩阵乘替换为GEMV，或将(r,q)批量化为GEMM",
+              "code_changes": "对固定(r,q)：sum = A_vec * C4 (A_vec为1xNP，C4为NPxNP) 等价于 row-vector GEMV/GER? 更适合做：把所有(r,q)展平为M=nr*nq行的矩阵 A2[M][NP]，则整体为 A2 = A2 * C4 (右乘)，即GEMM: (M x NP) * (NP x NP) -> (M x NP)。\n实现：重解释A为二维并调用cblas_*gemm，注意行主序与转置参数。",
+              "expected_speedup": "2x-10x (依赖MKL/OpenBLAS与问题规模；通常显著优于手写循环)",
+              "difficulty": "hard"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "将问题视为批量右乘：对每个(r,q)计算输出向量 out[p]=Σ_s A_in[s]*C4[s][p]。GPU上可：\n(1) 2D网格：block负责一个(r,q)或一小批(r,q)，线程在p维并行；每个线程计算一个或多个p。\n(2) 在block内对s做循环，A_in[s]可由少量线程加载到共享内存/寄存器广播；C4按行(s固定、p连续)读取以实现合并访问。\n(3) 更高效方案：把A展平为矩阵 A2[M=nr*nq][NP]，调用cuBLAS GEMM：A2 = A2 * C4（右乘），通常是最优路径。",
+            "data_layout": "保持C4为行主序并确保在GPU上按行访问：C4[s][p]中p为最快变维，线程沿p连续读取实现coalescing。A建议展平为A2[M][NP]以便GEMM；若保持3D，确保A[r][q,:]在内存连续(当前C布局满足k维连续)。可考虑将C4转置存储为C4T[p][s]以匹配不同线程映射(若选择线程沿s并行)。",
+            "challenges": [
+              "C4复用与带宽：C4被所有(r,q)重复使用，需利用L2/只读缓存或将C4分块加载到shared memory；NP大时shared放不下，需要tile(s,p)并多次迭代",
+              "归约与寄存器压力：每线程若计算多个p会增加寄存器占用，影响occupancy；需要选择合适的p-tile与线程块尺寸",
+              "写回覆盖A：原地更新A会覆盖输入向量A[r][q,s]，但计算需要旧A；需使用临时输出缓冲或先读入A向量到shared/寄存器后再写回，或采用双缓冲(A_in/A_out)",
+              "小NP时kernel启动开销占比高：可批量化为GEMM或融合多个(r,q)到一个kernel以提高吞吐"
+            ],
+            "expected_speedup": "相对单核CPU：10x-100x(取决于规模与是否用cuBLAS GEMM)；相对多核优化CPU：2x-20x(带宽受限时偏低，计算受限且规模大时偏高)"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "≈ 2*NP^3 / (bytes_per_(r,q)) FLOPs/byte；若按理想缓存复用(每(r,q)读A向量NP次、读C4一次、写A一次)：bytes ≈ sizeof(T)*(NP + NP*NP + NP) ≈ sizeof(T)*(NP^2+2NP)，AI ≈ (2*NP^3)/(sizeof(T)*(NP^2+2NP)) ≈ (2*NP)/(sizeof(T)*(1+2/NP)). 以double为例：AI≈ (2*NP)/(8)≈ NP/4 FLOPs/byte(大NP时)。但原始循环顺序会导致A向量在不同p上重复加载、C4列访问低命中，使有效bytes显著增大，实际AI会明显低于该上界，常落在“带宽/缓存受限”区间。",
+            "cache_behavior": "1) A[r][q][s]：原代码在(p外,s内)下，对每个p都顺序扫一遍s，导致同一A向量被重复读取NP次；若NP较大，A向量( NP*sizeof(T) )可能无法在L1/L2跨p保留，产生容量miss。\n2) C4[s][p]：C按行主序存储，原代码固定p、递增s，相当于按列访问，步长为NP*sizeof(T)，空间局部性差，易造成L1/L2 miss与TLB压力；交换循环后变为按行连续访问，硬件预取有效。\n3) sum[p]：原代码每个p先写0再在s循环中读改写，属于写-读-写热点；若sum驻留L1问题不大，但仍有额外写回/读出。采用p-tile寄存器acc可消除sum数组流量。\n4) 写回A[r][q][p]：顺序写，良好；但若与读取A向量交织不当可能引入写分配(RFO)。用acc直接写A可减少中间数组写。",
+            "data_dependencies": [
+              "sum[p] 在 s 循环中存在循环携带依赖(归约)：sum[p]_{s+1} 依赖 sum[p]_s；可用SIMD reduction/向量化在p维展开来规避标量依赖",
+              "A[r][q][p] 写回依赖于完整的sum[p]计算完成；因此需要在完成所有s累加后再写A(或使用双缓冲/临时acc)",
+              "不同(r,q)之间相互独立，可并行；同一(r,q)内不同p在交换循环后可SIMD并行(无跨p依赖)"
+            ]
+          },
+          "cost": 0.042467250000000005,
+          "bottleneck_raw": "memory (bandwidth + cache locality) / 次要: compute(当NP较小且C4可驻留缓存时)"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.05014975000000001
+      }
+    },
+    "gramschmidt": {
+      "program": "gramschmidt",
+      "config": "Role-Swap V1 Neutral",
+      "s1_model": "gpt-4o",
+      "s2_model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory_bandwidth + low_reuse_streaming (with unavoidable k-serial dependency)",
+      "s1_score": 52.52710843373494,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.055748000000000006,
+      "full_result": {
+        "code_name": "gramschmidt",
+        "program_key": "gramschmidt",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_gramschmidt, line 66",
+              "estimated_time_percentage": "90%",
+              "reason": "This function contains the main computational kernel with multiple nested loops, which are likely to dominate the execution time.",
+              "confidence": "high"
+            },
+            {
+              "location": "inner loop of kernel_gramschmidt, line 73",
+              "estimated_time_percentage": "40%",
+              "reason": "This loop performs a reduction operation to compute the norm, which is computationally intensive.",
+              "confidence": "high"
+            },
+            {
+              "location": "inner loop of kernel_gramschmidt, line 77",
+              "estimated_time_percentage": "30%",
+              "reason": "This loop updates the Q matrix, involving division operations which are costly.",
+              "confidence": "medium"
+            },
+            {
+              "location": "nested loops of kernel_gramschmidt, lines 80-85",
               "estimated_time_percentage": "20%",
-              "reason": "This function uses OpenMP for parallelization but involves atomic operations which can be a bottleneck.",
-              "confidence": "medium"
-            },
-            {
-              "location": "ForceLJ::compute_fullneigh (line 270)",
-              "estimated_time_percentage": "10%",
-              "reason": "This function is optimized for full neighbor lists and vectorization but still involves significant computation.",
-              "confidence": "medium"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "compute",
-            "reasoning": "The primary bottleneck is compute-bound due to the intensive calculations involved in force computations, especially in the original and halfneigh versions."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The code involves a high degree of parallelism and regular computation patterns, making it suitable for GPU acceleration.",
-            "recommended_approach": "Port the compute functions to CUDA or OpenCL, focusing on optimizing memory transfers and maximizing occupancy."
-          },
-          "cost": 0.01733025
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory+sync bound（带分支的邻居遍历导致的带宽/延迟受限 + OpenMP 原子更新导致的同步受限），而非纯 compute-bound",
-            "reasoning": "从源码看，热点都在邻居表双重循环。每个 pair 需要：1) 读取 j 的坐标 x[j*PAD+0..2]（跨粒子、近似随机访问，缓存命中率低）；2) 读取 type[j] 并索引 epsilon/sigma6/cutforcesq（小表可缓存，但 type_ij 计算与间接访问仍有开销）；3) 条件分支 if(rsq < cutforcesq[type_ij]) 造成分支预测失败与 SIMD 掩码化；4) halfneigh_threaded 中对 f[j] 的 3 次 atomic（以及对 f[i] 的 atomic）引入严重的同步与缓存行争用（尤其当邻居共享 j 时）。LJ 计算本身 FLOPs 不少，但与不规则内存访问 + 原子同步相比，整体更接近带宽/延迟与同步瓶颈。fullneigh 版本去掉 fj 更新后更易向量化，通常更接近 compute-bound，但仍受邻居访问的内存局部性限制。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "ForceLJ::compute_original (line ~78) 40%：消除对 j 的写回与不可向量化结构",
-              "technique": "改用 full neighbor list（或 halfneigh 但不写 fj），并将能量/维里计算与力计算分离；同时引入 SoA/结构化加载以提升 SIMD",
-              "code_changes": "1) 用 compute_fullneigh 替代 compute_original 路径（或直接删除 use_oldcompute 分支）。\n2) 若必须 halfneigh：将对 f[j] 的更新改为“线程私有缓冲 + 归约/散射”或改用 fullneigh。\n3) 数据布局：将 atom.x 从 AoS(带 PAD) 改为 SoA：x0[], x1[], x2[]；同理 f0[],f1[],f2[]，减少 gather。\n4) 将 type_ij 相关参数预打包：为每个 i 预取 type_i，并在内层将 cut/eps/sig6 指针缓存到局部数组或 restrict 指针。\n示例（概念性）：\n- const MMD_float* __restrict x0 = atom.x0; ...\n- const MMD_float* __restrict cut = cutforcesq + type_i*ntypes;\n- 内层用 cut[type_j] / eps[type_j] / sig6[type_j]\n",
-              "expected_speedup": "1.3x–2.0x（取决于邻居数、是否启用 SIMD、以及原先 original 占比）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "ForceLJ::compute_halfneigh (line ~144) 30%：提升 SIMD 有效性与减少分支/除法开销",
-              "technique": "向量化友好改写：分支掩码化/分离筛选；使用 rsqrt 近似或 FMA；减少重复加载；预取与 restrict；减少 PAD 带来的无效带宽",
-              "code_changes": "1) 将 if(rsq < cut) 改为两阶段：先计算 rsq 并生成 mask（编译器可用 masked SIMD），或先筛选邻居（构建 short list）再做 LJ。\n2) 用 inv_r2 = 1/rsq 可改为 inv_r = rsqrt(rsq)（若允许近似）再 inv_r2=inv_r*inv_r；或保持精确但用编译器选项 -ffast-math（需验证物理可接受性）。\n3) 将 type_ij = type_i*ntypes + type_j 改为：\n   const MMD_float* __restrict cut = &cutforcesq[type_i*ntypes];\n   const MMD_float* __restrict eps = &epsilon[type_i*ntypes];\n   const MMD_float* __restrict sig6= &sigma6[type_i*ntypes];\n   内层直接用 cut[type_j] 等，减少乘法与地址计算。\n4) 明确别名：给 x/f/type 加 __restrict；并将 x[j*PAD+0..2] 改为一次性加载到局部变量（已做），若 SoA 则更好。\n5) 对 neighbor.neighbors 做对齐与连续化（按 i 的 cell 顺序生成邻居表），提升 j 访问局部性。\n",
-              "expected_speedup": "1.15x–1.6x（SIMD 宽度越大、邻居表越规整收益越高）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "ForceLJ::compute_halfneigh_threaded (line ~204) 20%：原子更新导致的同步与伪共享",
-              "technique": "去原子：采用 coloring / 分块私有累加 / 双缓冲归约；或直接切换到 fullneigh 并按 i 并行",
-              "code_changes": "可选方案 A（推荐，最简单且常见更快）：\n1) 在 OpenMP 路径优先使用 full neighbor list：neighbor.halfneigh==true 时也允许构建 fullneigh（内存换性能）。\n2) 删除对 f[j] 的 atomic 更新（fullneigh 不需要）。\n\n可选方案 B（保持 halfneigh）：\n1) 为每线程分配 f_thread[tid][nall][3]（或按块分配，避免内存爆炸），内层对 f_thread 写入无原子；循环结束后对 f 做并行归约（按 i 分块归约）。\n2) 或使用图着色/原子减少：对粒子按 cell coloring，使同色粒子更新的 j 集合不冲突，从而去掉 atomic。\n3) 将对 f[i] 的 atomic 去掉：因为 i 循环是并行分配的，每个 i 只被一个线程处理，f[i]+=fix 不需要 atomic（当前代码对 f[i] 也 atomic，属于不必要同步）。\n   直接改为：f[i*PAD+0]+=fix; ...（无 atomic）。\n4) eng_vdwl/virial 用 reduction(+:t_eng_vdwl,t_virial) 替代末尾 atomic。\n",
-              "expected_speedup": "1.3x–3.0x（取决于原子冲突率；去掉对 f[i] 的 atomic 通常立刻有 1.05x–1.2x）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "ForceLJ::compute_fullneigh (line ~270) 10%：进一步提升向量化与缓存命中",
-              "technique": "强化 SIMD 与数据局部性：SoA、邻居重排、软件预取、常量表驻留 L1/寄存器；减少能量/维里额外 FLOPs",
-              "code_changes": "1) SoA：x0/x1/x2 与 f0/f1/f2，避免 PAD 跨步导致的无效加载。\n2) 邻居表按空间局部性排序：生成 neighbor.neighbors 时按 cell/距离排序，使 j 的 x 更可能在缓存中。\n3) 将 epsilon/sigma6/cutforcesq 打包为结构体数组 params[type_i*ntypes+type_j]，并保证对齐；或按 type_i 行缓存指针（同 halfneigh 建议）。\n4) EVFLAG 路径：将 (delx*delx+dely*dely+delz*delz) 复用 rsq，避免重复乘加：t_virial += rsq * force;\n5) 编译器：确保启用 -O3 -march=native，并验证 #pragma omp simd reduction 生效；必要时用 #pragma omp simd simdlen(VECTORLENGTH)。\n",
-              "expected_speedup": "1.1x–1.4x（fullneigh 已较优，收益主要来自 SoA+邻居重排）",
-              "difficulty": "easy"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "采用 full neighbor list 的 i-parallel：一个线程/warp 负责一个 i 粒子，遍历其 neighbor list；在寄存器累加 fi（fix/fiy/fiz），最后一次性写回 f[i]。EV/virial 用 block-level reduction 后写全局。若必须 halfneigh：使用原子更新 f[j]（代价高）或采用 cell/warp 分块共享内存累加后再散射。",
-            "data_layout": "强烈建议 SoA：x0[],x1[],x2[] 与 f0[],f1[],f2[]；neighbor list 使用 CSR 形式（offset[i], neighbors[idx]）替代 i*maxneighs 的定长二维展开，减少无效读取并提升合并访问；参数表 params[type_i*ntypes+type_j] 放 constant memory/texture cache（小表）。",
-            "challenges": [
-              "邻居表遍历长度不均导致负载不均与 warp divergence（不同 i 的 numneigh 不同，且 cutoff 分支导致进一步 divergence）",
-              "x[j] 的间接访问导致全局内存非合并（gather），缓存命中依赖邻居排序；halfneigh 的 f[j] 更新需要原子，冲突会严重拖慢",
-              "EVFLAG 的能量/维里归约会引入额外同步与全局原子（需分层归约）"
-            ],
-            "expected_speedup": "相对单核 CPU：10x–50x；相对多核 CPU（已良好 SIMD+fullneigh）：2x–10x。若使用 halfneigh 且大量原子冲突，可能仅 1.5x–4x。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "约 0.3–0.8 FLOPs/byte（典型范围，取决于是否 fullneigh/halfneigh、是否写 fj、以及缓存命中）。估算：每个有效 pair 约 25–40 FLOPs（3 sub + 5 mul/add for rsq + 若干 mul/add 形成 sr6/force + 3 mul 累加力；EVFLAG 再加 ~6–10 FLOPs）。内存方面：至少读取 xj 3*8=24B（double）+ type_j 4B（常被缓存）+ 写 fi 主要在寄存器，halfneigh 还要写 fj 3*8=24B（且可能触发 RFO），再加邻居索引读取 4B。若考虑写 fj 的 RFO，halfneigh_threaded 的有效字节数更高，AI 更低。",
-            "cache_behavior": "1) x[j] 访问是通过邻居表间接索引，呈现 gather/随机访问特征；若邻居表按空间局部性构建，仍可能在 L2/L3 命中，但在大体系下常落到内存带宽/延迟。\n2) f 数组：fullneigh 仅写 f[i]（顺序写，友好）；halfneigh 写 f[j]（散写），导致缓存行抖动与写分配(RFO)。\n3) cutforcesq/epsilon/sigma6：尺寸为 ntypes^2，通常很小（常驻 L1/L2），不是主要带宽来源；但 type_ij 的地址计算与间接访问会影响流水。\n4) OpenMP atomic：对 f[j] 的原子会导致缓存行在核间频繁迁移（MESI ping-pong），表现为同步/一致性开销主导。",
-            "data_dependencies": [
-              "halfneigh/compute_original 中对 f[j] 的更新形成跨 i 的写后写/写后读冲突（多线程下必须 atomic 或其他同步），限制并行扩展与 SIMD",
-              "if(rsq < cut) 的控制依赖导致 SIMD 掩码化与分支预测开销；EVFLAG 进一步引入条件累加依赖（reduction）",
-              "eng_vdwl/virial 为全局归约变量：线程间需要 reduction/atomic（当前 threaded 用 atomic，存在串行化点）"
-            ]
-          },
-          "cost": 0.049182000000000003
-        },
-        "total_cost": 0.06651225
-      }
-    },
-    "hpcg_spmv": {
-      "program": "hpcg_spmv",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "memory",
-      "s2_bottleneck_raw": "memory (irregular memory access / bandwidth-limited SpMV) + communication (MPI halo latency/bandwidth)",
-      "s2_primary": "memory",
-      "ground_truth": "memory",
-      "s1_matches_gt": true,
-      "s2_matches_gt": true,
-      "changed": false,
-      "s2_reasoning": "ComputeSPMV_ref 的内层循环对 xv[cur_inds[j]] 进行间接寻址(gather)，访问模式不连续且难以预取，导致缓存命中率低、TLB/缓存行利用率差；每个非零元只做 1 mul + 1 add(≈2 FLOPs)，但需要读取矩阵值/列索引/向量元素并写回 y，算术强度很低，典型为内存带宽受限。其次 ExchangeHalo 需要跨进程通信，受网络延迟与带宽影响，并可能与计算阶段形成同步点，约占 15% 时间。",
-      "cost": 0.0417655,
-      "full_result": {
-        "code_name": "hpcg",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "ComputeSPMV_ref, line 47",
-              "estimated_time_percentage": "80%",
-              "reason": "The nested loop over matrix rows and non-zero elements is the main computational workload.",
-              "confidence": "high"
-            },
-            {
-              "location": "ExchangeHalo, line 39",
-              "estimated_time_percentage": "15%",
-              "reason": "Communication overhead due to data exchange between processors.",
+              "reason": "These loops perform matrix updates, which involve multiple memory accesses and arithmetic operations.",
               "confidence": "medium"
             }
           ],
           "bottleneck_type": {
             "primary": "memory",
-            "reasoning": "The performance is limited by memory access patterns, particularly accessing non-contiguous memory locations in the inner loop."
+            "reasoning": "The algorithm involves frequent memory accesses for matrix operations, which can lead to cache misses and memory bandwidth limitations."
           },
           "gpu_suitability": {
             "suitable": true,
-            "reasoning": "The matrix-vector multiplication is highly parallelizable and can benefit from GPU acceleration.",
-            "recommended_approach": "Use CUDA or OpenCL to implement the SPMV kernel, ensuring coalesced memory accesses and leveraging shared memory for caching."
+            "reasoning": "The algorithm involves a high degree of parallelism in matrix operations, which is well-suited for GPU acceleration.",
+            "recommended_approach": "Port the computational kernel to CUDA or OpenCL, focusing on parallelizing the innermost loops and optimizing memory access patterns for coalesced reads and writes."
           },
-          "cost": 0.0070525
+          "cost": 0.01043175,
+          "bottleneck_raw": "memory"
         },
         "stage2": {
           "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory (irregular memory access / bandwidth-limited SpMV) + communication (MPI halo latency/bandwidth)",
-            "reasoning": "ComputeSPMV_ref 的内层循环对 xv[cur_inds[j]] 进行间接寻址(gather)，访问模式不连续且难以预取，导致缓存命中率低、TLB/缓存行利用率差；每个非零元只做 1 mul + 1 add(≈2 FLOPs)，但需要读取矩阵值/列索引/向量元素并写回 y，算术强度很低，典型为内存带宽受限。其次 ExchangeHalo 需要跨进程通信，受网络延迟与带宽影响，并可能与计算阶段形成同步点，约占 15% 时间。"
+          "validation": {},
+          "analysis": {
+            "primary_bottleneck": "memory_bandwidth + low_reuse_streaming (with unavoidable k-serial dependency)",
+            "reasoning": "kernel_gramschmidt 的主耗时来自对 A/Q 的列访问与对 A 的反复更新：对每个 k，需要(1)扫描 A[:,k] 求范数，(2)写 Q[:,k]，(3)对每个 j>k 扫描 A[:,j] 做点积并再次扫描 A[:,j] 做 axpy 更新。A 的每一列在同一 k 下被读两次(点积+更新)，且跨 k 会被多次更新导致工作集大、复用距离长；整体算术强度偏低，容易受内存带宽/缓存容量限制。与此同时，外层 k 循环存在严格数据依赖(A[:,j] 在 k 步更新后才能用于 k+1)，限制了跨 k 的并行与重排空间，使得只能在 i/j 维度挖掘并行与局部性。"
           },
           "detailed_optimizations": [
             {
-              "target": "ComputeSPMV_ref (80%)：减少间接访问代价、提升缓存/预取效率（不改变数学结果）",
-              "technique": "数据结构重排：将 A.matrixValues/A.mtxIndL 从“每行一个指针”改为 CSR(连续 val/colind/rowptr)，并对列索引做局部重编号/排序以提升 xv 访问局部性",
-              "code_changes": "将\n  const double * const cur_vals = A.matrixValues[i];\n  const local_int_t * const cur_inds = A.mtxIndL[i];\n替换为 CSR 形式：\n  const int row_start = A.rowptr[i];\n  const int row_end   = A.rowptr[i+1];\n  for (int jj=row_start; jj<row_end; ++jj) sum += A.val[jj] * xv[A.col[jj]];\n并在装配阶段：\n  1) 生成 rowptr/col/val 连续数组；\n  2) 对每行 col 做排序(或按 cache line 分桶)并同步重排 val；\n  3) 可选：对本地列做 RCM/space-filling curve 重编号以提升跨行复用。",
-              "expected_speedup": "1.2x–1.8x（取决于原始指针追踪开销与局部性；HPCG 27-pt stencil 通常可获得中等收益）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "ComputeSPMV_ref (80%)：降低索引带宽与提升向量化机会",
-              "technique": "索引压缩与类型收缩：若 localNumberOfColumns < 2^31，使用 int32 存 colind；并对常见固定 nnz/行(如 27)做展开/专用 kernel",
-              "code_changes": "1) 将 local_int_t *cur_inds 改为 int32_t *（存储层面），并确保 cur_inds[j] 转换无符号扩展开销最小；\n2) 若 cur_nnz 常为常数 K：\n  switch(cur_nnz){case 27: 手工展开或 #pragma unroll 27; default: 原循环}\n3) 编译器提示：在 CSR 连续数组上使用 __restrict__ 指针：\n  const double* __restrict__ xv = x.values; double* __restrict__ yv = y.values;",
-              "expected_speedup": "1.05x–1.25x（索引带宽下降与更好指令流水；展开在规则 stencil 上更有效）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "ComputeSPMV_ref (80%)：线程调度与 NUMA 亲和性",
-              "technique": "OpenMP 静态调度 + first-touch + 线程绑核，避免跨 NUMA 访问；必要时按行块划分以均衡负载",
-              "code_changes": "1) OpenMP：\n  #pragma omp parallel for schedule(static)\n2) 初始化 x/y/A 的内存采用 first-touch（并行初始化）；\n3) 运行时设置：OMP_PROC_BIND=close, OMP_PLACES=cores；\n4) 若行 nnz 不均：改为 schedule(guided,chunk) 或按 rowptr 做分块前缀和划分。",
-              "expected_speedup": "1.05x–1.3x（双路/多路 NUMA 机器上更明显）",
+              "target": "kernel_gramschmidt line 66-71: nrm += A[i][k]*A[i][k] (范数计算热点)",
+              "technique": "SIMD 向量化 + reduction + 对列指针做 restrict/对齐提示；可选：用 BLAS nrm2",
+              "code_changes": "1) 提前取列指针并加 restrict：\n```cpp\nfor (int k=0;k<_PB_N;k++){\n  DATA_TYPE * __restrict Ak = &A[0][k];\n  DATA_TYPE nrm = 0;\n  #pragma omp simd reduction(+:nrm)\n  for (int i=0;i<_PB_M;i++) nrm += Ak[i*_PB_N]*Ak[i*_PB_N];\n  R[k][k] = sqrt(nrm);\n  ...\n}\n```\n2) 若允许依赖库：用 cblas_dnrm2(m, &A[0][k], N)（stride=N）。\n3) 编译器选项：-O3 -ffast-math -march=native（或对应平台）并确保 A 行主序连续。",
+              "expected_speedup": "1.2x-2.0x（该段）；端到端通常 1.05x-1.2x（取决于 M,N 与内存带宽）",
               "difficulty": "easy"
             },
             {
-              "target": "ExchangeHalo (15%)：隐藏通信开销",
-              "technique": "通信-计算重叠：MPI_Irecv/Isend + 先算内部行(不依赖 halo) + MPI_Waitall 后算边界行",
-              "code_changes": "将 ExchangeHalo(A,x) 拆分为：\n  1) Post Irecv/Isend（打包外发 x）；\n  2) 计算 interior rows：这些行的 cur_inds 全在本地列范围；\n  3) Waitall；\n  4) 计算 boundary rows。\n需要在 SparseMatrix 中预先构建 interiorRows/boundaryRows 列表（或用标志数组）。",
-              "expected_speedup": "整体 1.05x–1.2x（取决于通信占比与可重叠比例；通信越慢收益越大）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "ExchangeHalo (15%)：降低通信量与次数",
-              "technique": "邻居聚合与打包优化：按邻居 rank 连续打包、使用持久通信(MPI_Send_init/MPI_Recv_init)或邻域集合通信(MPI_Neighbor_alltoallv)",
-              "code_changes": "1) 将外部索引按 neighbor rank 分组，形成连续 send buffer；\n2) 使用 MPI persistent requests：初始化一次，迭代中反复启动；\n3) 若拓扑固定：使用 MPI_Neighbor_alltoallv 简化并可能优化内部调度。",
-              "expected_speedup": "ExchangeHalo 1.1x–1.5x（整体 1.02x–1.1x）",
-              "difficulty": "medium"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "采用 CSR/SELL-C-σ 等 GPU 友好格式；以“一个 warp 处理一行”或“一个 block 处理多行”的 SpMV kernel。流程：1) 异步 halo 交换（GPU-aware MPI 或 CPU 打包+cudaMemcpyAsync）；2) kernel 先算 interior rows；3) 等待 halo 到达后算 boundary rows；4) 可与后续向量操作融合（如 y=Ax 与后续 axpy/dot 融合）减少带宽往返。",
-            "data_layout": "1) 首选 CSR(连续 rowptr/col/val) 或 SELL-C-σ（按行长度分桶并对齐到 C=32/64，提升合并访问）；\n2) colind 使用 int32；val 使用 double（HPCG 要求）；\n3) x/y 使用 SoA 连续数组并保证 128B 对齐；\n4) 若使用 SELL：对行按 nnz 分组排序(σ 窗口内排序)以减少填充并提升 warp 利用率。",
-            "challenges": [
-              "不规则 gather 导致全局内存访问不合并、cache 命中不稳定（可用 SELL-C-σ、行内排序、或使用 texture/readonly cache 读取 x）",
-              "MPI halo 与 GPU 数据驻留：需要 GPU-aware MPI 或显式 staging；否则 PCIe/NVLink 传输可能抵消收益（用异步拷贝与计算重叠）",
-              "负载不均：行 nnz 变化会造成 warp 分歧（用分桶/SELL 或 dynamic parallelism/segmented reduction 方案）",
-              "双精度吞吐与带宽限制：SpMV 仍主要受带宽限制，需尽量减少格式开销与 kernel launch 次数（融合算子、持久 kernel）"
-            ],
-            "expected_speedup": "相对单 CPU socket：约 3x–10x；相对双 socket 优化后 CPU：约 2x–6x（强依赖矩阵规则性、GPU 带宽、以及 halo 通信是否可重叠）"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "≈ 2 FLOPs / (8(val)+4~8(colind)+8(x load amortized)+8(y store amortized)) bytes ≈ 0.08–0.12 FLOPs/byte（典型 SpMV；若 colind 为 int32 且 x 命中缓存可接近上界）",
-            "cache_behavior": "1) A.matrixValues[i]/A.mtxIndL[i] 为“指针数组 + 行内连续”，行内顺序访问友好，但每行一次指针追踪会带来额外 L1/L2 miss 风险；\n2) xv[cur_inds[j]] 为随机/半随机 gather：空间局部性差，硬件预取器基本无效，常导致 L2/L3 miss 与内存带宽压力；\n3) yv[i] 顺序写，写分配开销较小（可被写合并），但总体被 x 的不规则读主导；\n4) 若矩阵来自规则 3D stencil（HPCG 常见），cur_inds 在局部块内仍有一定局部性，可通过列重编号/按行排序进一步提升缓存复用；\n5) NUMA：x/y/A 若跨 socket 分配，会使 xv 访问变成远端内存读，带宽下降明显。",
-            "data_dependencies": [
-              "行内归约依赖：sum 在 j 循环中存在串行累加（可用展开/多累加器减轻流水线依赖，但难以完全向量化）",
-              "跨行无依赖：不同 i 的 yv[i] 独立，适合 OpenMP 并行；但共享读取 xv 造成带宽竞争",
-              "通信依赖：boundary rows 依赖 ExchangeHalo 得到的外部 x 值；形成计算前置同步点（可通过重叠拆分为 interior/boundary 消除全局等待）"
-            ]
-          },
-          "cost": 0.034713
-        },
-        "total_cost": 0.0417655
-      }
-    },
-    "hpcg_symgs": {
-      "program": "hpcg_symgs",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "memory",
-      "s2_bottleneck_raw": "memory (irregular sparse gather + low arithmetic intensity) + loop-carried dependency (Gauss-Seidel)",
-      "s2_primary": "memory",
-      "ground_truth": "memory",
-      "s1_matches_gt": true,
-      "s2_matches_gt": true,
-      "changed": false,
-      "s2_reasoning": "两段 sweep 的核心开销都在内层 j 循环：对 currentValues[j] 与 xv[curCol] 做稀疏 gather 访问并累加。xv[curCol] 访问不连续、难以预取，导致 L1/L2 miss 与带宽/延迟受限；每个非零仅 1 mul + 1 add/sub，算术强度很低。更关键的是 Gauss-Seidel 的数据依赖：forward sweep 中 x[i] 依赖于同 sweep 已更新的 x[lower cols]，backward sweep 类似，限制了线程级并行与 SIMD 的有效性，使得即便带宽足够也会被依赖链与访存延迟放大。matrixDiagonal ",
-      "cost": 0.04980324999999999,
-      "full_result": {
-        "code_name": "hpcg",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "forward sweep loop starting at line 47",
-              "estimated_time_percentage": "50%",
-              "reason": "Iterates over all rows and non-zero elements, performing multiple memory accesses and computations.",
-              "confidence": "high"
-            },
-            {
-              "location": "backward sweep loop starting at line 67",
-              "estimated_time_percentage": "50%",
-              "reason": "Similar to the forward sweep, iterates over all rows and non-zero elements, performing multiple memory accesses and computations.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "The code involves frequent memory accesses to non-contiguous memory locations, which is typical in sparse matrix operations. The computation is relatively simple compared to the cost of memory access."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The problem is suitable for GPU acceleration due to its parallelizable nature, especially the independent operations across rows.",
-            "recommended_approach": "Use CUDA or OpenCL to implement the forward and backward sweeps, leveraging the GPU's ability to handle many threads for parallel execution of independent row operations."
-          },
-          "cost": 0.008309
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory (irregular sparse gather + low arithmetic intensity) + loop-carried dependency (Gauss-Seidel)",
-            "reasoning": "两段 sweep 的核心开销都在内层 j 循环：对 currentValues[j] 与 xv[curCol] 做稀疏 gather 访问并累加。xv[curCol] 访问不连续、难以预取，导致 L1/L2 miss 与带宽/延迟受限；每个非零仅 1 mul + 1 add/sub，算术强度很低。更关键的是 Gauss-Seidel 的数据依赖：forward sweep 中 x[i] 依赖于同 sweep 已更新的 x[lower cols]，backward sweep 类似，限制了线程级并行与 SIMD 的有效性，使得即便带宽足够也会被依赖链与访存延迟放大。matrixDiagonal 为 double** 指针追逐也会引入额外的间接访存与潜在 cache miss。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "热点1: forward sweep (line ~47) 内层稀疏乘加",
-              "technique": "数据结构与指针追逐消除：将对角线改为连续数组；将列索引与数值打包/对齐；减少间接寻址",
-              "code_changes": "1) 将 A.matrixDiagonal (double**) 替换为连续数组 A.diag (double*)，构建矩阵时填充 diag[i]。\n   - 原: const double currentDiagonal = matrixDiagonal[i][0];\n   - 改: const double currentDiagonal = A.diag[i];\n2) 若允许改 SparseMatrix：将 matrixValues[i] 与 mtxIndL[i] 改为单一连续 CSR (rowPtr/colInd/val) 或至少保证每行 val/col 连续且 64B 对齐；并将 local_int_t 索引压缩为 int32 (若范围允许) 以减小带宽。\n3) 在循环中使用 restrict/assume_aligned 提示编译器：\n   - const double* __restrict__ currentValues = ...;\n   - const local_int_t* __restrict__ currentColIndices = ...;\n   - double* __restrict__ xv = x.values;\n4) 对 currentNumberOfNonzeros 小且固定(如 HPCG 常见 27)的情况：对 j 循环做手工展开或 #pragma unroll（在保证不破坏正确性的前提下）。",
-              "expected_speedup": "1.05x-1.25x（主要来自减少指针追逐、提升 cache 命中与降低索引带宽；若从 AoS/指针行数组迁移到紧凑 CSR，可能到 1.2x-1.4x）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "热点1: forward sweep 的除法与对角处理",
-              "technique": "预计算倒数 + 消除对角项在内层循环的无效乘加",
-              "code_changes": "1) 预计算 invDiag[i] = 1.0 / diag[i]（矩阵装配后一次性完成）。\n   - 原: xv[i] = sum/currentDiagonal;\n   - 改: xv[i] = sum * A.invDiag[i];\n2) 若已知对角位置（例如存储 diagIndex[i]）：在 j 循环中跳过对角项，避免“先减后加”的冗余：\n   - 原: for j: sum -= val[j]*x[col[j]]; 然后 sum += x[i]*diag;\n   - 改: for j: if (j!=diagPos) sum -= val[j]*x[col[j]]; 直接不处理对角；最后 xv[i] = (sum) * invDiag[i];\n   这会减少 1 次乘法与 1 次加法/行（但会引入分支；更优是将 lower/upper 分段存储，天然不遍历对角）。",
-              "expected_speedup": "1.02x-1.10x（除法替换通常收益稳定；跳过对角项收益取决于分支/数据结构，若能结构化存储避免分支则更好）",
-              "difficulty": "easy/medium"
-            },
-            {
-              "target": "热点2: backward sweep (line ~67) 同类内层稀疏乘加",
-              "technique": "与 forward sweep 相同的结构化与编译器友好优化 + 反向循环的类型安全与向量化提示",
-              "code_changes": "1) 同步应用 diag 连续化、invDiag、restrict、对齐、CSR 化等。\n2) 修正反向循环的潜在类型/溢出风险并利于编译器：\n   - 原: for (local_int_t i=nrow-1; i>=0; i--)\n   - 改: for (local_int_t ii=0; ii<nrow; ++ii) { local_int_t i = nrow-1-ii; ... }\n   避免无符号/有符号比较陷阱，并让编译器更好分析循环边界。\n3) 若每行非零数固定：同样可 #pragma unroll。",
-              "expected_speedup": "1.05x-1.25x（与 forward 类似，叠加后整体可能 1.1x-1.4x）",
-              "difficulty": "easy/medium"
-            },
-            {
-              "target": "两段 sweep 的并行度受限（GS 依赖）",
-              "technique": "算法级并行化：多色 (multi-color) / 图着色 GS，或改用 (block-)Jacobi / Chebyshev 平滑器（若允许改变算法）",
-              "code_changes": "1) Multi-color GS：预处理对网格/图进行着色，得到 colorOffsets 与 colorRows 列表；每个颜色内行互不依赖，可 OpenMP 并行：\n   for color in colors:\n     #pragma omp parallel for schedule(static)\n     for idx in colorRows[color]: i = ...; 计算该行\n   forward/backward 可分别按颜色顺序执行（或对称处理）。\n2) 若允许替换：用 (damped) Jacobi：x[i] = (r[i] - sum_{j!=i} Aij*x_old[j]) * invDiag[i]，完全并行；或 block-Jacobi 提升收敛。\n3) 若保持 SYMGS 语义但想提升并行：可做局部块三角求解（level scheduling）或 ILU(0) 的 level-set。",
-              "expected_speedup": "CPU: 2x-10x（取决于颜色数/level 数与核数；HPCG 3D 27-point 常见 8 色，理论并行度较好但仍受带宽限制）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "MPI halo 交换与计算重叠（若 MPI 打开）",
-              "technique": "通信-计算重叠 + 分离内部行/边界行",
-              "code_changes": "1) 将行分为 interior（不依赖 halo）与 boundary（依赖 halo）。\n2) 使用非阻塞 ExchangeHalo：先发起 Irecv/Isend；先计算 interior 行的 sweep；Waitall 后计算 boundary 行。\n3) 需要在 SparseMatrix 中预存 interiorRows 列表或 row partition。",
-              "expected_speedup": "1.05x-1.30x（强依赖网络与问题规模；多节点时收益更明显）",
-              "difficulty": "medium/hard"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "不建议直接逐行顺序 SYMGS 映射到 GPU（依赖导致串行）。推荐两条路线：\n1) Multi-color/level-scheduling GS：按颜色(或 level)分批，每批内行独立并行；每个颜色启动一个 kernel（或使用 CUDA Graph/持久化 kernel 减少 launch 开销）。\n2) 若允许算法替换：用 Jacobi/多项式平滑器（Chebyshev）在 GPU 上更高效，通常整体求解时间更优。",
-            "data_layout": "1) 使用标准 CSR/SELL-C-σ 或 ELLPACK（HPCG 27nnz/row 很规则，ELL/SELL 很合适）以获得合并访存。\n2) val 与 col 分离 SoA；col 用 int32；val 用 float64（保持精度）或在允许时混合精度。\n3) x、r 连续存储；对齐到 128B；尽量让同一 warp 访问相近的 x 索引（通过行重排序：RCM/空间填充曲线）以提升缓存与合并读取。\n4) 预存 diag 与 invDiag 为连续数组；避免 double**。",
-            "challenges": [
-              "GS 数据依赖导致需要颜色/level 分解；颜色数越多 kernel 启动越多，带来 launch/同步开销",
-              "稀疏 gather 访问 x 的不规则性导致带宽利用率低；需要 SELL/ELL、行重排序、以及利用只读缓存/纹理缓存",
-              "双精度吞吐与原子/同步成本：若采用块级方法或需要归约，需避免原子热点；使用 warp-level reduction",
-              "MPI+GPU：halo 交换需要 GPU-aware MPI 或显式 D2H/H2D；建议使用 CUDA-aware MPI + GPUDirect，并做 interior/boundary 重叠"
-            ],
-            "expected_speedup": "相对单核 CPU：10x-50x（取决于实现与带宽）；相对多核优化 CPU（含多色并行）：1.5x-5x 更常见。若坚持严格顺序 SYMGS（无着色）则 GPU 加速可能很有限甚至变慢。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "约 0.08-0.15 FLOPs/byte（典型稀疏 SpMV/三角扫类似）。估算：每非零约 2 FLOPs（mul+add/sub）。内存：val 8B + col 4-8B + x 8B(通常来自更低层缓存/内存，且可能重复利用有限)；保守按 8+8+8=24B，则 2/24=0.083 FLOPs/B；若 col 为 4B 且 x 有部分缓存命中，可能到 ~0.12-0.15。",
-            "cache_behavior": "1) currentValues 与 currentColIndices：行内连续，具备良好空间局部性，L1/L2 命中较好。\n2) xv[curCol]：稀疏 gather，几乎无空间局部性；在 3D stencil 下存在一定邻域复用，但由于访问顺序由行遍历决定且前后 sweep 更新 x，复用距离可能超过 L1，主要落在 L2/L3，甚至内存。\n3) matrixDiagonal 为 double**：每行一次指针解引用，可能导致额外 cache miss；改为连续 diag[] 可改善。\n4) 写 xv[i]：顺序写，写分配/写回开销可控；但会与后续行读取形成读后写依赖链，限制乱序隐藏延迟。",
-            "data_dependencies": [
-              "forward sweep: x[i] 依赖于同 sweep 中已更新的 x[k]（当 curCol < i 且属于下三角项时），形成 loop-carried dependency，限制并行与向量化",
-              "backward sweep: x[i] 依赖于同 sweep 中已更新的 x[k]（当 curCol > i），同样形成反向依赖链",
-              "若包含 halo：边界行依赖来自邻域进程的 x(halo)；必须在 sweep 前/中保证数据可用（或通过 interior/boundary 分离重叠）"
-            ]
-          },
-          "cost": 0.041494249999999996
-        },
-        "total_cost": 0.04980324999999999
-      }
-    },
-    "abinit": {
-      "program": "abinit",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "compute",
-      "s2_bottleneck_raw": "memory+allocation/overhead dominated compute (mixed bottleneck, not纯compute-bound)",
-      "s2_primary": "compute",
-      "ground_truth": "memory",
-      "s1_matches_gt": false,
-      "s2_matches_gt": false,
-      "changed": false,
-      "s2_reasoning": "从nonlop_ylm本体看，真正的数值核在opernla_ylm/opernlb_ylm（投影与回写）以及opernlc/opernld（小矩阵收缩/累加）。这些核本身是大量复数点积/AXPY/小GEMV，理论上偏compute；但当前实现每个(itypat, atom-block)都会ABI_MALLOC/ABI_FREE多个5维临时数组(gx/gxfac/dgxdt/...)，并频繁清零(:)=zero，且ph1d3d可能在每个block重复生成相位因子。对典型规模(npw很大、nlmn较小、nincat较小)而言：投影核的算术强度中等，而临时内存流量、分配/初始化开销、以及对ph3d(",
-      "cost": 0.13722974999999998,
-      "full_result": {
-        "code_name": "abinit",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "subroutine nonlop_ylm (line 100)",
-              "estimated_time_percentage": "70%",
-              "reason": "This subroutine contains multiple nested loops and complex operations, including calls to other subroutines like opernla_ylm and opernlb_ylm, which are likely to be computationally intensive.",
-              "confidence": "high"
-            },
-            {
-              "location": "subroutine opernla_ylm (called within nonlop_ylm)",
-              "estimated_time_percentage": "15%",
-              "reason": "This subroutine is called multiple times within nonlop_ylm and involves matrix operations that are typically compute-intensive.",
-              "confidence": "medium"
-            },
-            {
-              "location": "subroutine opernlb_ylm (called within nonlop_ylm)",
-              "estimated_time_percentage": "10%",
-              "reason": "Similar to opernla_ylm, this subroutine is called multiple times and involves matrix operations.",
-              "confidence": "medium"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "compute",
-            "reasoning": "The primary bottleneck is compute-bound due to the extensive use of matrix operations and nested loops, which are typical in high-performance computing applications."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The code involves a significant amount of matrix operations and parallelizable loops, which are well-suited for GPU acceleration.",
-            "recommended_approach": "Port the matrix operations and parallel loops to CUDA or OpenCL to leverage GPU parallelism."
-          },
-          "cost": 0.048727
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory+allocation/overhead dominated compute (mixed bottleneck, not纯compute-bound)",
-            "reasoning": "从nonlop_ylm本体看，真正的数值核在opernla_ylm/opernlb_ylm（投影与回写）以及opernlc/opernld（小矩阵收缩/累加）。这些核本身是大量复数点积/AXPY/小GEMV，理论上偏compute；但当前实现每个(itypat, atom-block)都会ABI_MALLOC/ABI_FREE多个5维临时数组(gx/gxfac/dgxdt/...)，并频繁清零(:)=zero，且ph1d3d可能在每个block重复生成相位因子。对典型规模(npw很大、nlmn较小、nincat较小)而言：投影核的算术强度中等，而临时内存流量、分配/初始化开销、以及对ph3d(in/out)的带宽访问会显著抬高“有效字节/有效FLOP”，使整体呈现为‘带宽/开销限制的计算’，热点时间会被nonlop_ylm的内存管理与数据搬运放大。另一个证据是代码已提供mv/dgemv路径(nloalg(1))，说明作者也在尝试把核变成BLAS型以提高算术强度与缓存复用；若仍慢，常见原因就是外围开销与数据布局/复用不足。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "hotspot: nonlop_ylm (≈70%) — 反复ABI_MALLOC/ABI_FREE与大数组清零",
-              "technique": "引入workspace缓存(持久化工作区) + 只初始化必要切片 + 复用已分配内存",
-              "code_changes": "1) 在module中定义可复用工作区类型(按最大nlmn、max_nincat、ndgxdt等维度一次性分配)，例如type(nonlop_ws)包含gx,gxfac,dgxdt,...以及cplex_dgxdt等；提供nonlop_ylm_ws_init(npw,nlmn_max,...)与nonlop_ylm_ws_free。\n2) 在nonlop_ylm中把每个block内的ABI_MALLOC/ABI_FREE替换为指向workspace的切片/指针，并用显式循环或where只清零实际使用范围(例如只清零1:cplex,1:nlmn,1:nincat,1:nspinor)。\n3) 对于ndgxdt==0/nd2gxdt==0的情况，不再分配对应数组(或workspace里延迟分配)，避免零尺寸ABI_MALLOC(0,0,...)带来的分支与潜在开销。\n4) 将gx/gxfac等初始化从整数组赋零改为在opernla/opernlc内部保证写满(若可证明写满)，否则仅清零需要累加的数组。",
-              "expected_speedup": "1.2×–2.0×（取决于block数=opernl_calls、以及npw与nlmn比例；小nlmn/多block时收益更大）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "hotspot: nonlop_ylm — ph1d3d相位因子重复计算与ph3d(in/out)带宽压力",
-              "technique": "相位因子缓存/增量更新 + 调整nloalg(2)策略 + 提升ph3d访问局部性",
-              "code_changes": "1) 若nloalg(2)<=0导致每个block调用ph1d3d：考虑在更外层(按k点/能带批次)预计算ph3din/ph3dout并复用，或把ph3d缓存粒度从(atom-block)提升到(itypat)甚至全natom（受matblk限制）。\n2) 若matblk不足导致必须分块：在ph1d3d内部或调用侧增加“最近一次(ia3,ia4,kg,...)”缓存，避免同一block在signs==1与signs==2路径分别对in/out重复生成（当前代码对in与out分别生成，若npwin==npwout且k点相同可共享）。\n3) 数据布局：确保ph3d维度(2,npw,matblk)中npw为内层连续访问；在opernla/opernlb中按npw顺序遍历，避免跨stride访问matblk。",
-              "expected_speedup": "1.1×–1.5×（若ph1d3d占比高可更高）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "hotspot: opernla_ylm (≈15%) — 投影 <p|c> 计算",
-              "technique": "优先使用BLAS-3/批量GEMM化（把多原子/多投影/多自旋打包）+ 向量化/复数内核优化",
-              "code_changes": "1) 尽量选择nloalg(1)=2/3/5/6使opernla_ylm_mv或mv-dgemv路径生效；并在getcpjr一致性允许下，优先mv-dgemv或进一步改为小批量GEMM：\n   - 将ffnlin_typ(npwin,dimffnlin,nlmn)在运行时重排为A(npwin, nlmn_eff)；\n   - 将vectin(2,npwin*nspinor)按自旋or能带批次打包为B(npwin, nbatch)；\n   - 计算C = A^H * B（复数GEMM），得到gx(nlmn_eff, nbatch)。\n2) 若无法GEMM化：在opernla_ylm中把复数点积改为手写SIMD友好的SoA布局（Re/Im分离已存在cplex维），并确保最内层循环是npw连续。\n3) 对istwf_k>1(cplex=1)的纯实/纯虚导数路径：用cplex_dgxdt避免分支，改为两套专用kernel(实/虚)减少if。",
-              "expected_speedup": "1.3×–3.0×（取决于是否能从GEMV提升到GEMM；GEMM化通常收益最大）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "hotspot: opernlb_ylm (≈10%) — 回写 |out> += Σ |p> * coeff",
-              "technique": "与opernla对称的批量GEMM/GER化 + 原子块融合减少对vectout的写带宽",
-              "code_changes": "1) 同样优先nloalg(1)选择mv/mv-dgemv路径；进一步将多个原子块(nincat)与多个nlmn合并为一次矩阵乘：vectout(npwout, nbatch) += ffnlout(npwout,nlmn_eff) * gxfac(nlmn_eff, nbatch)。\n2) 若vectout为复数分量(2,...)：采用两次实GEMM或使用cublasZgemm/zgmm（GPU）/zgemm（CPU）直接复数GEMM。\n3) 减少写放大：对vectout采用线程私有tile累加到L2/L3友好的缓冲，再一次性写回（CPU上可用OpenMP + reduction到块缓冲）。",
-              "expected_speedup": "1.2×–2.5×",
-              "difficulty": "hard"
-            },
-            {
-              "target": "nonlop_ylm — 分支/路径选择与小数组拷贝(sij_typ, gx_left等)",
-              "technique": "消除小拷贝与提升常量传播；减少choice/signs分支在内层出现",
-              "code_changes": "1) sij_typ：避免每block ABI_MALLOC+循环拷贝。改为对sij直接建立指针视图(若布局允许)或在itypat循环外为每种类型预打包一次。\n2) gx_left：仅choice=1,signs=1且present(cprjin_left)才需要；将该路径拆分成单独子程序，避免主路径携带额外分支与潜在编译器保守。\n3) 将choice/signs导致的ndgxdt/nd2gxdt等维度计算提前并缓存到表驱动(lookup table)，减少大量if链（虽非主耗时，但可降低指令与分支失预测）。",
-              "expected_speedup": "1.05×–1.2×（偏工程化，但能稳定降低开销）",
-              "difficulty": "easy"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "把非局域算符应用重写为两阶段GEMM（或batched GEMM）：\n(1) Projection: 对每个原子类型/原子块，计算 G = P^H * C，其中P=ffnlin(plane-wave×projector)，C=vectin(plane-wave×nbatch)。输出G对应gx/gxfac（含自旋/导数批次）。\n(2) Scatter/Add: 计算 V = P_out * (D * G) 并累加到vectout，其中D来自enl/sij收缩(opernlc)。\n导数(choice!=1)可视为增加batch维度（ndgxdt/nd2gxdt等），统一进矩阵乘的列数。\n实现上优先使用cuBLAS/cuBLASLt：Zgemm/Cgemm 或把Re/Im分离用两次Dgemm/Sgemm；对小nlmn可用cublasGemmStridedBatched。",
-            "data_layout": "1) 将ffnlin/ffnlout按( npw , nlmn_eff )连续存储（projector为快变维），并为每个itypat预打包到GPU常驻内存；避免Fortran多维切片导致的非连续。\n2) vectin/vectout采用SoA或原生复数类型统一：若继续使用(2, N)表示复数，GPU上建议转换为cuComplex/cuDoubleComplex数组以便直接调用Zgemm。\n3) gx/gxfac等中间量放GPU全局内存，但尽量融合opernlc收缩：在GPU上直接计算gxfac = D * gx（D为小矩阵，nlmn×nlmn），可用小矩阵GEMM或tensor core（若单精度可接受）。\n4) ph3d：若必须使用，建议把ph3d按(npw, nincat)打包并常驻；或在GPU上按k+G与原子位置在线生成相位（用sincos）以换取带宽（需评估）。",
-            "challenges": [
-              "vectout的跨原子块累加导致写冲突：需要按G向量分块、或为每个block生成临时out再做分层归约（block-level reduction）",
-              "数据搬运成本：ffnl与ph3d体积大，若每次调用都H2D/D2H会淹没收益；必须常驻并批处理多个band/nbatch",
-              "cpopt与多choice路径复杂：导数维度变化大，需把ndgxdt/nd2gxdt映射为统一batch维，避免大量小kernel launch",
-              "双精度复数性能：若必须Zgemm，GPU峰值较低；可考虑混合精度（投影单精度+累加双精度）但需验证物理精度"
-            ],
-            "expected_speedup": "端到端 2×–8×（取决于是否能批处理多个band、是否常驻数据、以及当前CPU是否已用高效BLAS）。若仅把单band、小batch搬到GPU且频繁传输，可能<2×甚至变慢；若实现GEMM化并把ffnl/ph3d常驻、nbatch>=16，常见可达4×–8×。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "估计 0.5–3 FLOPs/byte（强依赖实现路径与参数）。投影/回写核本质是对npw长度向量做复数点积与AXPY：每读取vectin/ffnl并做少量FMA；若使用GEMV，缓存复用差，AI偏低(~0.5–1.5)。若能把多个nlmn/原子/自旋批量GEMM化，ffnl与vectin复用显著提升，AI可到~2–3甚至更高（受npw与batch大小影响）。外围的临时数组清零与分配几乎是0 FLOP但大量字节，进一步拉低整体有效AI。",
-            "cache_behavior": "1) 主要流量：vectin(2,npwin*nspinor)、vectout(2,npwout*...)、ph3d(2,npw,matblk)、ffnlin/ffnlout(npw,*,nlmn,ntypat)。npw通常很大，工作集远超LLC，呈流式访问。\n2) ffnlin/ffnlout在nlmn与nincat维度上有复用潜力，但当前按原子块逐次调用且可能走GEMV，导致对ffnl的复用不足；若改为GEMM批处理，可把ffnl驻留在L2/L3并复用。\n3) gx/gxfac/dgxdt等临时数组体积相对小(nlmn*nincat*nspinor)，应驻留cache；但反复分配/清零会触发写分配(write-allocate)与cache污染。\n4) ph3d的matblk维度可能导致stride访问：若内核遍历顺序不当，会出现跨cache line跳跃，降低带宽利用率。\n5) NUMA：若workspace不固定绑定线程/进程，反复malloc可能导致跨NUMA页，带宽下降；持久化workspace + first-touch并行初始化可改善。",
-            "data_dependencies": [
-              "vectout/svectout 在 signs==2 路径为跨原子块累加（+=），存在写后读/写后写依赖；需要通过原子块私有缓冲或按G分块避免线程竞争",
-              "enlout/enlk/fnlk/strnlk 在 signs==1 路径为归约累加，存在归约依赖；MPI与OpenMP需reduction/分层归约",
-              "cpopt>=2/4 时从 cprjin 读取 gx/dgxdt，依赖于上一次存储的投影结果与导数布局(ishift逻辑)，错误的并行切分会破坏一致性"
-            ]
-          },
-          "cost": 0.08850274999999999
-        },
-        "total_cost": 0.13722974999999998
-      }
-    },
-    "hotspot": {
-      "program": "hotspot",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "compute",
-      "s2_bottleneck_raw": "memory-bandwidth + control-divergence (branch-heavy stencil), not pure compute-bound",
-      "s2_primary": "compute",
-      "ground_truth": "memory",
-      "s1_matches_gt": false,
-      "s2_matches_gt": false,
-      "changed": false,
-      "s2_reasoning": "虽然表面是 5-point stencil 的“算术密集”更新，但对每个网格点需要读取 temp 的中心+四邻域(典型 interior 为 5 次 load)以及 power(1 次 load)，并写回 result(1 次 store)。每次迭代对 512x512 网格重复该访问，数据复用主要来自相邻点共享邻域，但在当前实现中没有显式 blocking/向量化，且大量 if/else 边界分支在内层循环中导致分支预测失败与指令流水受阻。对现代 CPU 来说，该类 stencil 通常受内存带宽/缓存层次与指令效率限制（尤其是双精度、每点字节流量高），而不是受峰值 FLOPs 限制。边界点占",
-      "cost": 0.052036250000000006,
-      "full_result": {
-        "code_name": "hotspot",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "compute_tran_temp() - inner loop at line 66",
-              "estimated_time_percentage": "85%",
-              "reason": "This loop performs the main 2D stencil computation, which is the core of the thermal simulation and involves multiple arithmetic operations per grid cell.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "compute",
-            "reasoning": "The primary bottleneck is compute-bound due to the intensive arithmetic operations required for the 5-point stencil computation across a large grid."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The computation involves regular grid updates with a 5-point stencil, which is highly parallelizable and suitable for GPU execution.",
-            "recommended_approach": "Use CUDA or OpenCL to implement the stencil computation on the GPU. Each thread can handle the update of a single grid cell, taking advantage of the GPU's massive parallelism."
-          },
-          "cost": 0.01125775
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory-bandwidth + control-divergence (branch-heavy stencil), not pure compute-bound",
-            "reasoning": "虽然表面是 5-point stencil 的“算术密集”更新，但对每个网格点需要读取 temp 的中心+四邻域(典型 interior 为 5 次 load)以及 power(1 次 load)，并写回 result(1 次 store)。每次迭代对 512x512 网格重复该访问，数据复用主要来自相邻点共享邻域，但在当前实现中没有显式 blocking/向量化，且大量 if/else 边界分支在内层循环中导致分支预测失败与指令流水受阻。对现代 CPU 来说，该类 stencil 通常受内存带宽/缓存层次与指令效率限制（尤其是双精度、每点字节流量高），而不是受峰值 FLOPs 限制。边界点占比小，但分支在每个点都执行判断，造成额外开销与阻碍编译器自动向量化。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "compute_tran_temp(): 消除内层分支，恢复向量化与流水效率",
-              "technique": "边界与内部区域分离（split interior/boundary loops）+ 仅对边界做特殊处理",
-              "code_changes": "将双重循环拆成三部分：1) 先计算 interior: for(i=1..row-2) for(j=1..col-2) 使用统一公式；2) 单独处理四条边（不含角）；3) 单独处理四个角。并把 idx=i*col+j、center=temp[idx] 等提取为局部变量，减少重复地址计算。\n示例（核心 interior）：\nfor (int i=1;i<row-1;i++) {\n  int base=i*col;\n  for (int j=1;j<col-1;j++) {\n    int idx=base+j;\n    double c=temp[idx];\n    double delta = stepCap*(power[idx]\n      + (temp[idx+1]+temp[idx-1]-2.0*c)*Rx_1\n      + (temp[idx+col]+temp[idx-col]-2.0*c)*Ry_1\n      + (amb_temp-c)*Rz_1);\n    result[idx]=c+delta;\n  }\n}\n其中 stepCap = step/Cap 预先计算。",
-              "expected_speedup": "1.2x–2.0x（取决于编译器是否因此成功自动向量化，以及分支/地址计算占比）",
+              "target": "kernel_gramschmidt line 73: Q[i][k] = A[i][k] / R[k][k] (归一化热点)",
+              "technique": "用乘法替代除法(预计算倒数) + SIMD；减少对 R[k][k] 的重复加载",
+              "code_changes": "```cpp\nDATA_TYPE inv = (DATA_TYPE)1.0 / R[k][k];\nDATA_TYPE * __restrict Qk = &Q[0][k];\nDATA_TYPE * __restrict Ak = &A[0][k];\n#pragma omp simd\nfor (int i=0;i<_PB_M;i++)\n  Qk[i*_PB_N] = Ak[i*_PB_N] * inv;\n```\n（保持 stride=N 的列访问；若可改变布局见后续 data_layout 建议。）",
+              "expected_speedup": "1.1x-1.5x（该段）；端到端 1.02x-1.1x",
               "difficulty": "easy"
             },
             {
-              "target": "compute_tran_temp(): 提升 SIMD 向量化与减少标量开销",
-              "technique": "显式向量化友好写法 + 编译指示/对齐 + restrict",
-              "code_changes": "1) 将指针声明为 restrict（C++ 用编译器扩展或改为 C 风格）：\nvoid compute_tran_temp(..., double* __restrict temp, double* __restrict power, double* __restrict result,...)\n2) 确保 64B 对齐分配（posix_memalign/aligned_alloc），并在循环前加编译器提示：\n#pragma omp simd\n或 #pragma GCC ivdep（在 interior loop 上）。\n3) 预计算常量：stepCap=step/Cap；cRx=stepCap*Rx_1；cRy=stepCap*Ry_1；cRz=stepCap*Rz_1；并重写为 FMA 友好形式。\n4) 将 i*col 提前为 base，减少 IMUL/LEA 压力。",
-              "expected_speedup": "1.1x–1.6x（若原本未向量化，可能更高；若已向量化则偏低）",
+              "target": "kernel_gramschmidt line 77: R[k][j] += Q[i][k] * A[i][j] (点积热点，占比高)",
+              "technique": "j 维并行 + i 维 SIMD reduction；块化(j-block)以复用 Q[:,k]；可选：用 GEMV/GEMM 形式调用 BLAS",
+              "code_changes": "方案A（纯代码，块化+并行）：\n```cpp\nconst int JB = 32; // 依据缓存/寄存器调\nfor (int j0=k+1; j0<_PB_N; j0+=JB){\n  int j1 = (j0+JB<_PB_N)? j0+JB : _PB_N;\n  // 初始化 R[k][j]\n  for(int j=j0;j<j1;j++) R[k][j]=0;\n  for (int i=0;i<_PB_M;i++){\n    DATA_TYPE q = Q[i][k];\n    #pragma omp simd\n    for(int j=j0;j<j1;j++)\n      R[k][j] += q * A[i][j];\n  }\n}\n```\n方案B（BLAS）：把 A 的子矩阵 A[:,k+1:] 视为 (m x (n-k-1))，计算 r = Q[:,k]^T * A_sub，可用 cblas_dgemv 或 dgemm(1 x m) * (m x nb)。",
+              "expected_speedup": "1.5x-4x（该段）；端到端 1.2x-2.5x（取决于是否多核并行与块大小）",
               "difficulty": "medium"
             },
             {
-              "target": "compute_tran_temp(): 改善缓存复用与带宽效率",
-              "technique": "二维分块（cache blocking / tiling）+ 行滑窗（3-row sliding window）",
-              "code_changes": "对 interior 做 tile，例如 Ti=32, Tj=256（按 L1/L2 调参），外层按块遍历：\nfor(ii=1; ii<row-1; ii+=Ti)\n for(jj=1; jj<col-1; jj+=Tj)\n  for(i=ii; i<min(ii+Ti,row-1); ++i)\n   for(j=jj; j<min(jj+Tj,col-1); ++j) ...\n同时可用 3 行指针缓存：rowm=temp+(i-1)*col, row0=temp+i*col, rowp=temp+(i+1)*col，减少重复 base 计算并提升预取效果。",
-              "expected_speedup": "1.1x–1.4x（在大网格/多迭代、带宽受限平台更明显）",
+              "target": "kernel_gramschmidt lines 80-85: A[i][j] = A[i][j] - Q[i][k] * R[k][j] (更新热点)",
+              "technique": "与点积融合的块化(同一 i 上同时做 R 累加与 A 更新需两遍；可用两阶段但共享块驻留)；或采用两遍但对 A_sub 做 cache blocking；多核并行按 j-block 分块",
+              "code_changes": "推荐与上一个热点配套的 j-block，并在得到 R[k][j] 后对同一块做更新：\n```cpp\nfor (int j0=k+1; j0<_PB_N; j0+=JB){\n  int j1 = min(j0+JB,_PB_N);\n  // 1) 计算 R[k][j0:j1)\n  for(int j=j0;j<j1;j++) R[k][j]=0;\n  for(int i=0;i<_PB_M;i++){\n    DATA_TYPE q = Q[i][k];\n    #pragma omp simd\n    for(int j=j0;j<j1;j++) R[k][j] += q * A[i][j];\n  }\n  // 2) 更新 A[:,j0:j1)\n  for(int i=0;i<_PB_M;i++){\n    DATA_TYPE q = Q[i][k];\n    #pragma omp simd\n    for(int j=j0;j<j1;j++) A[i][j] -= q * R[k][j];\n  }\n}\n```\n并行：\n```cpp\n#pragma omp parallel for schedule(static)\nfor (int j0=...)\n  ... // 每个线程处理不同 j-block\n```\n注意：k 循环仍串行，但每个 k 内 j-block 可并行。",
+              "expected_speedup": "1.3x-3x（该段）；端到端 1.2x-2.2x",
               "difficulty": "medium"
             },
             {
-              "target": "compute_tran_temp(): 多核并行扩展",
-              "technique": "OpenMP 并行 for（按行或按 tile）+ NUMA first-touch",
-              "code_changes": "在每次迭代的 i 循环外加：\n#pragma omp parallel for schedule(static)\nfor (int i=1; i<row-1; ++i) { ... }\n边界处理可在单线程或并行处理。\n并在初始化 temp/power/result 时用并行 first-touch：\n#pragma omp parallel for\nfor(i=0;i<total_cells;i++){...}\n以保证 NUMA 本地性。",
-              "expected_speedup": "接近内存带宽上限：典型 4–16 核可达 3x–10x（取决于平台带宽与线程数；若已带宽饱和则收益递减）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "整体：降低内存流量/提高吞吐",
-              "technique": "精度降级（double->float）或混合精度（若误差允许）",
-              "code_changes": "将 temp/power/result 改为 float，常量用 float，计算用 float 或关键路径用 float+累积用 double（混合）。需要验证数值稳定性与误差界。\n例如：\nvoid compute_tran_temp(..., float* temp, float* power, float* result, ...)\n并将 Rx_1 等改为 float。",
-              "expected_speedup": "1.5x–2.5x（CPU：带宽减半+SIMD 宽度翻倍潜力；GPU：吞吐提升更明显）",
+              "target": "整体：改善内存局部性与向量化效率（列访问 stride=N 导致缓存/预取不友好）",
+              "technique": "数据布局变换：改为列主序存储或显式转置/分块存储；或使用 SoA/面向列的连续存储以提升带宽利用率",
+              "code_changes": "方案A（推荐，结构性改动）：将 A/Q 定义为列主序(或存为 Acol[k][i])：\n```cpp\n// 逻辑：Acol[k*m + i] 表示 A[i][k]\nDATA_TYPE* Acol = aligned_alloc(..., m*n*sizeof(DATA_TYPE));\n#define A(i,j) Acol[(j)*m + (i)]\n```\n然后所有对 A[:,k]、Q[:,k] 的访问变为连续(i 连续)，SIMD/预取效率显著提升。\n方案B（折中）：每次 k 处理前把 A[:,k] 拷贝到连续缓冲(小向量)用于 nrm/Q；对 A_sub 仍行主序处理 j-block。",
+              "expected_speedup": "端到端 1.3x-3.5x（取决于尺寸与平台；对大 N 的 stride 访问改善明显）",
               "difficulty": "hard"
             }
           ],
           "gpu_implementation": {
             "suitable": true,
-            "strategy": "Jacobi 迭代的 2D stencil：每个线程负责一个网格点 (i,j)，读取 temp 的 5 点邻域与 power，写 result。每次迭代后交换 temp/result 指针。使用 2D grid/block（如 blockDim=(32,8) 或 (16,16)）以保证全局内存合并访问；对 interior 使用共享内存 tile + halo（每个 block 加载 (Bx+2)x(By+2) 的 temp 到 shared），减少全局读带宽；边界用单独 kernel 或在 kernel 内用条件分支但尽量让大多数线程走同一路径（例如只对 interior launch 主 kernel，边界另起小 kernel）。",
-            "data_layout": "保持行主序一维数组（SoA 已满足）。建议：\n1) temp/power/result 使用连续、对齐分配（cudaMalloc 默认对齐足够）；\n2) pitch（cudaMallocPitch）可改善跨行对齐与合并；\n3) 若使用 shared tile，按 [y][x] 存放并避免 bank conflict（必要时 padding）。",
+            "strategy": "保持 k 串行(或小范围 look-ahead)，在每个 k 内把两大操作搬到 GPU：\n1) nrm: 对 A[:,k] 做并行归约；\n2) Q[:,k]: 并行缩放；\n3) r = Q[:,k]^T * A[:,k+1:]: 用 GEMV/GEMM（1xm 乘 mx(n-k-1)）；\n4) A[:,k+1:] -= Q[:,k] * r: 用 GER/外积更新（rank-1 update）。\n实现上可用 cuBLAS：nrm2 + scal/copy + gemv(或 gemm) + ger；或用自定义 kernel 融合 gemv+update 以减少对 A_sub 的两遍读写。",
+            "data_layout": "GPU 侧建议列主序以直接调用 cuBLAS（Fortran/col-major 语义）：A、Q 按 leading dimension = m 存储，使 A[:,k] 连续；R 按 n*n 存储。若 CPU 侧仍行主序，可在初始化后一次性转置/重排到 GPU 友好布局，避免每步转置。",
             "challenges": [
-              "内存带宽主导：算术强度低，需依赖 shared memory/缓存与合并访问来接近带宽上限",
-              "边界分支导致 warp divergence：建议 interior/edge 分 kernel 或使用掩码但让大多数 warp 处于 interior",
-              "迭代次数多时 kernel launch 开销与同步：可用 CUDA Graphs 或在一个 kernel 内做多步 time-tiling（但会增加寄存器/共享内存压力且需要处理 halo 交换）",
-              "双精度吞吐限制：消费级 GPU FP64 速率低，若必须 double 可能受 FP64 吞吐影响；若允许 float/混合精度可显著提速"
+              "k 维串行导致 kernel launch 频繁、同步开销显著：需要用 cuBLAS batched/stream、CUDA Graph 或融合 kernel 降低 launch/sync",
+              "数值稳定性与可重复性：并行归约导致舍入差异；需要确定容忍度或使用更稳定的归约(Kahan/树归约)；Modified Gram-Schmidt 本身对病态矩阵仍可能不稳",
+              "A_sub 的读-改-写带宽压力大：若不融合，gemv + ger 会对 A_sub 产生两次遍历；融合可降为一次读一次写但实现复杂",
+              "R 的写入与后续使用在 GPU 上很小但需要同步点：可将 R 保持在 GPU，最后一次性拷回"
             ],
-            "expected_speedup": "相对单核 CPU：20x–100x；相对已优化的多核 CPU（带宽饱和）：3x–15x（取决于 FP64 性能、内存带宽、是否使用 shared tile、以及是否可用 float/混合精度）"
+            "expected_speedup": "相对单核 CPU：5x-30x（取决于 m,n 与 GPU/CPU 带宽比、是否用 cuBLAS、是否融合减少 A_sub 遍历）；相对多核优化后 CPU：2x-10x"
           },
           "performance_analysis": {
-            "arithmetic_intensity": "≈ 0.25–0.35 FLOPs/byte（interior 点，double）",
-            "cache_behavior": "访问模式为行主序连续访问 result/power/temp(center, east, west)；north/south 为跨行访问但仍是固定 stride=col。对 interior 来说，相邻 j 共享大量数据（例如 temp[idx+1] 会成为下一次迭代的 center），硬件预取可覆盖顺序流。主要问题：1) 当前实现每点执行多重分支判断，破坏指令流与向量化；2) 未分块时，工作集为 3 行 temp + 1 行 power + 1 行 result（流式写），总体对 L1/L2 友好，但多线程时会更快触及内存带宽上限；3) result 为写分配（write-allocate）可能引入 RFO 读流量，建议使用 non-temporal store（在大尺寸、带宽受限且不复用 result 的场景）或确保 result 很快成为下一迭代的 temp（当前 swap 会复用，因此是否 NT store 需权衡）。",
+            "arithmetic_intensity": "约 0.10 ~ 0.20 FLOPs/byte（double，未计 sqrt/div 的特殊函数开销；主导项为对 A_sub 的点积+更新：每个 A[i][j] 在每个 k 约 4 FLOPs(2用于点积累计+2用于更新)且至少产生 ~24B 流量(点积读8B + 更新读8B+写8B)，AI≈4/24≈0.167；考虑 Q 读与 R 读写、缓存未命中与写分配，实际更低)",
+            "cache_behavior": "1) 行主序下访问 A[i][k]、Q[i][k] 为 stride=N 的列访问：当 N 较大时跨 cache line 跳跃，硬件预取效果差，L1/L2 命中率低。\n2) 对 A[i][j] 的内层 j 循环(若采用 j-block)可形成连续访问，显著提升 L1/L2 命中与带宽利用。\n3) R[k][j] 为小向量，易驻留在 L1/L2；Q[:,k] 若为列主序可连续驻留/流式读取，否则同样 stride 访问。\n4) 写 A[i][j] 存在写分配(RFO)开销；若平台支持可考虑 non-temporal store 仅在确定不会很快重用时使用，但本算法 A 会在后续 k 重用，通常不建议对 A 用 NT store。",
             "data_dependencies": [
-              "时间步依赖：第 k+1 次迭代读取第 k 次迭代写出的 temp/result（通过指针 swap），迭代间存在严格顺序依赖",
-              "空间依赖：同一迭代内每个 cell 只读旧 temp 邻域并写 result[idx]，不同 cell 之间无写后读/写后写冲突（典型 Jacobi stencil），可并行",
-              "边界条件依赖：边界点使用 amb_temp 与缺失邻居的特殊公式，逻辑依赖导致分支/掩码处理需求"
+              "外层 k 串行依赖：A[:,j] 在第 k 步被更新后，才能用于后续 k+1 的 nrm/投影计算（true dependence across k）",
+              "同一 k 内：R[k][j] 依赖对 i 的归约(点积 reduction)，完成后才能用于 A[:,j] 更新（reduction + producer-consumer）",
+              "Q[:,k] 依赖 R[k][k]（先求范数再归一化），且后续所有 j>k 的计算都依赖 Q[:,k]"
             ]
           },
-          "cost": 0.0407785
+          "cost": 0.04531625,
+          "bottleneck_raw": "memory_bandwidth + low_reuse_streaming (with unavoidable k-serial dependency)"
         },
-        "total_cost": 0.052036250000000006
-      }
-    },
-    "srad": {
-      "program": "srad",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "compute",
-      "s2_bottleneck_raw": "memory-bandwidth + cache/traffic (with secondary compute pressure from divisions)",
-      "s2_primary": "compute",
-      "ground_truth": "memory",
-      "s1_matches_gt": false,
-      "s2_matches_gt": false,
-      "changed": false,
-      "s2_reasoning": "虽然单点计算包含较多乘加/除法（且注释提到 exp，但当前代码实际未调用 exp），但实现方式引入了巨大的内存流量：Phase 1 写 dN/dS/dW/dE/c 五个整幅数组，Phase 2 再读回 d* 与 c 并更新 image。对 2048^2 双精度，单次迭代仅这些数组的读写就达到数百 MB 级别（且 niter=100），远超典型 CPU 缓存容量，导致频繁的 DRAM 访问与写分配(RFO)。此外 Phase 1/2 分离使得 d* 无法在寄存器中复用，增加了往返内存的流量；边界分支与除法也会降低向量化效率，但总体更像是“流量主导 + 计算次要”的 Roofline 形态。若改为",
-      "cost": 0.053828249999999994,
-      "full_result": {
-        "code_name": "srad",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
-              "estimated_time_percentage": "45%",
-              "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls.",
-              "confidence": "high"
-            },
-            {
-              "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
-              "estimated_time_percentage": "33%",
-              "reason": "Involves divergence computation and image update, which are computationally intensive.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "compute",
-            "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The algorithm has a regular grid access pattern and each element's computation is independent per iteration, making it well-suited for parallel execution on a GPU.",
-            "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using a grid of threads where each thread computes the diffusion for a single pixel."
-          },
-          "cost": 0.011110749999999999
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
         },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory-bandwidth + cache/traffic (with secondary compute pressure from divisions)",
-            "reasoning": "虽然单点计算包含较多乘加/除法（且注释提到 exp，但当前代码实际未调用 exp），但实现方式引入了巨大的内存流量：Phase 1 写 dN/dS/dW/dE/c 五个整幅数组，Phase 2 再读回 d* 与 c 并更新 image。对 2048^2 双精度，单次迭代仅这些数组的读写就达到数百 MB 级别（且 niter=100），远超典型 CPU 缓存容量，导致频繁的 DRAM 访问与写分配(RFO)。此外 Phase 1/2 分离使得 d* 无法在寄存器中复用，增加了往返内存的流量；边界分支与除法也会降低向量化效率，但总体更像是“流量主导 + 计算次要”的 Roofline 形态。若改为融合/分块并减少中间数组，算术强度会显著上升，性能会更接近 compute-bound。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "热点 Phase 1+2：消除 dN/dS/dW/dE 中间数组（内存流量）",
-              "technique": "kernel fusion（融合两阶段）+ on-the-fly 计算梯度/散度；仅保留 c 或直接使用邻域 c",
-              "code_changes": "将 Phase 1 与 Phase 2 合并为一次遍历：对每个 idx 计算 dN/dS/dW/dE、c(idx)，并立即形成 D 更新 image。为获得 cS/cE（来自南/东邻居），可采用两种方式：A) 两遍但不存 d*：第一遍只算 c 写回；第二遍重新计算 d* 并用 c 邻域更新（仍比原实现少 4 个大数组）。B) 分块(tile)计算：对一个 tile 先算并缓存 tile 内 c 到小缓冲（L1/栈/临时数组），再在 tile 内完成更新，避免全局 d* 数组。示例（两遍方案，删除 dN/dS/dW/dE 分配与写入）：\n- 删除 dN/dS/dW/dE malloc/free\n- Phase1: 仅计算 c[idx]\n- Phase2: 重新计算 dN/dS/dW/dE（局部变量）并计算 D\n并在 Phase2 中用局部变量替代 dN[idx] 等数组访问。",
-              "expected_speedup": "CPU 端常见 1.5x–3.0x（取决于内存带宽与编译器向量化）；若采用 tile 融合并减少到仅 c+image 两数组往返，可能 2.0x–4.0x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "热点 Phase 1：减少除法/提高向量化（compute + latency）",
-              "technique": "代数化简 + reciprocal 近似/向量化友好写法 + FMA",
-              "code_changes": "将重复的 image[idx] 值提取为 invI / invI2：\n- double I = image[idx]; double invI = 1.0/I; double invI2 = invI*invI;\n- G2 = (dN*dN + dS*dS + dW*dW + dE*dE) * invI2;\n- L  = (dN + dS + dW + dE) * invI;\n将 den=(1+0.25L)^2 写成 t=1+0.25L; den=t*t；并用 fma（编译器 -ffp-contract=fast 或显式 fma）减少指令数。若允许轻微精度变化，可用 -Ofast/-ffast-math 或 SVML 向量除法/倒数近似（需验证数值稳定性）。",
-              "expected_speedup": "1.1x–1.4x（单核/向量化受限时更明显；与融合/分块叠加）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "热点 Phase 1/2：边界分支与索引开销",
-              "technique": "边界剥离（interior/border split）+ 预计算行指针/索引",
-              "code_changes": "将循环拆成：\n1) interior: for i=1..rows-2, j=1..cols-2，无需 iN/iS/jW/jE 条件分支，直接 idx±1/±cols。\n2) 单独处理四条边与四个角。\n同时在内层使用行基址：int base=i*cols; idx=base+j; north=idx-cols; south=idx+cols; west=idx-1; east=idx+1。\n这会显著改善编译器自动向量化与分支预测。",
-              "expected_speedup": "1.1x–1.3x（常与向量化一起带来更大收益）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "热点 Phase 1/2：提升缓存命中与带宽利用",
-              "technique": "空间分块/循环交换 + NUMA/大页 + 对齐与restrict",
-              "code_changes": "对 i/j 做 tile（如 64x64 或按 LLC/带宽调参），使 image/c 的工作集更贴近缓存；为指针添加 restrict（C99）或在 C++ 用 __restrict__：\nvoid srad_kernel(double* __restrict image, ...)\n并用 aligned_alloc/posix_memalign 64B 对齐；在多线程下 first-touch 初始化以匹配 NUMA；可选启用 hugepages 减少 TLB miss。",
-              "expected_speedup": "1.1x–1.6x（取决于平台内存层次与线程数）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "全局：利用多核并行",
-              "technique": "OpenMP 并行 for + 合理调度 + 线程绑定",
-              "code_changes": "在 Phase1/Phase2（或融合后的循环）外层加：\n#pragma omp parallel for collapse(2) schedule(static)\n并设置 OMP_PROC_BIND=close, OMP_PLACES=cores；若采用两遍方案，确保每遍独立并行。注意避免在并行区内频繁 malloc/free（当前已在外部）。",
-              "expected_speedup": "接近内存带宽上限：8 核常见 4x–7x；32 核可能 8x–15x（受带宽限制）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "数据精度与吞吐（若允许）",
-              "technique": "double->float 或 mixed precision（关键统计保持 double）",
-              "code_changes": "将 image/c 及中间计算改为 float（或 image float、统计 double），q0sqr 用 double 计算后转 float；需要验证收敛与输出误差。GPU 上尤其关键（FP64 吞吐通常远低于 FP32）。",
-              "expected_speedup": "CPU 端 1.2x–2.0x；GPU 端可能 2x–8x（取决于 FP64/FP32 比率）",
-              "difficulty": "hard"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "以像素为粒度的 2D 网格并行。推荐每次迭代使用两个 kernel（或一个融合 kernel + 双缓冲）：Kernel1 计算 c（或直接计算更新项），Kernel2 计算散度并写回 image_out。为避免读写同一 image 导致的潜在读后写问题与简化实现，使用 ping-pong：image_in -> image_out，每迭代交换指针。对 interior 与 border 分开处理或在 kernel 内用 clamp（但尽量减少分支）。使用 shared memory tile 缓存 image_in 的 (BLOCK_X+2)x(BLOCK_Y+2) halo，以减少全局内存访问并提升带宽利用；c 若单独存储，也可按 tile 缓存。",
-            "data_layout": "使用线性 row-major（当前即是），确保 cudaMalloc 对齐；优先使用 float（若精度允许）以提升吞吐与带宽效率。将 cols 作为 leading dimension，保证 j 方向线程连续访问实现全合并(coalesced)加载。若保留 c，单独数组 c 与 image 分离（SoA）即可；避免 dN/dS/dW/dE 全局数组，改为寄存器/共享内存内计算。",
-            "challenges": [
-              "FP64 性能：许多 GPU 的双精度吞吐显著低于单精度，可能使 kernel 变为 compute-bound；可考虑 mixed precision 或使用支持强 FP64 的数据中心 GPU",
-              "迭代次数多（NITER=100）：kernel launch 开销与全局内存往返累积明显；可用 CUDA Graphs/持久化 kernel 或在一个 kernel 内做多步迭代（但需要同步与共享内存重载，复杂度上升）",
-              "边界处理与分支发散：clamp 边界会导致 warp 分歧；建议单独 kernel 处理边界或在主 kernel 仅处理 interior",
-              "数值稳定性：使用 fast-math/倒数近似或 float 可能改变收敛与统计量，需要回归测试"
-            ],
-            "expected_speedup": "相对单核 CPU：20x–150x（取决于 GPU/精度/带宽）；相对多核优化后 CPU：3x–20x。若保持 double 且 GPU FP64 弱，可能仅 2x–8x；若用 float+tile+融合，常见 10x–30x（相对多核 CPU）"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "≈0.3–0.8 FLOPs/byte（原实现，DRAM 口径；融合/去 d* 后可提升到 ≈1–3 FLOPs/byte）",
-            "cache_behavior": "工作集：image(32MB) + c(32MB) + dN/dS/dW/dE(4*32MB)=192MB（不含其他），远超 LLC（常见 20–60MB），导致流式访问为主。Phase1 对 d* 的写入触发写分配(RFO)与回写，带来额外读流量；Phase2 再次读取 d* 与 c，形成两次大规模内存往返。访问模式在 j 方向连续（较好预取），但 i 方向跨行访问 north/south 会带来额外 cache line 触碰；边界分支破坏向量化。TLB 压力较大（多数组并行流式），大页可缓解。若采用两遍仅存 c 或 tile 融合，可显著减少 DRAM 流量并提高 L1/L2 复用。",
-            "data_dependencies": [
-              "迭代间依赖：第 k+1 次迭代读取第 k 次更新后的 image（时间步依赖，无法跨迭代并行）",
-              "空间依赖：每个像素更新依赖其 N/S/E/W 邻域的 image（用于梯度）以及邻域的 c（用于散度）；但在同一迭代内可并行，因为读取的是旧 image（若采用双缓冲）或在当前实现中 Phase2 只写 image[idx]，读取邻域不写邻域",
-              "Phase 依赖：Phase2 依赖 Phase1 产生的 c（以及当前实现的 d*）；这是可通过融合/重算消除的存储依赖"
-            ]
-          },
-          "cost": 0.0427175
-        },
-        "total_cost": 0.053828249999999994
-      }
-    },
-    "lulesh": {
-      "program": "lulesh",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "compute",
-      "s2_bottleneck_raw": "mixed (compute + memory/irregular scatter), overall limited by scatter/atomics when parallelized; single-thread baseline appears compute-heavy",
-      "s2_primary": "compute",
-      "ground_truth": "memory",
-      "s1_matches_gt": false,
-      "s2_matches_gt": false,
-      "changed": false,
-      "s2_reasoning": "从源代码看，CalcFBHourglassForceForElems() 的每个单元包含 4 个 hourglass mode，每个 mode 对 8 个节点做 3 个方向的点积与回写，FLOPs 很多；但真正限制可扩展性的关键在最后对 fx/fy/fz 的 scatter 累加：同一节点被多个单元共享（3D 规则网格内部节点最多 8 个单元贡献），在 OpenMP/GPU 上会产生写冲突，需要原子/着色/分阶段归约，导致吞吐下降并使瓶颈从纯 compute 转向“irregular memory + synchronization”。CalcKinematicsForElems() 主要是间",
-      "cost": 0.067627,
-      "full_result": {
-        "code_name": "lulesh",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "CalcFBHourglassForceForElems()",
-              "estimated_time_percentage": "45%",
-              "reason": "This function is the primary hotspot due to its arithmetic-intensive operations involving multiple loops and indirect memory accesses.",
-              "confidence": "high"
-            },
-            {
-              "location": "CalcKinematicsForElems()",
-              "estimated_time_percentage": "25%",
-              "reason": "This function is a secondary hotspot due to the indirect memory accesses and arithmetic operations required for each element.",
-              "confidence": "high"
-            },
-            {
-              "location": "CalcPressureForElems()",
-              "estimated_time_percentage": "10%",
-              "reason": "This function involves arithmetic operations for each element, contributing to a smaller but significant portion of the execution time.",
-              "confidence": "medium"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "compute",
-            "reasoning": "The primary bottleneck is compute-bound due to the heavy floating-point arithmetic operations per element, especially in the CalcFBHourglassForceForElems function."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The code is suitable for GPU acceleration due to its element-parallel nature, although care must be taken with the gather/scatter patterns on nodes.",
-            "recommended_approach": "Port the element-wise computations to GPU kernels, ensuring coalesced memory accesses and using shared memory to handle gather/scatter operations efficiently."
-          },
-          "cost": 0.016147250000000002
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "mixed (compute + memory/irregular scatter), overall limited by scatter/atomics when parallelized; single-thread baseline appears compute-heavy",
-            "reasoning": "从源代码看，CalcFBHourglassForceForElems() 的每个单元包含 4 个 hourglass mode，每个 mode 对 8 个节点做 3 个方向的点积与回写，FLOPs 很多；但真正限制可扩展性的关键在最后对 fx/fy/fz 的 scatter 累加：同一节点被多个单元共享（3D 规则网格内部节点最多 8 个单元贡献），在 OpenMP/GPU 上会产生写冲突，需要原子/着色/分阶段归约，导致吞吐下降并使瓶颈从纯 compute 转向“irregular memory + synchronization”。CalcKinematicsForElems() 主要是间接 gather（nodelist）+ 大量标量运算，缓存命中依赖网格局部性；CalcPressureForElems() 轻量且含分支，通常不是主瓶颈。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "CalcFBHourglassForceForElems: 减少重复计算与提升向量化(FMA/AVX)",
-              "technique": "hoist invariants + 手工展开/向量化 + 常量gamma用int8/bitmask表示 + FMA",
-              "code_changes": "1) 将 hgcoef 移到 mode 循环外（当前每个 mode 重算一次）：\n```cpp\nconst double volume = elemMass[i] / ss[i];\nconst double volinv = 1.0 / (volume + 1e-20);\nconst double hgcoef = HGCOEF * ss[i] * elemMass[i] * volinv;\nfor (int mode=0; mode<4; ++mode) { ... }\n```\n2) 将 gamma[mode][n] 由 double 常量改为 int8_t (+1/-1)，并用加减替代乘法：\n```cpp\nstatic const int8_t g[4][8] = {{1,1,-1,-1,-1,-1,1,1}, ...};\n// hourmodx += xd_local[n] * g -> if(g>0) hourmodx += xd_local[n]; else hourmodx -= xd_local[n];\n```\n3) 展开 n=0..7 的点积与回写，帮助编译器生成 SIMD/FMA；或用编译指示：\n```cpp\n#pragma omp simd reduction(+:hourmodx,hourmody,hourmodz)\nfor(int n=0;n<8;n++) { ... }\n```\n4) 将 xd/yd/zd 改为 AoSoA(见下条)后，用 AVX2/AVX-512 一次处理多个 element（结构化网格可按 i 连续元素批处理）。",
-              "expected_speedup": "单核/单线程 1.2x–1.6x；多核在无冲突版本下可到 1.3x–2.0x（取决于编译器SIMD质量）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "CalcFBHourglassForceForElems: 解决 scatter 写冲突以提升多核/GPU可扩展性",
-              "technique": "两阶段归约（element->node）/图着色/节点私有缓冲 + reduce",
-              "code_changes": "方案A（CPU OpenMP）：按线程私有节点力数组再归约（内存大但简单）：\n```cpp\n#pragma omp parallel\n{\n  std::vector<double> fx_priv(NUM_NODES,0.0), fy_priv(...), fz_priv(...);\n  #pragma omp for\n  for(i=0;i<numElem;i++){ ... fx_priv[gn]+=hgfx[n]; ... }\n  #pragma omp for\n  for(int n=0;n<NUM_NODES;n++) { fx[n]+=fx_priv[n]; fy[n]+=...; fz[n]+=...; }\n}\n```\n方案B（更省内存）：对元素做 8-coloring（规则六面体网格可预计算 8 色，使同色元素不共享节点），同色内无冲突直接写：\n```cpp\nfor(color=0;color<8;color++){\n  #pragma omp parallel for\n  for(i : elems_of_color[color]) { ... fx[gn]+=...; }\n}\n```\n方案C（GPU）：避免全局原子，改为“节点并行”核函数：每个 node 线程遍历其相邻元素（最多8个）并累加，完全无原子；需要 node->elem 邻接表（CSR）。",
-              "expected_speedup": "CPU 多核：相对 naive 原子/锁 2x–6x（取决于线程数与冲突率）；GPU：相对全局原子版本 1.5x–4x",
-              "difficulty": "hard"
-            },
-            {
-              "target": "CalcKinematicsForElems: 降低间接访存开销与提升缓存命中",
-              "technique": "结构化网格专用路径（去掉 nodelist 间接）+ 预取/批处理 + SoA对齐",
-              "code_changes": "1) 由于本程序 connectivity 来自规则网格，可直接由 (i,j,k) 计算 8 个节点索引，避免读取 nodelist（节省 8 次 int load + 间接）：\n```cpp\n// 用 eidx -> (i,j,k) 反解或直接三重循环内计算\nint base = k*s1*s1 + j*s1 + i;\nint n0=base, n1=base+1, n2=base+s1+1, ...;\n```\n2) 对 x/y/z/xd/yd/zd 使用 64B 对齐分配并加 restrict：\n```cpp\nvoid CalcKinematicsForElems(const double* __restrict x, ...)\n```\n3) 将局部数组 x_local[8] 等替换为标量寄存器（展开8节点），减少栈访问并利于寄存器分配。\n4) 对元素按 i 连续方向分块（tile），提高节点数据复用（相邻元素共享节点）。",
-              "expected_speedup": "1.3x–2.5x（规则网格去间接索引通常收益显著）；若保持通用非结构网格，仅靠对齐/restrict/展开通常 1.1x–1.4x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "CalcPressureForElems: 降低分支与向量化",
-              "technique": "branchless clamp + SIMD-friendly",
-              "code_changes": "用 fmax/fmin 与掩码替代多重 if（编译器更易向量化）：\n```cpp\ndouble pi = bvc * vnew[i];\npi = (fabs(pi) < p_cut) ? 0.0 : pi;\npi = (vnew[i] >= 1.0) ? 0.0 : pi;\npi = fmax(pi, pmin);\np[i]=pi;\n```\n并加：\n```cpp\n#pragma omp simd\nfor(i=0;i<numElem;i++) ...\n```",
-              "expected_speedup": "该函数自身 1.1x–1.5x，但对总时间影响通常 <5%",
-              "difficulty": "easy"
-            },
-            {
-              "target": "全局数据布局与带宽效率",
-              "technique": "AoSoA/SoA融合 + 减少数组数量与流量 + 对齐与NUMA初始化",
-              "code_changes": "1) 将 (xd,yd,zd) 与 (fx,fy,fz) 改为 AoSoA：\n```cpp\nstruct alignas(64) Vec3 { double x,y,z; };\nVec3* v = ...; // v[n].x=xd\nVec3* f = ...;\n```\n2) first-touch 初始化（并行初始化数组）以避免 NUMA 远端访问。\n3) 若允许精度折中：将部分中间量用 float（如 hourmod*）并保持累加为 double（mixed precision）。",
-              "expected_speedup": "CPU 1.05x–1.3x（取决于NUMA与SIMD）；混合精度在不受限于误差时可额外 1.1x–1.4x",
-              "difficulty": "medium"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "推荐两种核函数组织：\n1) Element-parallel（每线程/warp处理一个元素）：适合 CalcKinematics 与 hourglass 的计算部分；但 hourglass 的 scatter 需要特殊处理。\n2) Node-parallel（每线程处理一个节点）：用于 hourglass 力的最终累加，线程遍历相邻元素并求和，避免全局原子。整体采用两阶段：先计算每元素的中间 hourmod 或每元素对8节点的贡献（存到临时数组），再做 node gather-reduce 写 fx/fy/fz。",
-            "data_layout": "1) 速度/力使用 AoSoA（例如每 4/8 个节点一组）以保证合并访问；或保持 SoA 但确保 128B 对齐。\n2) connectivity：规则网格建议不存 nodelist，GPU 端用 base 索引公式生成 8 节点；非结构网格则用压缩索引并尽量按空间重排元素（Hilbert/Morton）提升局部性。\n3) 若采用 node-parallel，需要 node->elem 邻接表（CSR）：row_ptr[node], col_ind[idx]=elemId，并可同时存该 node 在 elem 内的局部序号(0..7)以快速取 gamma 符号。",
-            "challenges": [
-              "scatter 写冲突：element-parallel 直接对 fx/fy/fz 原子加会严重限速（高冲突节点、原子序列化）。解决：两阶段归约或 node-parallel；或对元素做 coloring 分多轮无冲突写。",
-              "寄存器压力与占用率：hourglass 内部局部数组与展开可能导致寄存器过多、降低 occupancy。解决：用共享内存缓存 8 节点速度（每 block 处理多个元素），并控制展开程度；gamma 用 int8/常量内存。",
-              "内存流量与临时缓冲：两阶段方法需要临时存储（elem->node 贡献或 hourmod）。解决：选择更小的中间表示（例如仅存每元素4个mode的hourmodx/y/z，再在 node-parallel 阶段重建对节点的贡献），或在 node-parallel 中直接从节点速度重算 hourmod（以计算换带宽）。"
-            ],
-            "expected_speedup": "相对单核 CPU：10x–50x（取决于是否避免原子、以及问题规模）；相对多核优化后 CPU：3x–15x。若使用全局原子直接 scatter，可能仅 1.5x–5x 且随规模/冲突恶化。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "估计范围：Hourglass(元素核)约 2–6 FLOPs/byte（取决于是否把 scatter 计入、以及缓存命中）；Kinematics 约 1–3 FLOPs/byte；Pressure 约 0.5–1.5 FLOPs/byte。整体在并行实现中常因 scatter/原子与间接访存而表现为带宽/同步受限，而非纯 compute。",
-            "cache_behavior": "1) CalcKinematicsForElems: 通过 nodelist 间接 gather 访问 x/y/z/xd/yd/zd，规则网格下相邻元素共享节点，若元素按自然顺序遍历，节点数据有较强空间/时间局部性；但每元素需要读取 8 个节点 * 6 个数组 = 48 次 double load，容易受 L1/L2 容量与带宽影响。局部数组 x_local 等会落在栈上，若未被优化成寄存器会增加 L1 压力。\n2) CalcFBHourglassForceForElems: gather 8 节点速度（24 double load）后在寄存器中做大量运算，计算阶段较友好；真正的缓存/一致性问题在 scatter：对 fx/fy/fz 的写入是稀疏且共享的，导致 cache line 争用（false sharing）与写回流量增加；多线程下会触发 cache coherence 震荡。\n3) CalcPressureForElems: 顺序流式访问，缓存友好，易 SIMD，但分支可能导致前端/预测开销。",
-            "data_dependencies": [
-              "CalcFBHourglassForceForElems: 元素到节点的 scatter 累加形成跨元素写后写(WAW)冲突（并行时需要原子/分色/归约）；这是主要并行依赖。",
-              "CalcKinematicsForElems: 每元素内部无跨元素依赖（embarrassingly parallel），但依赖于 nodelist 的间接读导致访存不可预测；vdov[k] 依赖 det（除法）形成长延迟链。",
-              "CalcPressureForElems: 每元素独立；但包含 fabs 与条件赋值，存在控制依赖（可改为数据依赖以利 SIMD）。"
-            ]
-          },
-          "cost": 0.051479750000000005
-        },
-        "total_cost": 0.067627
-      }
-    },
-    "nas_cg": {
-      "program": "nas_cg",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "memory",
-      "s2_bottleneck_raw": "memory-bound（带有不规则访存的 SpMV 主导）",
-      "s2_primary": "memory",
-      "ground_truth": "memory",
-      "s1_matches_gt": true,
-      "s2_matches_gt": true,
-      "changed": false,
-      "s2_reasoning": "整体时间主要消耗在 sparse_matvec()（~65%）与 dot_product()（~15%）。两者算术强度都很低，且 sparse_matvec() 通过 colidx[] 对 x[] 的间接寻址导致不规则访存与低缓存命中，性能受限于内存带宽/延迟而非计算吞吐。对 Class A（n=14000, nnz≈(2*NONZER+1)*n≈23*n≈322k）而言矩阵本体不大，但 SpMV 的瓶颈来自 gather 访问 x[colidx[j]] 的缓存/预取困难；对更大规模（注释中的 Class B）该问题更明显。dot_product() 为流式读、可向量化，但仍是带宽受限的归约核",
-      "cost": 0.06119925,
-      "full_result": {
-        "code_name": "nas_cg",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "sparse_matvec() - line 54",
-              "estimated_time_percentage": "65%",
-              "reason": "This function performs sparse matrix-vector multiplication, which is memory-bound due to irregular memory access patterns and low arithmetic intensity.",
-              "confidence": "high"
-            },
-            {
-              "location": "dot_product() - line 92",
-              "estimated_time_percentage": "15%",
-              "reason": "This function performs a vector inner product, which is memory-bound due to streaming access and low arithmetic intensity.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "The primary bottleneck is memory-bound due to irregular memory access patterns in sparse_matvec() and low arithmetic intensity in both sparse_matvec() and dot_product()."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The sparse matrix-vector multiplication can benefit from GPU acceleration, but irregular memory access patterns may limit efficiency.",
-            "recommended_approach": "Use libraries like cuSPARSE for SpMV and optimize data transfer between host and device."
-          },
-          "cost": 0.010718749999999999
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory-bound（带有不规则访存的 SpMV 主导）",
-            "reasoning": "整体时间主要消耗在 sparse_matvec()（~65%）与 dot_product()（~15%）。两者算术强度都很低，且 sparse_matvec() 通过 colidx[] 对 x[] 的间接寻址导致不规则访存与低缓存命中，性能受限于内存带宽/延迟而非计算吞吐。对 Class A（n=14000, nnz≈(2*NONZER+1)*n≈23*n≈322k）而言矩阵本体不大，但 SpMV 的瓶颈来自 gather 访问 x[colidx[j]] 的缓存/预取困难；对更大规模（注释中的 Class B）该问题更明显。dot_product() 为流式读、可向量化，但仍是带宽受限的归约核。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "sparse_matvec(): 提升向量化与减少不必要的别名/边界开销",
-              "technique": "restrict + 对齐 + 编译器向量化提示 + OpenMP 并行按行划分",
-              "code_changes": "将接口改为使用 restrict 并在循环上加并行与向量化提示；确保 y/x/values 对齐分配。\n\n示例：\n```cpp\nvoid sparse_matvec(int n,\n  const int* __restrict rowptr,\n  const int* __restrict colidx,\n  const double* __restrict values,\n  const double* __restrict x,\n  double* __restrict y)\n{\n  #pragma omp parallel for schedule(static)\n  for (int i=0;i<n;i++) {\n    double sum = 0.0;\n    int start=rowptr[i], end=rowptr[i+1];\n    #pragma omp simd reduction(+:sum)\n    for (int j=start;j<end;j++) {\n      sum += values[j] * x[colidx[j]];\n    }\n    y[i]=sum;\n  }\n}\n```\n并将 malloc/calloc 替换为 aligned_alloc/posix_memalign（64B）以利于加载：\n```cpp\nposix_memalign((void**)&x, 64, n*sizeof(double));\n```\n编译：`-O3 -march=native -fopenmp`",
-              "expected_speedup": "1.2×–3×（单核 1.05×–1.3×；多核随带宽扩展，通常 2× 左右后趋于饱和）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "sparse_matvec(): 改善 x[] 的局部性（降低 gather 代价）",
-              "technique": "矩阵重排序（RCM/AMD/Metis）+ 向量同置换；或按列块/带状结构做 blocking",
-              "code_changes": "对 CSR 做一次离线重排序：求置换 p，使得带宽/填充降低；生成新 CSR：A' = P A P^T，同时在每次 SpMV 前后对向量做同样置换（或全程在置换空间迭代）。\n\n伪代码：\n```cpp\n// build permutation p via RCM\nperm = rcm(graph_of_A);\napply_perm_csr(rowptr,colidx,values, perm); // colidx 也要映射\napply_perm_vec(x, perm);\napply_perm_vec(b, perm);\n```\n若保持 NAS 的带状结构，可做固定窗口 blocking：按列块（例如 256/512）对每行的 (col,val) 分桶并在桶内排序，以提升 x 的缓存命中与硬件预取有效性。",
-              "expected_speedup": "1.1×–2×（取决于结构；带状/近带状通常更有效；完全随机稀疏收益较小）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "sparse_matvec(): 使用更合适的稀疏格式/内核（减少索引带宽与分支）",
-              "technique": "CSR → SELL-C-σ / ELLPACK（对近规则每行 nnz 相近的矩阵）或 CSR5；索引压缩（32-bit 已用）+ 分块",
-              "code_changes": "本程序生成的矩阵每行 nnz 近似常数（≈2*NONZER+1），非常适合 ELL/SELL。\n\n思路：预处理一次把每行填充到固定宽度 K（K=2*NONZER+1），存为：\n```cpp\nint K = 2*NONZER+1;\nint *ell_col = (int*)aligned_alloc(64, n*K*sizeof(int));\ndouble *ell_val = (double*)aligned_alloc(64, n*K*sizeof(double));\n// fill ell_col[i*K+k], ell_val[i*K+k]\n```\nSpMV：\n```cpp\n#pragma omp parallel for\nfor(int i=0;i<n;i++){\n  double sum=0;\n  #pragma omp simd reduction(+:sum)\n  for(int k=0;k<K;k++) sum += ell_val[i*K+k]*x[ell_col[i*K+k]];\n  y[i]=sum;\n}\n```\nSELL-C-σ 可减少填充并提升 SIMD 友好性（按 chunk C=8/16 分组并在组内按 nnz 排序）。",
-              "expected_speedup": "1.3×–3×（对“每行 nnz 近常数”的矩阵常见；若 nnz 分布很不均则收益下降）",
-              "difficulty": "medium"
-            },
-            {
-              "target": "dot_product(): 向量化 + 多线程归约 + 减少函数调用开销",
-              "technique": "OpenMP reduction + SIMD；必要时使用 BLAS（ddot）",
-              "code_changes": "```cpp\ndouble dot_product(const double* __restrict x,\n                   const double* __restrict y, int n)\n{\n  double sum = 0.0;\n  #pragma omp parallel for simd reduction(+:sum) schedule(static)\n  for (int i=0;i<n;i++) sum += x[i]*y[i];\n  return sum;\n}\n```\n或直接调用 MKL/OpenBLAS：`cblas_ddot(n,x,1,y,1)`（通常已高度优化）。",
-              "expected_speedup": "1.5×–10×（取决于是否从单线程变为多线程；单核提升通常 1.1×–1.5×）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "conj_grad(): 减少内存分配与提升数据复用",
-              "technique": "将 r/p/q 的 calloc 移出 conj_grad，复用缓冲区；避免每次 outer iter 分配 ax",
-              "code_changes": "当前 conj_grad 每次调用都 calloc/free 三个向量；main 中每次 outer iter 也 calloc/free ax。改为一次性分配并复用：\n\n```cpp\n// main: allocate work buffers once\ndouble *r = aligned_alloc(64,n*sizeof(double));\ndouble *p = aligned_alloc(64,n*sizeof(double));\ndouble *q = aligned_alloc(64,n*sizeof(double));\ndouble *ax= aligned_alloc(64,n*sizeof(double));\n\n// pass into conj_grad_workspace(...)\n```\n并用 memset 初始化需要清零的数组（或在算法中显式写满避免清零）。",
-              "expected_speedup": "1.05×–1.2×（对小规模/多次调用更明显；对大规模 SpMV 主导时较小）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "全局：融合向量操作以减少内存带宽压力",
-              "technique": "kernel fusion（AXPY + dot / 更新 p 的循环融合）",
-              "code_changes": "在 CG 迭代中，`x = x + alpha*p` 与 `r = r - alpha*q` 是两次流式写；随后又做 `rho_new = r'r` 与 `p = r + beta*p`。可将部分融合：\n\n```cpp\n// after alpha computed\n#pragma omp parallel for reduction(+:rho_new)\nfor(int i=0;i<n;i++){\n  x[i] += alpha*p[i];\n  r[i] -= alpha*q[i];\n  rho_new += r[i]*r[i];\n}\n// then update p in another pass (or fuse if beta known)\n```\n这样减少一次对 r 的完整读写遍历（把 dot 融入更新 r 的循环）。",
-              "expected_speedup": "1.1×–1.4×（取决于带宽与缓存；通常对带宽受限代码有效）",
-              "difficulty": "medium"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "将 SpMV 与向量核（axpy/scale/dot）全部放到 GPU，避免每次迭代 CPU-GPU 往返；采用“每行一个 warp/一个 block”或使用 cuSPARSE SpMV（csrmm/csrmv）并用 CUB 做归约。对 dot/axpy/融合核使用自定义 CUDA kernel 或 Thrust/CUB。整体采用 pipelined CG（或至少 kernel fusion）减少 kernel launch 与全局内存往返。",
-            "data_layout": "优先使用 CSR（与 cuSPARSE 兼容），但对本程序这种每行 nnz 近常数的矩阵，GPU 上 SELL-C-σ/ELL 往往更高效（更规则的内存访问与更好的合并加载）。索引使用 32-bit（int）即可；values/x/y 使用 double。将 rowptr/colidx/values/x/y 常驻 GPU 全局内存；若带状结构明显，可考虑把 x 的热点窗口利用只读缓存（__ldg）/纹理缓存（取决于架构）并在 kernel 内做适度预取到 shared memory（对小 NONZER 有效）。",
-            "challenges": [
-              "不规则 gather 导致内存访问不合并、带宽利用率低（尤其是更随机的稀疏结构）。解决：格式转换（SELL/ELL）、重排序（RCM/Metis）、或使用厂商库（cuSPARSE）选择合适的 SpMV 算法。",
-              "dot_product 等归约带来同步与多次 kernel launch 开销。解决：使用 CUB block reduction；并将更新 r 与计算 rho_new 融合到同一 kernel（减少一次全量读写）。",
-              "双精度在部分 GPU 上吞吐较低。解决：若允许精度折中可用 mixed precision（SpMV 用 FP32、累加/关键标量用 FP64）或使用 Tensor Core 的稀疏/混合精度路径（需算法与误差控制）。",
-              "CPU-GPU 数据传输可能吞噬收益（若每次 outer iter 都回传中间量）。解决：把整个 NITER*CG 过程放在 GPU，仅回传最终标量（zeta/rnorm）或按需回传。"
-            ],
-            "expected_speedup": "相对单核 CPU：5×–30×（取决于矩阵结构与 GPU/CPU 带宽差距）；相对“已把 CPU 内存带宽打满的多核实现”：1.5×–6× 更常见。若矩阵接近带状且 CPU 已高度优化，GPU 优势会缩小；若更不规则且规模更大，GPU 优势更明显。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "SpMV(CSR): 约 2 FLOPs / (8(values)+4(colidx)+8(x)+8(y amortized)) ≈ 2 / 28 ≈ 0.071 FLOPs/byte（若 x 命中缓存则可到 ~0.1–0.17；若考虑写回 y 的 8B/row 摊销到每个非零约 8/nnz_per_row≈0.35B，则影响很小）。dot_product: 2 FLOPs / 16B ≈ 0.125 FLOPs/byte（忽略写回 sum）。vec_axpy: 2 FLOPs / 24B ≈ 0.083 FLOPs/byte（读x 8B + 读写y 16B）。整体 CG 迭代因此明显带宽受限。",
-            "cache_behavior": "sparse_matvec(): values[]/colidx[] 顺序流式访问，易被硬件预取；瓶颈在 x[colidx[j]] 的 gather：当 colidx 近似带状（本生成器确实是 i±NONZER），x 访问具有局部性，L1/L2 命中率较高；但一旦结构更随机（NAS 原版更不规则），会导致频繁 L2/L3 miss，甚至 DRAM 访问，且预取器难以生效。y[] 顺序写，写分配/写回开销可控。dot_product()/axpy/scale: 纯流式，通常受限于内存带宽；可通过多线程把带宽打满。注意多线程 SpMV 可能很快达到内存带宽上限，继续加线程收益递减。",
-            "data_dependencies": [
-              "sparse_matvec(): 行内 sum 为循环归约（reduction），跨行无依赖；可按行并行。间接读取 x[colidx[j]] 只读无写冲突。",
-              "dot_product(): 全局归约依赖（sum reduction），需要线程私有累加再归并；存在浮点非结合性导致并行结果可能有微小差异。",
-              "CG 迭代级依赖：rho -> alpha -> 更新 x/r -> rho_new -> beta -> 更新 p；迭代间严格串行，但迭代内向量/SpMV 可并行。"
-            ]
-          },
-          "cost": 0.0504805
-        },
-        "total_cost": 0.06119925
-      }
-    },
-    "jacobi2d": {
-      "program": "jacobi2d",
-      "variant": "V1 Neutral",
-      "s1_bottleneck": "memory",
-      "s2_bottleneck_raw": "memory-bandwidth bound（DRAM 带宽/写分配导致的内存流量主导）",
-      "s2_primary": "memory",
-      "ground_truth": "memory",
-      "s1_matches_gt": true,
-      "s2_matches_gt": true,
-      "changed": false,
-      "s2_reasoning": "jacobi_kernel 两个 sweep 占 ~90% 时间；每个格点更新为 5 点 stencil：理论计算量约 5 FLOPs（4 add + 1 mul），但需要 5 次读取 + 1 次写回。对大 N=4096，工作集约 2*4096^2*8≈256MB，远超 LLC，时间步之间复用很弱，绝大多数访问落到 DRAM。并且写 B/A 会触发 write-allocate（RFO）带来额外读流量，使有效字节/点更高，进一步降低算术强度，导致性能主要受内存带宽限制而非算力。",
-      "cost": 0.05259275,
-      "full_result": {
-        "code_name": "jacobi2d",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-4o",
-          "hotspots": [
-            {
-              "location": "jacobi_kernel() forward sweep loop at line 54",
-              "estimated_time_percentage": "45%",
-              "reason": "This loop performs the main computation of the Jacobi method, involving multiple memory accesses and arithmetic operations for each grid point.",
-              "confidence": "high"
-            },
-            {
-              "location": "jacobi_kernel() backward sweep loop at line 66",
-              "estimated_time_percentage": "45%",
-              "reason": "This loop mirrors the forward sweep, performing similar memory-bound operations, contributing equally to the execution time.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "The arithmetic intensity is very low (0.10 FLOPs/byte), indicating that the computation is limited by memory bandwidth rather than processing power. The working set size exceeds typical cache sizes, leading to frequent memory accesses."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The Jacobi method is highly parallelizable with no data dependencies within each iteration, making it well-suited for GPU execution. The regular memory access patterns further enhance its suitability for GPU architectures.",
-            "recommended_approach": "Port the jacobi_kernel function to CUDA or OpenCL, using a grid of threads where each thread computes a single grid point. Ensure coalesced memory accesses to maximize memory throughput."
-          },
-          "cost": 0.010227
-        },
-        "stage2": {
-          "model": "gpt-5.2",
-          "validation": {
-            "bottleneck_correct": false,
-            "corrected_bottleneck": "memory-bandwidth bound（DRAM 带宽/写分配导致的内存流量主导）",
-            "reasoning": "jacobi_kernel 两个 sweep 占 ~90% 时间；每个格点更新为 5 点 stencil：理论计算量约 5 FLOPs（4 add + 1 mul），但需要 5 次读取 + 1 次写回。对大 N=4096，工作集约 2*4096^2*8≈256MB，远超 LLC，时间步之间复用很弱，绝大多数访问落到 DRAM。并且写 B/A 会触发 write-allocate（RFO）带来额外读流量，使有效字节/点更高，进一步降低算术强度，导致性能主要受内存带宽限制而非算力。"
-          },
-          "detailed_optimizations": [
-            {
-              "target": "热点1：forward sweep (A→B) 与热点2：backward sweep (B→A) 的内存流量与向量化效率",
-              "technique": "消除冗余 sweep：指针 ping-pong + 奇偶步处理（避免每步两次全域 stencil）",
-              "code_changes": "将每个 t 的两次 sweep 改为每个 t 只做一次 stencil，然后交换指针；若需要最终结果在 A 中，tsteps 为奇数时最后 swap 或 memcpy。\n\n示例：\n```cpp\nvoid jacobi_kernel(int tsteps, int n, double* A, double* B){\n  double *src=A, *dst=B;\n  for(int t=0;t<tsteps;t++){\n    for(int i=1;i<n-1;i++){\n      int base=i*n;\n      int baseN=(i-1)*n;\n      int baseS=(i+1)*n;\n      for(int j=1;j<n-1;j++){\n        dst[base+j]=0.2*(src[base+j]+src[base+j-1]+src[base+j+1]+src[baseS+j]+src[baseN+j]);\n      }\n    }\n    double* tmp=src; src=dst; dst=tmp;\n  }\n  if(src!=A){ memcpy(A, src, (size_t)n*n*sizeof(double)); }\n}\n```",
-              "expected_speedup": "1.7×–2.0×（理论上 sweep 数减半≈2×；考虑 memcpy/边界与带宽利用，通常略低于 2×）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "热点 sweep 内层循环：减少地址计算与提升编译器向量化",
-              "technique": "strength reduction（行基址缓存）+ restrict + 对齐分配 + 显式 SIMD 提示",
-              "code_changes": "1) 缓存行指针/基址，避免重复 i*n 乘法；2) 使用 `__restrict__` 告诉编译器无别名；3) 使用 aligned_alloc/posix_memalign 保证 64B 对齐；4) 加 `#pragma omp simd` 或编译器向量化指示。\n\n示例：\n```cpp\nvoid jacobi_step(int n, const double* __restrict__ src, double* __restrict__ dst){\n  for(int i=1;i<n-1;i++){\n    const double* row  = src + i*n;\n    const double* rowN = src + (i-1)*n;\n    const double* rowS = src + (i+1)*n;\n    double* out = dst + i*n;\n    #pragma omp simd\n    for(int j=1;j<n-1;j++){\n      out[j]=0.2*(row[j]+row[j-1]+row[j+1]+rowS[j]+rowN[j]);\n    }\n  }\n}\n```\n内存分配：\n```cpp\nposix_memalign((void**)&A, 64, (size_t)n*n*sizeof(double));\nposix_memalign((void**)&B, 64, (size_t)n*n*sizeof(double));\n```",
-              "expected_speedup": "1.1×–1.3×（主要来自更稳定的 SIMD 与更少的整数地址开销；总体仍受带宽限制）",
-              "difficulty": "easy"
-            },
-            {
-              "target": "热点 sweep：提升内存带宽利用（多核）",
-              "technique": "OpenMP 并行 + 合理调度/绑核 + NUMA first-touch",
-              "code_changes": "对 i 维并行（每行独立），静态调度；初始化也并行以 first-touch 分布页；运行时设置线程绑核。\n\n示例：\n```cpp\n#pragma omp parallel for schedule(static)\nfor(int i=1;i<n-1;i++){\n  ... // j 循环\n}\n```\n初始化：\n```cpp\n#pragma omp parallel for collapse(2) schedule(static)\nfor(int i=0;i<n;i++) for(int j=0;j<n;j++){ ... }\n```\n运行建议：`OMP_PROC_BIND=close OMP_PLACES=cores`；双路 NUMA 用 numactl 或线程亲和。",
-              "expected_speedup": "按带宽扩展：典型 4–16 核可达 3×–10×；到达内存带宽上限后饱和",
-              "difficulty": "easy/medium"
-            },
-            {
-              "target": "热点 sweep：降低写回的额外流量（RFO）与提升流式写效率",
-              "technique": "non-temporal store（streaming store）/编译器选项 + 写合并友好访问",
-              "code_changes": "当 dst 不会很快被 CPU 读取（尤其在“每步只做一次 stencil + swap”时，dst 会在下一步作为 src 被读，仍可能受益有限），可尝试对 dst 使用 non-temporal store（平台相关）。\n- x86: 使用编译器内建或 pragma（如 ICC/ICX 的 streaming store 指示），或手写 AVX `_mm256_stream_pd`（需要对齐与尾处理）。\n- 同时确保 j 连续访问，避免跨行。\n\n（示意，需 AVX2/AVX-512 版本化实现）",
-              "expected_speedup": "1.05×–1.2×（依赖平台与是否被下一步快速复用；若复用很快，收益可能更小）",
-              "difficulty": "hard"
-            },
-            {
-              "target": "整体：减少内存流量（时间维复用）",
-              "technique": "时间阻塞/波前式 time-tiling（Jacobi 的时间阻塞需要额外缓冲或更复杂的块内多步推进）",
-              "code_changes": "将网格分块（Bx×By），在块内做 k 个时间步以提高 L2/L3 复用；需要处理 halo 扩展与多缓冲（至少 2 个缓冲，块内可能需要临时数组）。实现复杂，且对 Jacobi 的严格同步语义要小心（块间依赖通过 halo 交换）。",
-              "expected_speedup": "1.2×–2.0×（在带宽受限且缓存足够容纳块+halo 时；取决于 k 与缓存层级）",
-              "difficulty": "hard"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "每个时间步一次 kernel：2D 网格映射到 CUDA/HIP 线程块；每线程计算一个 (i,j) 内点。采用 ping-pong（src/dst 指针交换）避免每步两次 sweep。线程块内用 shared memory 缓存 tile+halo（(Bx+2)×(By+2)）以减少全局内存读取；或在较新 GPU 上依赖 L2/只读缓存也可，但 shared memory 通常更稳。每个时间步 kernel 结束即为全局同步点；若需要减少 kernel launch 开销，可用 CUDA Graphs 或在单 kernel 内循环多个时间步（但需要块间同步，通常不可行，除非使用更复杂的多阶段/分块时间推进）。",
-            "data_layout": "保持行主序（row-major）1D 展平；确保 src/dst 128B 对齐；使用 `__ldg`/只读缓存（或在 CUDA 中将 src 指针标记为 `const` 并启用合适编译选项）。若使用 shared memory：按 [ty][tx] 存放，避免 bank conflict（必要时对 shared tile 做 padding）。边界不更新可通过 kernel 内 if 或通过网格配置避开边界线程。",
-            "challenges": [
-              "全局同步：Jacobi 每个时间步需要全局同步，天然对应一次 kernel launch；500 步会有 launch 开销（可用 CUDA Graphs 缓解）",
-              "内存带宽上限：GPU 也将是带宽受限，优化重点是合并访问、减少冗余读、提高 L2 命中与利用 shared memory",
-              "双精度吞吐：虽然算术强度低主要受带宽限制，但在部分消费级 GPU 上 FP64 可能成为次要限制；需确认 roofline（带宽 vs FP64 峰值）",
-              "PCIe 传输：若每步都回传数据会极慢；应将 tsteps 全部留在 GPU 上执行，仅在开始/结束传输或在 GPU 上计算 residual/checksum"
-            ],
-            "expected_speedup": "相对单核 CPU：10×–80×（取决于 CPU/内存带宽与 GPU 带宽）。相对已带宽饱和的多核 CPU（如双路服务器）：2×–8×更常见。若 CPU 端未做“每步一次 stencil + swap”，GPU 版本还会额外获得≈2×的算法级收益。"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "≈0.10 FLOPs/byte（理想化：5 FLOPs / (5 load + 1 store)*8B = 5/48）。更现实地考虑写分配 RFO：dst store 可能引入额外 8B 读（甚至整条 cache line），有效可接近 5 / 56 ≈ 0.089 FLOPs/byte 或更低；若按 cache line 粒度计入 RFO，AI 进一步下降。",
-            "cache_behavior": "空间局部性：j 连续访问，src 的 row/rowN/rowS 为流式读取，硬件预取有效；时间局部性：同一时间步内对 src 的复用很弱（每个元素被作为 center/neighbor 被用到几次，但跨多个输出点的复用主要发生在 L1/L2 的短距离滑窗中）。对 N=4096，单行 4096*8=32KB，三行约 96KB，超过典型 L1（32KB），但可驻留在 L2（256KB~1MB），因此“行滑窗”主要在 L2 命中；然而整个网格远超 LLC，跨 i 扫描时数据基本从 DRAM 流入。写 dst 为流式写，若发生 write-allocate，会产生额外读流量并污染缓存；若使用 non-temporal store 可减少缓存污染但可能影响下一步读取（取决于是否立即 swap 读取）。总体表现为带宽受限、接近 STREAM triad 类行为。",
-            "data_dependencies": [
-              "单个 sweep 内：无 loop-carried 依赖（每个 dst[i,j] 只读 src 的固定邻域），可完全并行",
-              "时间步之间：t 与 t+1 之间存在依赖（t+1 读取 t 的结果），需要全局同步/交换缓冲",
-              "边界条件：i=0,n-1 或 j=0,n-1 不更新（或需单独处理），但不形成计算依赖，仅是条件域"
-            ]
-          },
-          "cost": 0.04236575
-        },
-        "total_cost": 0.05259275
+        "total_cost": 0.055748000000000006
       }
     }
   }

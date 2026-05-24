@@ -1,0 +1,154 @@
+{
+  "program": "doitgen",
+  "config": "Ablation D (5.4→5.4)",
+  "s1_model": "gpt-5.4",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "compute-bound after loop interchange / GEMV-like reuse is exposed; naive version suffers from cache-unfriendly access and redundant reload pressure, but the dominant issue is low SIMD utilization and poor loop ordering rather than pure DRAM bandwidth saturation",
+  "s1_score": 72.65890481064484,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "compute",
+    "ground_truth": "compute",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.08351525,
+  "full_result": {
+    "code_name": "doitgen",
+    "program_key": "doitgen",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.4",
+      "hotspots": [
+        {
+          "location": "kernel_doitgen, inner loop nest over (r,q,p,s), especially line: sum[p] += A[r][q][s] * C4[s][p]",
+          "estimated_time_percentage": "90-98%",
+          "reason": "This is the main computational kernel and performs nr*nq*np*np multiply-add operations. It dominates runtime because initialization and copy-back are much smaller O(nr*nq*np) work, while this loop is O(nr*nq*np^2).",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_doitgen, copy-back loop over p, line: A[r][q][p] = sum[p]",
+          "estimated_time_percentage": "2-8%",
+          "reason": "This loop writes np elements for every (r,q) pair. It is lower complexity than the matrix-vector multiply but still contributes due to memory traffic.",
+          "confidence": "medium"
+        },
+        {
+          "location": "init_array, triple loop initializing A and double loop initializing C4",
+          "estimated_time_percentage": "1-5%",
+          "reason": "Initialization is outside the timed kernel in most benchmark interpretations, but if included in end-to-end execution it is much smaller than the kernel due to lower arithmetic intensity and one-time execution.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel is a batched matrix-vector/matrix-matrix-like operation with repeated streaming accesses to C4 columns via C4[s][p]. In C row-major layout, varying s while holding p fixed causes strided access with poor spatial locality. For each (r,q,p), A[r][q][s] is reread across all p iterations unless optimized, increasing memory traffic. The arithmetic intensity of the naive implementation is modest, and performance is likely limited by cache behavior and memory bandwidth more than peak FLOPs."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation has abundant data parallelism across (r,q) pairs and across p updates. The kernel is regular, dense, and free of dependencies between output elements except for reductions over s, which map well to GPU threads/blocks. Performance will depend on arranging memory accesses to be coalesced.",
+        "recommended_approach": "Map each (r,q) slice to a thread block and parallelize over p within the block. Use the loop-interchanged form so threads read contiguous C4[s][p] values. Cache A[r][q][s] and/or tiles of C4 in shared memory when beneficial. For best performance, reformulate as batched GEMV or grouped GEMM using cuBLAS/rocBLAS rather than writing a naive custom kernel."
+      },
+      "cost": 0.02301075,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "compute-bound after loop interchange / GEMV-like reuse is exposed; naive version suffers from cache-unfriendly access and redundant reload pressure, but the dominant issue is low SIMD utilization and poor loop ordering rather than pure DRAM bandwidth saturation",
+        "reasoning": "初步分析抓住了一个关键问题：原始循环次序下，C4[s][p] 的访问在固定 p、递增 s 时是跨行步长访问，局部性差。但将其简单归类为 memory-bound 并不完全准确。对每个 (r,q) 而言，计算本质是 A[r][q][:] (1xNP) 与 C4 (NPxNP) 的乘法，即一个小规模 dense matrix-vector / row-times-matrix 操作。若按原始代码估算，每次 FMA 伴随对 A[r][q][s] 的重复读取，表面 FLOPs/byte 偏低；但通过交换 p/s 循环后，A[r][q][s] 可在寄存器中复用，C4 的访问也变为按行连续流式访问，工作集通常可落入 cache。此时瓶颈更接近小矩阵核常见问题：向量化不足、寄存器阻塞不够、循环开销和 cache 层次利用不佳。换言之，原始实现的性能差主要来自不良数据复用与访存模式；优化后未必受主存带宽限制，而更可能受 L1/L2 带宽、SIMD 吞吐和小核效率限制。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_doitgen 主热点：sum[p] += A[r][q][s] * C4[s][p]",
+          "technique": "循环交换 (p,s) + 外积式更新，消除 A[r][q][s] 的重复加载并使 C4 按行连续访问",
+          "code_changes": "将内层从 `for p { sum[p]=0; for s sum[p]+=A[r][q][s]*C4[s][p]; }` 改为 `for p sum[p]=0; for s { DATA_TYPE a = A[r][q][s]; for p sum[p] += a * C4[s][p]; }`。示例：\n```cpp\nfor (r = 0; r < nr; r++)\n  for (q = 0; q < nq; q++) {\n    for (p = 0; p < np; p++) sum[p] = 0;\n    for (s = 0; s < np; s++) {\n      DATA_TYPE a = A[r][q][s];\n      for (p = 0; p < np; p++)\n        sum[p] += a * C4[s][p];\n    }\n    for (p = 0; p < np; p++)\n      A[r][q][p] = sum[p];\n  }\n```\n这一步是最关键的结构性优化。",
+          "expected_speedup": "2x-6x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_doitgen 主热点：提升 SIMD 吞吐",
+          "technique": "对 p 维向量化 + restrict/alignment + pragma simd",
+          "code_changes": "在交换循环后，让最内层 p 成为连续内存访问并显式提示编译器向量化。可引入局部指针：\n```cpp\nvoid kernel_doitgen(...,\n  DATA_TYPE (* __restrict A)[NQ][NP],\n  DATA_TYPE (* __restrict C4)[NP],\n  DATA_TYPE * __restrict sum)\n{\n  ...\n  for (r = 0; r < nr; r++)\n    for (q = 0; q < nq; q++) {\n      DATA_TYPE* __restrict sumv = sum;\n      for (p = 0; p < np; p++) sumv[p] = 0;\n      for (s = 0; s < np; s++) {\n        DATA_TYPE a = A[r][q][s];\n        DATA_TYPE* __restrict c4row = &C4[s][0];\n        #pragma omp simd aligned(sumv, c4row:64)\n        for (p = 0; p < np; p++)\n          sumv[p] += a * c4row[p];\n      }\n      #pragma omp simd aligned(sumv:64)\n      for (p = 0; p < np; p++)\n        A[r][q][p] = sumv[p];\n    }\n}\n```\n若编译器支持，可加 `-O3 -march=native -ffast-math`。",
+          "expected_speedup": "1.5x-3x（在循环交换基础上）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_doitgen 主热点：缓存与寄存器阻塞",
+          "technique": "p 维分块/寄存器 blocking，减少 sum 数组往返访存",
+          "code_changes": "当 np 较大时，将 p 分块，例如 BP=32/64，使一个块的 sum 保持在寄存器/L1 中：\n```cpp\nconst int BP = 64;\nfor (r = 0; r < nr; r++)\n  for (q = 0; q < nq; q++)\n    for (int pb = 0; pb < np; pb += BP) {\n      int pend = (pb + BP < np) ? pb + BP : np;\n      for (p = pb; p < pend; p++) sum[p] = 0;\n      for (s = 0; s < np; s++) {\n        DATA_TYPE a = A[r][q][s];\n        #pragma omp simd\n        for (p = pb; p < pend; p++)\n          sum[p] += a * C4[s][p];\n      }\n      for (p = pb; p < pend; p++)\n        A[r][q][p] = sum[p];\n    }\n```\n进一步可手工展开 p 循环 4/8 路。",
+          "expected_speedup": "1.2x-2x（在前两项基础上）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_doitgen 整体：线程级并行",
+          "technique": "对 (r,q) 二维批次并行 OpenMP",
+          "code_changes": "不同 (r,q) 对之间完全独立，但原代码中的 `sum` 是共享临时数组，必须私有化。推荐每线程私有局部缓冲：\n```cpp\n#pragma omp parallel for collapse(2) private(p,s)\nfor (r = 0; r < nr; r++)\n  for (q = 0; q < nq; q++) {\n    DATA_TYPE local_sum[NP];\n    for (p = 0; p < np; p++) local_sum[p] = 0;\n    for (s = 0; s < np; s++) {\n      DATA_TYPE a = A[r][q][s];\n      #pragma omp simd\n      for (p = 0; p < np; p++)\n        local_sum[p] += a * C4[s][p];\n    }\n    for (p = 0; p < np; p++)\n      A[r][q][p] = local_sum[p];\n  }\n```\n若 NP 不是编译期常量，可用 `std::vector<DATA_TYPE> local_sum(np);` 或线程私有分配。",
+          "expected_speedup": "按核数近似扩展，4x-20x（取决于 CPU 核数与问题规模）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_doitgen 整体：调用高性能库",
+          "technique": "将每个 (r,q) 视为 GEMV，或将整个 A reshape 为 (nr*nq) x np 后调用 GEMM",
+          "code_changes": "最优工程方案通常是直接映射到 BLAS。数学上：`A[r][q][:] = A[r][q][:] * C4`。可将 A 视为二维矩阵 `A2[(nr*nq)][np]`，整体执行右乘 C4，即 `A2 = A2 * C4`。若使用 row-major CBLAS，可考虑转置参数或预转置 C4：\n```cpp\n// conceptual\ncblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,\n            nr*nq, np, np,\n            1.0, &A[0][0][0], np,\n            &C4[0][0], np,\n            0.0, &Out[0][0][0], np);\n```\n由于原地覆盖不安全，需单独输出缓冲区或分批处理。若坚持逐 (r,q) 调用，则是 batched GEMV/GEMM，但小尺寸调用开销可能偏高。",
+          "expected_speedup": "2x-10x（相对 naive；取决于尺寸和 BLAS 实现）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "copy-back loop over p",
+          "technique": "与计算融合或使用双缓冲减少额外拷贝",
+          "code_changes": "若允许额外内存，可为 A 的输出使用独立数组 `Aout`，避免 `sum -> A` 的单独 copy-back 成为显式阶段，并便于 BLAS/GPU 实现：\n```cpp\nfor (r = 0; r < nr; r++)\n  for (q = 0; q < nq; q++) {\n    for (p = 0; p < np; p++) Aout[r][q][p] = 0;\n    for (s = 0; s < np; s++) {\n      DATA_TYPE a = A[r][q][s];\n      #pragma omp simd\n      for (p = 0; p < np; p++)\n        Aout[r][q][p] += a * C4[s][p];\n    }\n  }\nswap(A, Aout);\n```\n若必须原地，可保留 local_sum 后一次写回；该阶段已较轻，不建议过度优化。",
+          "expected_speedup": "0%-10%",
+          "difficulty": "medium"
+        },
+        {
+          "target": "init_array",
+          "technique": "并行初始化 + 向量化",
+          "code_changes": "初始化不是主瓶颈，但可用 OpenMP collapse：\n```cpp\n#pragma omp parallel for collapse(3)\nfor (i = 0; i < nr; i++)\n  for (j = 0; j < nq; j++)\n    for (k = 0; k < np; k++)\n      A[i][j][k] = (DATA_TYPE)((i*j + k)%np) / np;\n\n#pragma omp parallel for collapse(2)\nfor (i = 0; i < np; i++)\n  for (j = 0; j < np; j++)\n    C4[i][j] = (DATA_TYPE)(i*j % np) / np;\n```\n仅在计时包含初始化时有意义。",
+          "expected_speedup": "对总时间影响通常 <5%",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将问题重写为批量小矩阵乘：把 A 视为二维矩阵 A2，形状为 (nr*nq) x np，计算 `Aout = A2 * C4`。GPU 上最优策略通常不是逐元素手写 reduction，而是直接映射到 GEMM：每个 thread block 负责 A2 的一个 tile 与 C4 的 tile 相乘，沿 k=s 维做分块累加。若使用库，优先 cuBLAS/rocBLAS GEMM；若手写 kernel，则采用 2D tiled GEMM：block 维度如 128x64 或 64x64，线程协作加载 A2 tile 和 C4 tile 到 shared memory，寄存器中累加多个 p 输出。对于较小 np，也可让一个 block 处理一个或多个 (r,q) 行，线程沿 p 维展开。",
+        "data_layout": "建议将 A 逻辑上展平为连续的 `A2[(nr*nq)][np]`，保持 row-major 连续行存储；C4 保持二维连续存储，但在 GPU 上若使用自定义 kernel，可考虑预转置为 `C4T[p][s]`，使线程按 p 连续写输出时读取也更易合并/coalesced。若调用 GEMM 库，则按库偏好的列主序/行主序组织，必要时通过转置参数避免显式转置。输出最好写入独立 `Aout`，避免原地覆盖带来的读写冲突和额外同步。",
+        "challenges": [
+          "问题本质可能是大量小规模矩阵乘；若 np 较小，单次 kernel 启动和全局内存延迟会显著影响效率，需通过批处理或整体 reshape 成一次大 GEMM 提高占用率",
+          "原始访问模式对 GPU 不友好；若不重排循环/数据布局，C4 的读取难以合并，导致带宽浪费",
+          "若采用逐 (r,q) block 映射，shared memory 容量和寄存器压力会限制 tile 大小，需要调优 block shape",
+          "原地更新 A 会引入读写别名风险，通常需要单独输出缓冲区",
+          "当 nr*nq 不足时，GPU 并行度可能不够；需要让每个 block 计算多个输出 tile 或合并批次"
+        ],
+        "expected_speedup": "相对原始单线程 CPU：10x-80x；相对优化后的多线程 SIMD CPU：2x-10x。若直接使用高性能 GEMM 且规模足够大，通常接近区间上界；若 np 很小或批量不足，则接近下界。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "原始实现近似为每次内层更新 2 FLOPs，对应读取 A[r][q][s]、C4[s][p] 并反复读写 sum[p]。若按保守主存模型估算，约 2 / (8+8+16) = 0.0625 FLOPs/byte（double，sum 读改写计 16B），明显偏低；若 sum 驻留寄存器/L1，则约 2 / (8+8) = 0.125 FLOPs/byte。交换循环后，A[r][q][s] 对所有 p 复用一次，单个 (r,q) 总 FLOPs 为 2*np*np；数据流量约为读 A 向量 8*np、读 C4 矩阵 8*np*np、写结果 8*np（double），故 AI 约为 2*np*np / (8*np*np + 16*np) = np / (4*np + 8)，当 np 较大时趋近 0.25 FLOPs/byte。若 C4 可在 LLC/L2 中复用、A 向量和局部 sum 在 L1/L2 中复用，则有效 AI 相对 DRAM 可更高，因此优化后常不再是纯 DRAM 带宽受限，而是 cache/L1 带宽与 SIMD 吞吐共同限制。",
+        "cache_behavior": "原始代码中，最内层是 s，访问 `A[r][q][s]` 连续，较友好；但 `C4[s][p]` 在 row-major 下对固定 p、递增 s 是跨行步长访问，步长为 NP，空间局部性差，硬件预取效果有限。更糟的是，对每个 p 都重新扫描整个 `A[r][q][:]`，导致同一 A 向量被重复读取 np 次，虽然部分可由 cache 命中，但仍增加 cache 端口压力和不必要的数据移动。`sum[p]` 在 p 外层时可标量驻留，但整体访存模式不利于向量化。交换循环后，`C4[s][p]` 变为按行连续访问，适合 SIMD 和预取；`A[r][q][s]` 每个 s 只加载一次并广播使用；`sum[:]` 可作为连续向量累加，若 np 不大可驻留 L1，若分块则可进一步提升寄存器/L1 命中率。对整个程序而言，C4 被所有 (r,q) 重复使用，若 NP 中等，C4 可在 LLC 中保持较高复用；若 NP 很大，则需要 p/s blocking 以避免 cache thrash。",
+        "data_dependencies": [
+          "对固定 (r,q,p)，沿 s 维存在归约依赖：sum[p] 是对 s 的累加，因此 s 维不能直接完全并行而不做 reduction/private accumulation",
+          "不同 p 的 sum[p] 彼此独立，可在向量级并行",
+          "不同 (r,q) 对之间完全独立，可在线程块/CPU 线程级并行",
+          "copy-back 阶段依赖对应 (r,q) 的全部 sum[p] 计算完成后才能写回 A[r][q][p]",
+          "若采用原地覆盖，必须保证读取的 A[r][q][s] 来自旧值，因此不能在同一 (r,q) 计算过程中提前覆盖 A[r][q][:]"
+        ]
+      },
+      "cost": 0.060504499999999996,
+      "bottleneck_raw": "compute-bound after loop interchange / GEMV-like reuse is exposed; naive version suffers from cache-unfriendly access and redundant reload pressure, but the dominant issue is low SIMD utilization and poor loop ordering rather than pure DRAM bandwidth saturation"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "compute",
+      "ground_truth": "compute",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.08351525
+  }
+}

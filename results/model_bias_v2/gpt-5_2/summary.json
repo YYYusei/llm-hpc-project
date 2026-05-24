@@ -1,0 +1,345 @@
+{
+  "model": "gpt-5.2",
+  "timestamp": "2026-05-24T02:19:04.795802",
+  "programs_tested": [
+    "gemm",
+    "2mm",
+    "3mm",
+    "syrk",
+    "syr2k",
+    "doitgen",
+    "gramschmidt"
+  ],
+  "n_correct": 0,
+  "n_total": 7,
+  "total_cost": 0.1756,
+  "results": [
+    {
+      "program": "gemm",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "The kernel is a naive GEMM with poor cache reuse for B in the i-k-j ordering: for each i, it streams through B for every k, causing large memory bandwidth pressure and cache misses. Arithmetic intensity is far below an optimized blocked GEMM, so performance is typically limited by memory hierarchy rather than peak FLOPs (unless matrices are very small and fit in cache).",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 72.1959049544995,
+      "cost": 0.025249,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_gemm(): nested loops i-k-j (C[i][j] += alpha*A[i][k]*B[k][j])",
+            "estimated_time_percentage": "85-98%",
+            "reason": "This is the O(ni*nk*nj) GEMM update performing the vast majority of floating-point operations and memory traffic; it dominates runtime for realistic sizes.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_gemm(): scaling loop i-j (C[i][j] *= beta)",
+            "estimated_time_percentage": "1-10%",
+            "reason": "Full sweep over C (O(ni*nj)) adds extra memory traffic; smaller than the GEMM update but can be noticeable when nk is small.",
+            "confidence": "medium"
+          },
+          {
+            "location": "print_array(): i-j printing loop (fprintf per element)",
+            "estimated_time_percentage": "0-99% (depends on whether DUMP is enabled and output target)",
+            "reason": "If PolyBench dumping is enabled, per-element formatted I/O is extremely slow and can dominate total wall time; otherwise it is typically compiled out or redirected and negligible.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "The kernel is a naive GEMM with poor cache reuse for B in the i-k-j ordering: for each i, it streams through B for every k, causing large memory bandwidth pressure and cache misses. Arithmetic intensity is far below an optimized blocked GEMM, so performance is typically limited by memory hierarchy rather than peak FLOPs (unless matrices are very small and fit in cache)."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "This is a classic dense GEMM (highly parallel, regular memory access). GPUs excel at GEMM when implemented with tiling/shared memory and/or via vendor libraries; performance can be dramatically higher than a naive CPU implementation.",
+          "recommended_approach": "Use cuBLAS/rocBLAS gemm (preferred). If writing a custom kernel, implement 2D tiling: each thread block loads A and B tiles into shared memory, performs a register-blocked micro-kernel with FMA, and writes a C tile; fuse beta scaling into the epilogue. Use appropriate leading dimensions and consider using column-major to match BLAS conventions or use the correct transpose flags."
+        },
+        "cost": 0.025249,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "2mm",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "Both main kernels are GEMM-like but written in an order that causes strided accesses to B and C (column-wise traversal in row-major storage). This reduces cache line reuse and effective bandwidth, often making performance limited by memory hierarchy (cache/TLB misses, bandwidth) rather than peak FLOPs. Additionally, tmp is written then reread, adding extra memory traffic compared to a fused formulation.",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 69.16253791708796,
+      "cost": 0.023619750000000002,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_2mm: first triple loop computing tmp[i][j] (approx. lines 95-104)",
+            "estimated_time_percentage": "45-60%",
+            "reason": "Dense matrix multiply-like kernel (tmp = alpha*A*B). O(ni*nj*nk) multiply-adds; repeatedly streams A rows and B columns. B access is stride-1 in k-major? Actually B[k][j] is accessed with k varying fastest, causing non-contiguous (stride = NJ) access in row-major layout, leading to poor cache utilization and high memory traffic.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_2mm: second triple loop updating D[i][j] using tmp and C (approx. lines 105-113)",
+            "estimated_time_percentage": "40-55%",
+            "reason": "Second GEMM-like kernel (D = beta*D + tmp*C). O(ni*nl*nj) multiply-adds; C[k][j] accessed with k varying fastest, again non-contiguous (stride = NL) in row-major layout, stressing memory subsystem and limiting vectorization effectiveness.",
+            "confidence": "high"
+          },
+          {
+            "location": "print_array (approx. lines 55-73) when enabled in benchmark run",
+            "estimated_time_percentage": "0-30%",
+            "reason": "Potentially large I/O and full traversal of D; if PolyBench dump/prevent_dce is active and output is not redirected/disabled, fprintf dominates runtime. In typical performance runs this is often disabled or excluded, but in real executions it can be significant.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "Both main kernels are GEMM-like but written in an order that causes strided accesses to B and C (column-wise traversal in row-major storage). This reduces cache line reuse and effective bandwidth, often making performance limited by memory hierarchy (cache/TLB misses, bandwidth) rather than peak FLOPs. Additionally, tmp is written then reread, adding extra memory traffic compared to a fused formulation."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "The computation is two large dense matrix multiplications (GEMM), which map extremely well to GPUs. The main requirement is sufficient problem size to amortize transfers and using a GEMM implementation that maximizes data reuse in shared memory/L2.",
+          "recommended_approach": "Use cuBLAS/rocBLAS: compute tmp = alpha*A*B via GEMM, then D = beta*D + tmp*C via GEMM. Keep A,B,C,D,tmp resident on device across both calls to avoid extra PCIe transfers. If custom kernels are needed, implement tiled GEMM with shared-memory blocking and consider fusing beta scaling into the epilogue of the second GEMM."
+        },
+        "cost": 0.023619750000000002,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "3mm",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "Each inner iteration performs 2 FLOPs (mul+add) but streams multiple operands from memory; without cache blocking/packing, arithmetic intensity is low and performance is limited by memory bandwidth and cache misses (especially for the right-hand matrices B, D, F accessed across k). With proper blocking/BLAS, it can become more compute-bound.",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 68.01358148893361,
+      "cost": 0.02239475,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_3mm: E := A*B triple loop (around lines 86-96)",
+            "estimated_time_percentage": "30-40%",
+            "reason": "Dense matrix multiplication O(ni*nj*nk) with poor cache reuse for B[k][j] (stride-1 in j but k changes in inner loop) and high memory traffic; dominates runtime for typical PolyBench sizes.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_3mm: F := C*D triple loop (around lines 98-108)",
+            "estimated_time_percentage": "25-35%",
+            "reason": "Dense matrix multiplication O(nj*nl*nm); similar access pattern issues (D[k][j] accessed with k inner, causing repeated streaming of D columns) and large working set.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_3mm: G := E*F triple loop (around lines 110-120)",
+            "estimated_time_percentage": "25-35%",
+            "reason": "Dense matrix multiplication O(ni*nl*nj); typically comparable to the other two GEMMs and suffers from limited cache reuse without blocking.",
+            "confidence": "high"
+          },
+          {
+            "location": "print_array (around lines 52-70) when enabled by PolyBench dump/prevent_dce",
+            "estimated_time_percentage": "0-60% (depends on build/run configuration and output target)",
+            "reason": "I/O can dominate wall time if dumping is enabled or output is not redirected; not part of the timed kernel but can dominate end-to-end runtime.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "Each inner iteration performs 2 FLOPs (mul+add) but streams multiple operands from memory; without cache blocking/packing, arithmetic intensity is low and performance is limited by memory bandwidth and cache misses (especially for the right-hand matrices B, D, F accessed across k). With proper blocking/BLAS, it can become more compute-bound."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "The kernel consists of three large dense matrix multiplications, which map extremely well to GPUs (high parallelism, regular memory access after tiling). Performance is typically dominated by GEMM throughput; intermediate matrices E and F can remain on device to avoid PCIe transfers.",
+          "recommended_approach": "Use cuBLAS/rocBLAS GEMM for the three multiplications. Allocate A,B,C,D,E,F,G on device, copy inputs once, run: E=A*B, F=C*D, G=E*F, then copy back G. Use appropriate leading dimensions and transpose flags for row-major data (or store matrices in column-major). Consider using streams and keeping intermediates on GPU; fuse nothing unless memory is constrained."
+        },
+        "cost": 0.02239475,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "syrk",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "The main update loop has low-to-moderate arithmetic intensity due to repeatedly reading A[j][k] with poor spatial locality (stride-N access in row-major layout) and repeatedly updating C[i][j] across k (read-modify-write). Without blocking, cache reuse is limited and performance is typically constrained by memory bandwidth and cache misses rather than peak FLOPs.",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 72.5203109327984,
+      "cost": 0.0259875,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_syrk(): nested loops i-k-j (C[i][j] += alpha*A[i][k]*A[j][k])",
+            "estimated_time_percentage": "90-98%",
+            "reason": "This is the O(N^2*M) rank-k update; it performs the vast majority of floating-point operations and repeatedly streams/updates the lower-triangular part of C while reading A. For typical PolyBench sizes, this dominates runtime.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_syrk(): scaling loop i-j (C[i][j] *= beta)",
+            "estimated_time_percentage": "1-5%",
+            "reason": "O(N^2) pass over C; relatively small compared to the O(N^2*M) update but still touches a large memory region.",
+            "confidence": "high"
+          },
+          {
+            "location": "print_array(): i-j printing loop (fprintf of C)",
+            "estimated_time_percentage": "0-90% (depends on whether timing includes it / dump enabled)",
+            "reason": "If output is enabled and included in measured time, formatted I/O can dominate. In PolyBench, timing typically excludes this, but it can still dominate end-to-end wall time.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "The main update loop has low-to-moderate arithmetic intensity due to repeatedly reading A[j][k] with poor spatial locality (stride-N access in row-major layout) and repeatedly updating C[i][j] across k (read-modify-write). Without blocking, cache reuse is limited and performance is typically constrained by memory bandwidth and cache misses rather than peak FLOPs."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "SYRK is a dense linear algebra kernel with high parallelism and regular memory access when implemented with blocking; GPUs perform very well using optimized BLAS-3 routines. Naive porting of the given loops may be memory-inefficient, but mapping to cuBLAS/rocBLAS SYRK achieves high throughput.",
+          "recommended_approach": "Use cuBLAS/rocBLAS syrk (or gemm) on device-resident A and C. Transfer A and C once, run syrk with uplo=lower, trans=no-trans, then (optionally) copy back only the needed triangle. For best performance, use column-major layouts expected by BLAS or adapt leading dimensions accordingly; rely on library tiling rather than custom kernels unless specialized fusion (beta scaling) is required."
+        },
+        "cost": 0.0259875,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "syr2k",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "The main update has low-to-moderate arithmetic intensity because it repeatedly streams A and B columns (A[j][k], B[j][k]) while updating many C elements; C is also repeatedly read-modify-written across k. Without blocking, working sets exceed cache and performance is limited by memory bandwidth and cache misses rather than peak FLOPs. Using a tuned BLAS (SYR2K/GEMM) typically yields large gains by improving locality and vectorization.",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 72.547583081571,
+      "cost": 0.0248115,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_syr2k(): nested loops i-k-j (C[i][j] += A[j][k]*alpha*B[i][k] + B[j][k]*alpha*A[i][k])",
+            "estimated_time_percentage": "90-98%",
+            "reason": "Dominant O(N^2*M) work: for each (i,k) it updates ~i/2 elements of C, performing multiple FLOPs and streaming A/B/C. Poor cache reuse for A[j][k] and B[j][k] across j, and repeated loads/stores of C[i][j] inside the k loop.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_syr2k(): scaling loop i-j (C[i][j] *= beta)",
+            "estimated_time_percentage": "1-5%",
+            "reason": "O(N^2) memory traffic over the lower triangle of C; relatively small compared to the rank-2k update but still bandwidth-driven.",
+            "confidence": "high"
+          },
+          {
+            "location": "print_array(): full scan and fprintf of C",
+            "estimated_time_percentage": "0-90% (depends on whether timed / output enabled)",
+            "reason": "If included in timing or run with large N, formatted I/O dominates due to per-element fprintf and flush behavior; however PolyBench typically excludes it from the timed region.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "The main update has low-to-moderate arithmetic intensity because it repeatedly streams A and B columns (A[j][k], B[j][k]) while updating many C elements; C is also repeatedly read-modify-written across k. Without blocking, working sets exceed cache and performance is limited by memory bandwidth and cache misses rather than peak FLOPs. Using a tuned BLAS (SYR2K/GEMM) typically yields large gains by improving locality and vectorization."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "This is a dense linear algebra kernel (SYR2K-like) with high parallelism and regular memory access when blocked; GPUs perform well using GEMM/SYR2K primitives. Naive triple loops will be memory-inefficient, but mapping to cuBLAS/rocBLAS yields high throughput.",
+          "recommended_approach": "Use cuBLAS/rocBLAS syr2k if available (lower triangle). Otherwise compute C = beta*C + alpha*A*B^T + alpha*B*A^T via two GEMMs (cublasGemmEx) and then mask/keep only the lower triangle (or store full C if acceptable). Keep A/B/C resident on device, use column-major layout expected by BLAS (or adjust leading dimensions/transposes), and overlap transfers with computation if data must move each iteration."
+        },
+        "cost": 0.0248115,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "doitgen",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "The core kernel performs ~2*np^2 FLOPs per (r,q) but streams A[r][q,:] and repeatedly reads C4 with limited temporal locality unless blocked; for realistic NP sizes C4 does not fit in L1 and may not fit in LLC, causing high bandwidth demand. The arithmetic intensity is moderate and often insufficient to fully utilize peak FLOPs on modern CPUs without cache blocking and vectorization, making performance primarily limited by memory hierarchy (cache/DRAM bandwidth and latency).",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 72.27507676560901,
+      "cost": 0.02574075,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_doitgen(): nested loops r/q/p/s (sum[p] += A[r][q][s] * C4[s][p])",
+            "estimated_time_percentage": "85-95%",
+            "reason": "This is the O(nr*nq*np*np) matrix-vector-like accumulation (for each (r,q), computes sum = A[r][q,:] * C4). It dominates FLOPs and memory traffic; repeatedly streams A[r][q][s] and accesses C4[s][p] with poor cache reuse across p unless blocked.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_doitgen(): copy-back loop (A[r][q][p] = sum[p])",
+            "estimated_time_percentage": "3-8%",
+            "reason": "Extra full pass over p writing A; adds memory bandwidth pressure and store traffic (and potential write-allocate) after the compute loop.",
+            "confidence": "high"
+          },
+          {
+            "location": "init_array(): triple loop initializing A and double loop initializing C4",
+            "estimated_time_percentage": "1-5%",
+            "reason": "Linear initialization over large arrays; typically small compared to kernel but can be noticeable for small problem sizes or when timing includes initialization (here it does not).",
+            "confidence": "medium"
+          },
+          {
+            "location": "print_array(): full scan with fprintf",
+            "estimated_time_percentage": "variable (can exceed kernel if enabled for large sizes)",
+            "reason": "I/O-bound full traversal with formatted printing; extremely slow relative to computation. In PolyBench runs this is often disabled or redirected, but if executed it can dominate wall time.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "The core kernel performs ~2*np^2 FLOPs per (r,q) but streams A[r][q,:] and repeatedly reads C4 with limited temporal locality unless blocked; for realistic NP sizes C4 does not fit in L1 and may not fit in LLC, causing high bandwidth demand. The arithmetic intensity is moderate and often insufficient to fully utilize peak FLOPs on modern CPUs without cache blocking and vectorization, making performance primarily limited by memory hierarchy (cache/DRAM bandwidth and latency)."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "The kernel is essentially a dense matrix multiplication: (nr*nq x np) times (np x np). This has high parallelism and can achieve high throughput on GPUs, especially when NP is large enough to amortize memory transfers. C4 is reused across many (r,q) rows, which is favorable for GPU caching/constant memory.",
+          "recommended_approach": "Flatten A to a 2D matrix M with rows = nr*nq and cols = np, then compute M = M * C4 using cuBLAS/rocBLAS GEMM. Keep C4 resident on device; transfer A once, run GEMM, transfer back if needed. If writing a custom kernel, use tiling in shared memory for C4 tiles and register accumulation for output tiles; map threads to (row, p) output elements."
+        },
+        "cost": 0.02574075,
+        "bottleneck_raw": "memory"
+      }
+    },
+    {
+      "program": "gramschmidt",
+      "model": "gpt-5.2",
+      "s1_bottleneck_raw": "memory",
+      "s1_primary": "memory",
+      "s1_reasoning": "The main j-loop performs low-to-moderate arithmetic per byte moved: it streams A[:,j] and Q[:,k] for the dot product and then streams A[:,j] again for the update. Q[:,k] is reused across many j but is typically too large for registers and only partially cache-resident; A is read/modified with poor temporal locality across j and k. This makes performance largely limited by memory bandwidth/cache behavior rather than peak FLOPs, especially for large m,n.",
+      "ground_truth": "compute",
+      "correct": false,
+      "eval_score": 52.15060240963856,
+      "cost": 0.027804000000000002,
+      "stage1": {
+        "model": "gpt-5.2",
+        "hotspots": [
+          {
+            "location": "kernel_gramschmidt(): outer loop k with inner j/i updates (lines ~86-110)",
+            "estimated_time_percentage": "85-95%",
+            "reason": "Dominant O(m*n^2) work: for each k, for each j>k it performs a dot product over i (R[k][j] += Q[i][k]*A[i][j]) and then an axpy-style update over i (A[i][j] -= Q[i][k]*R[k][j]). These stream through large columns of A/Q repeatedly and drive most runtime.",
+            "confidence": "high"
+          },
+          {
+            "location": "kernel_gramschmidt(): norm and normalization for each k (nrm accumulation + Q column compute) (lines ~88-95)",
+            "estimated_time_percentage": "5-12%",
+            "reason": "O(m*n) work: reduction nrm += A[i][k]^2 plus division Q[i][k]=A[i][k]/R[k][k]. Includes a sqrt and a full column pass; smaller than the j-loop but still significant.",
+            "confidence": "high"
+          },
+          {
+            "location": "print_array(): dumping R and Q (lines ~41-74) (only if enabled in the benchmark run)",
+            "estimated_time_percentage": "0-80% (configuration-dependent)",
+            "reason": "If I/O is not excluded from timing or if DCE printing is executed in a measured context, fprintf in nested loops can dominate. In PolyBench timing, kernel is timed separately, but overall program wall time can still be dominated by output for large sizes.",
+            "confidence": "medium"
+          }
+        ],
+        "bottleneck_type": {
+          "primary": "memory",
+          "reasoning": "The main j-loop performs low-to-moderate arithmetic per byte moved: it streams A[:,j] and Q[:,k] for the dot product and then streams A[:,j] again for the update. Q[:,k] is reused across many j but is typically too large for registers and only partially cache-resident; A is read/modified with poor temporal locality across j and k. This makes performance largely limited by memory bandwidth/cache behavior rather than peak FLOPs, especially for large m,n."
+        },
+        "gpu_suitability": {
+          "suitable": true,
+          "reasoning": "The dominant work is dense linear algebra (dot products and rank-1 updates) with high parallelism over i and j. However, the algorithm has a sequential dependency over k, and the per-k operations are memory-bandwidth sensitive unless blocked into BLAS-3. GPUs perform best if the computation is reformulated into larger GEMM-like kernels to raise arithmetic intensity and reduce kernel launch overhead.",
+          "recommended_approach": "Use a blocked Gram-Schmidt/QR approach: for each block of columns, compute panel factorization on CPU or GPU, then update the trailing matrix with GEMM on GPU (cuBLAS). Alternatively, for each k, compute r = Qk^T * A_trailing via cuBLAS GEMV and update A_trailing via cuBLAS GER, but prefer batching/blocked updates to amortize launches. Keep A/Q/R resident on device, and overlap k-iteration panel work with trailing updates using streams if blocking is used."
+        },
+        "cost": 0.027804000000000002,
+        "bottleneck_raw": "memory"
+      }
+    }
+  ]
+}

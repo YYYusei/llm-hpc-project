@@ -1,0 +1,45 @@
+{
+  "program": "2mm",
+  "model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "Both main kernels are GEMM-like but written in an order that causes strided accesses to B and C (column-wise traversal in row-major storage). This reduces cache line reuse and effective bandwidth, often making performance limited by memory hierarchy (cache/TLB misses, bandwidth) rather than peak FLOPs. Additionally, tmp is written then reread, adding extra memory traffic compared to a fused formulation.",
+  "ground_truth": "compute",
+  "correct": false,
+  "eval_score": 69.16253791708796,
+  "cost": 0.023619750000000002,
+  "stage1": {
+    "model": "gpt-5.2",
+    "hotspots": [
+      {
+        "location": "kernel_2mm: first triple loop computing tmp[i][j] (approx. lines 95-104)",
+        "estimated_time_percentage": "45-60%",
+        "reason": "Dense matrix multiply-like kernel (tmp = alpha*A*B). O(ni*nj*nk) multiply-adds; repeatedly streams A rows and B columns. B access is stride-1 in k-major? Actually B[k][j] is accessed with k varying fastest, causing non-contiguous (stride = NJ) access in row-major layout, leading to poor cache utilization and high memory traffic.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_2mm: second triple loop updating D[i][j] using tmp and C (approx. lines 105-113)",
+        "estimated_time_percentage": "40-55%",
+        "reason": "Second GEMM-like kernel (D = beta*D + tmp*C). O(ni*nl*nj) multiply-adds; C[k][j] accessed with k varying fastest, again non-contiguous (stride = NL) in row-major layout, stressing memory subsystem and limiting vectorization effectiveness.",
+        "confidence": "high"
+      },
+      {
+        "location": "print_array (approx. lines 55-73) when enabled in benchmark run",
+        "estimated_time_percentage": "0-30%",
+        "reason": "Potentially large I/O and full traversal of D; if PolyBench dump/prevent_dce is active and output is not redirected/disabled, fprintf dominates runtime. In typical performance runs this is often disabled or excluded, but in real executions it can be significant.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "Both main kernels are GEMM-like but written in an order that causes strided accesses to B and C (column-wise traversal in row-major storage). This reduces cache line reuse and effective bandwidth, often making performance limited by memory hierarchy (cache/TLB misses, bandwidth) rather than peak FLOPs. Additionally, tmp is written then reread, adding extra memory traffic compared to a fused formulation."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The computation is two large dense matrix multiplications (GEMM), which map extremely well to GPUs. The main requirement is sufficient problem size to amortize transfers and using a GEMM implementation that maximizes data reuse in shared memory/L2.",
+      "recommended_approach": "Use cuBLAS/rocBLAS: compute tmp = alpha*A*B via GEMM, then D = beta*D + tmp*C via GEMM. Keep A,B,C,D,tmp resident on device across both calls to avoid extra PCIe transfers. If custom kernels are needed, implement tiled GEMM with shared-memory blocking and consider fusing beta scaling into the epilogue of the second GEMM."
+    },
+    "cost": 0.023619750000000002,
+    "bottleneck_raw": "memory"
+  }
+}

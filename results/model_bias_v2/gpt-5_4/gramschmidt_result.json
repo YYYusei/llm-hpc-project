@@ -1,0 +1,45 @@
+{
+  "program": "gramschmidt",
+  "model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The dominant trailing update repeatedly reads and writes large portions of A and reads Q with relatively low arithmetic intensity: each inner iteration performs only a few floating-point operations per multiple memory accesses. The access pattern over columns in row-major C layout uses stride-N accesses for A[i][j] and Q[i][k], which hurts spatial locality, cache efficiency, and SIMD utilization. There is some compute cost from division and sqrt, but overall runtime is dominated by data movement",
+  "ground_truth": "compute",
+  "correct": false,
+  "eval_score": 51.397590361445786,
+  "cost": 0.024388,
+  "stage1": {
+    "model": "gpt-5.4",
+    "hotspots": [
+      {
+        "location": "kernel_gramschmidt: inner loop `for (j = k + 1; j < _PB_N; j++)` with nested `for (i = 0; i < _PB_M; i++)` updates to R[k][j] and A[i][j]",
+        "estimated_time_percentage": "75-90%",
+        "reason": "This is the dominant O(m*n^2) part of modified Gram-Schmidt. For each k, it computes a dot product R[k][j] += Q[i][k] * A[i][j] and then updates the full column A[i][j] = A[i][j] - Q[i][k] * R[k][j] for all remaining j. It repeatedly streams through columns of A and Q, causing high memory traffic and poor cache reuse.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_gramschmidt: norm computation loop `for (i = 0; i < _PB_M; i++) nrm += A[i][k] * A[i][k];`",
+        "estimated_time_percentage": "8-15%",
+        "reason": "Executed once per k over all m rows, this performs a reduction with a square root afterward. It is lower order than the trailing matrix update but still significant due to full-column traversal and reduction dependency.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_gramschmidt: normalization loop `for (i = 0; i < _PB_M; i++) Q[i][k] = A[i][k] / R[k][k];`",
+        "estimated_time_percentage": "3-8%",
+        "reason": "This loop touches an entire column and performs division, which is relatively expensive. However, it is only O(m*n) overall, so it is smaller than the j/i nested update.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The dominant trailing update repeatedly reads and writes large portions of A and reads Q with relatively low arithmetic intensity: each inner iteration performs only a few floating-point operations per multiple memory accesses. The access pattern over columns in row-major C layout uses stride-N accesses for A[i][j] and Q[i][k], which hurts spatial locality, cache efficiency, and SIMD utilization. There is some compute cost from division and sqrt, but overall runtime is dominated by data movement in the O(m*n^2) loops."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The dominant work is in large data-parallel dot products and rank-1 updates over matrices, which map well to GPUs. However, the current scalar modified Gram-Schmidt structure has sequential dependence in k and relatively low arithmetic intensity if implemented naively. GPU suitability improves significantly if reformulated into blocked operations or library calls.",
+      "recommended_approach": "Port using cuBLAS/cuSOLVER or a blocked QR algorithm. For each step or panel, use GPU kernels for column norm, normalization, projection (GEMV), and trailing update (GER/GEMM). Prefer Householder QR via vendor libraries for better numerical stability and much better GPU utilization than a direct scalar modified Gram-Schmidt implementation."
+    },
+    "cost": 0.024388,
+    "bottleneck_raw": "memory"
+  }
+}
