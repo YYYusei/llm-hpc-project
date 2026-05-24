@@ -1,0 +1,110 @@
+{
+  "program": "heat_3d",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Misses",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.02829575,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-78",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the 3D arrays.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves multiple accesses to large 3D arrays in a nested loop structure, which is likely to be limited by memory bandwidth and cache performance rather than pure computation."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem is highly parallelizable due to its regular structure and independent computations across the 3D grid, making it suitable for GPU acceleration.",
+        "recommended_approach": "Port the kernel_heat_3d function to CUDA or OpenCL, using a 3D grid of threads to map directly to the 3D data structure, ensuring coalesced memory accesses."
+      },
+      "cost": 0.008573250000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Cache Misses",
+        "reasoning": "该核函数是一个典型的三维 7 点 stencil 迭代计算。在每次时间步迭代中，需要对 A 和 B 两个大三维数组进行交替的读写操作。由于 3D 数组的跨步访问（尤其是 i 维和 j 维），会导致严重的 L1/L2 缓存失效。此外，每个网格点计算仅涉及 11 次浮点运算，却需要访问 7 个相邻内存位置，算术强度极低，性能完全受限于内存带宽。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Loop Tiling (3D Spatial Blocking) & Loop Fusion",
+          "code_changes": "将 i, j, k 三层循环进行分块（Tiling），以匹配 CPU L1/L2 缓存大小。同时，在可能的情况下，通过时间分块（Temporal Tiling）融合 A->B 和 B->A 的更新，减少对主存的重复读写。",
+          "expected_speedup": "2.0x - 3.5x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Vectorization (SIMD) & Common Subexpression Elimination",
+          "code_changes": "提取公共系数，将公式简化为：B[i][j][k] = 0.125 * (A[i+1][j][k] + A[i-1][j][k] + A[i][j+1][k] + A[i][j-1][k] + A[i][j][k+1] + A[i][j][k-1]) + 0.25 * A[i][j][k]。使用 #pragma omp simd 或编译器向量化指令引导最内层 k 循环的向量化，并确保最内层内存连续访问。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "OpenMP Parallelization",
+          "code_changes": "在最外层空间循环（i 循环）上添加 #pragma omp parallel for collapse(2) 开启多线程并行化，结合 NUMA 亲和性设置（OMP_PROC_BIND=close）。",
+          "expected_speedup": "4.0x - 8.0x (取决于CPU核心数)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 或 OpenACC 进行异构并行化。将 3D 网格映射到 GPU 的三维线程块（Thread Blocks）。使用共享内存（Shared Memory）暂存 3D 晕圈（Halo）区域的数据，以减少对全局内存（Global Memory）的重复访问。利用双缓冲（Double Buffering）技术交替迭代 A 和 B，避免在主机和设备之间频繁拷贝数据。",
+        "data_layout": "保持行优先（Row-Major）的 3D 数组布局。确保最内层维度 k 映射到 CUDA 的 threadIdx.x，以实现全局内存的合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "3D 晕圈（Halo）数据在共享内存中的加载和同步较为复杂。",
+          "寄存器压力：由于 3D 模板计算邻域点较多，容易导致每个线程使用的寄存器过多，从而降低线程束并发度（Occupancy）。",
+          "边界条件处理：在线程块边缘需要处理越界保护，可能导致分支分化（Branch Divergence）。"
+        ],
+        "expected_speedup": "20x - 50x (相比于单线程 CPU 基础版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.19 FLOPs/Byte",
+        "cache_behavior": "在未优化的版本中，k 维是连续访问的（Stride-1），但 i 维和 j 维的跨步访问（Stride-N 和 Stride-N^2）会导致频繁的 Cache Line 替换和 TLB 失效。当 N 较大时，无法在缓存中保留相邻切片的数据，导致重复从主存加载相同的数据（每个点被重复加载 7 次）。",
+        "data_dependencies": [
+          "时间步 t 与 t+1 之间存在 RAW（写后读）依赖，必须顺序执行。",
+          "在同一个时间步内，B 的更新完全依赖于 A 的前一状态，空间网格点之间无数据依赖，可完全并行化。",
+          "第二阶段 A 的更新完全依赖于 B 的当前状态，同样无空间依赖。"
+        ]
+      },
+      "cost": 0.0197225,
+      "bottleneck_raw": "Memory Bandwidth & Cache Misses"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.02829575
+  }
+}

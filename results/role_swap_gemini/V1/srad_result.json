@@ -1,0 +1,113 @@
+{
+  "program": "srad",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory Bandwidth & Instruction Latency (Memory-Bound with High Latency Operations)",
+  "s1_score": 63.19036697247705,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.034013,
+  "full_result": {
+    "code_name": "srad",
+    "program_key": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 99-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Divergence computation with neighbor coefficients and image update",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and each element's computation is independent per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using GPU threads to handle each pixel's computation independently, and optimize memory transfers between host and device."
+      },
+      "cost": 0.01109675,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Instruction Latency (Memory-Bound with High Latency Operations)",
+        "reasoning": "虽然初步分析认为该程序是计算密集型（Compute-bound），但深入分析表明它实际上受限于内存带宽和高延迟指令。首先，算法在每次迭代中分配并读写了5个与图像等大的临时数组（dN, dS, dW, dE, c），导致极高的内存流量（每个迭代读写约 480MB 数据，远超 CPU 缓存容量）。其次，代码中存在大量非连续的邻域内存访问（如 iN, iS 导致的跨行访问），造成严重的 L1/L2 缓存失效。最后，除法操作（每个像素多次双精度除法）和分支预测失败（边界条件判断及 clamp 操作）引入了极高的指令延迟，阻碍了流水线并行。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Memory Footprint & Cache Locality",
+          "technique": "Loop Fusion & Temporary Array Elimination (Stencil Fusion)",
+          "code_changes": "消除 dN, dS, dW, dE, c 这5个全局临时数组。将 Phase 1 和 Phase 2 合并为一个单次循环。利用滑动窗口（Sliding Window）或行缓冲区（Line Buffers）在 L1 缓存/寄存器中暂存相邻像素的值，直接计算出更新后的图像值，将空间复杂度从 O(Rows*Cols) 降至 O(Cols)。",
+          "expected_speedup": "3.0x - 4.5x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "Instruction-Level Parallelism (ILP) & Vectorization",
+          "technique": "SIMD Vectorization (AVX2/AVX-512) & Fast Division",
+          "code_changes": "使用 `#pragma omp simd` 或 Intel Intrinsics 向量化内层循环。将双精度 `double` 转换为单精度 `float`（图像处理通常不需要双精度精度，且 float 可使向量通道数翻倍）。使用倒数近似指令（如 `_mm256_rcp_ps`）代替高延迟的除法操作。",
+          "expected_speedup": "2.0x - 3.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Thread-Level Parallelism",
+          "technique": "OpenMP Multi-threading & Loop Collapsing",
+          "code_changes": "在外部循环添加 `#pragma omp parallel for collapse(2)`，并采用 `schedule(static)` 静态调度，确保多核 CPU 的负载均衡。同时将边界条件判断（iN, iS, jW, jE）移出核心循环，通过剥离边界（Loop Peeling）消除循环体内的分支预测开销。",
+          "expected_speedup": "8.0x - 12.0x (在 16 核 CPU 上)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenCL 进行二维网格并行化。每个线程负责计算一个像素。利用 GPU 的共享内存（Shared Memory）构建 16x16 或 32x32 的线程块（Thread Block）光晕区（Halo Exchange），将邻域像素加载到共享内存中，消除对全局内存的重复访问。将 Phase 1 和 Phase 2 合并为一个 GPU Kernel，通过寄存器传递中间梯度值，完全避免全局内存中临时数组的分配。",
+        "data_layout": "采用一维线性布局（Row-Major），确保 Warp 内的线程在访问 `image[idx]`、`image[idx+1]` 时实现合并内存访问（Coalesced Memory Access）。将数据类型从 `double` 转换为 `float`，以充分利用 GPU 的单精度浮点计算单元（ALU）和纹理缓存（Texture Cache，可用于免费的边界插值和缓存）。",
+        "challenges": [
+          "线程块边界处的同步问题（Halo cells）：需要处理好共享内存加载时的边界守护（Boundary Guard）。",
+          "寄存器压力（Register Pressure）：由于每个线程计算梯度、Laplacian、ICOV 等需要较多局部变量，需控制寄存器使用量以维持高活跃扭曲度（Occupancy）。"
+        ],
+        "expected_speedup": "30x - 50x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.15 FLOPs/byte",
+        "cache_behavior": "由于图像大小为 2048x2048 双精度（32MB），5个临时数组共占用 160MB，远超现代 CPU 的 L3 缓存（通常为 32MB-64MB）。Phase 1 和 Phase 2 之间的数据无法驻留在缓存中，导致每次迭代都发生大量的 L3 缓存失效和 DRAM 换入换出。此外，跨行访问（iS, iN）导致非连续内存加载，无法有效利用 CPU 的硬件预取器（Hardware Prefetcher）。",
+        "data_dependencies": [
+          "Loop-carried dependency: 迭代 k+1 强依赖于迭代 k 更新后的 `image` 数组，限制了迭代间的并行化。",
+          "Spatial dependency: Phase 2 中更新 `image[idx]` 需要邻域的 `c` 和 `d(N,S,W,E)` 值，这构成了典型的 5 点星形模板（Stencil）依赖。"
+        ]
+      },
+      "cost": 0.022916250000000003,
+      "bottleneck_raw": "Memory Bandwidth & Instruction Latency (Memory-Bound with High Latency Operations)"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.034013
+  }
+}

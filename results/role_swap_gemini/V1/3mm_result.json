@@ -1,0 +1,105 @@
+{
+  "program": "3mm",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Misses (CPU) / Compute Bound (Theoretical)",
+  "s1_score": 78.5135814889336,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": true,
+    "s1_matches_gt": true,
+    "s2_matches_gt": false,
+    "correction_type": "over-correction"
+  },
+  "cost": 0.031974249999999996,
+  "full_result": {
+    "code_name": "3mm",
+    "program_key": "3mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_3mm: E := A*B loop (line 66)",
+          "estimated_time_percentage": "30%",
+          "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_3mm: F := C*D loop (line 74)",
+          "estimated_time_percentage": "30%",
+          "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_3mm: G := E*F loop (line 82)",
+          "estimated_time_percentage": "30%",
+          "reason": "Matrix multiplication is computationally intensive and involves nested loops.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the nature of matrix multiplications which involve a large number of arithmetic operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "Matrix multiplication is highly parallelizable and can benefit from the massive parallelism offered by GPUs.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU, ensuring data is transferred efficiently between host and device."
+      },
+      "cost": 0.0112105,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Misses (CPU) / Compute Bound (Theoretical)",
+        "reasoning": "虽然矩阵乘法（GEMM）在理论上是计算密集型任务，但该原始 C 语言实现存在严重的性能瓶颈。首先，最内层循环 `k` 访问矩阵 B/D/F 时跨步长较大（非连续内存访问，如 `B[k][j]`），导致极高的 L1/L2 缓存缺失率。其次，编译器无法对未向量化的标量累加进行有效优化，导致无法充分利用 CPU 的 SIMD 寄存器和 FMA（融合乘加）单元。因此，在未优化前，程序实际受限于内存延迟与带宽。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_3mm (E, F, G 矩阵乘法循环)",
+          "technique": "Loop Tiling (循环分块) & Loop Permutation (循环重排) & Vectorization (向量化)",
+          "code_changes": "将传统的 i-j-k 循环重排为 i-k-j 循环，以确保最内层对所有矩阵的访问都是行连续的（空间局部性）。同时，引入 OpenMP 开启多线程并行化，并使用 `#pragma omp simd` 引导编译器进行 AVX2/AVX-512 向量化。对于大矩阵，应用 Block Size = 64 或 128 的分块技术。\n\n示例代码改动 (以 E := A*B 为例):\n```cpp\n#pragma omp parallel for collapse(2) private(i, k, j)\nfor (int i = 0; i < _PB_NI; i++) {\n  for (int j = 0; j < _PB_NJ; j++) {\n    E[i][j] = SCALAR_VAL(0.0);\n  }\n  for (int k = 0; k < _PB_NK; k++) {\n    #pragma omp simd\n    for (int j = 0; j < _PB_NJ; j++) {\n      E[i][j] += A[i][k] * B[k][j];\n    }\n  }\n}\n```",
+          "expected_speedup": "5x - 15x (取决于 CPU 核心数和 SIMD 宽度)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/HIP 将三个矩阵乘法并行化。利用共享内存（Shared Memory）进行 2D Block Tiling（例如 32x32 线程块），将 A 和 B 的子矩阵加载到 Shared Memory 中以消除全局内存带宽瓶颈。利用 GPU 的 Tensor Cores（若使用 FP16/BF16）或通过高效的寄存器双缓冲（Double Buffering）实现 FMA 吞吐最大化。由于 E 和 F 相互独立，前两个 GEMM（E:=A*B 和 F:=C*D）可以在不同的 CUDA Streams 中并发执行，最后再执行 G:=E*F。",
+        "data_layout": "保持行优先（Row-Major）布局，但在 Shared Memory 载入时采用 Padding（如 32x33）以避免 Bank Conflict。",
+        "challenges": [
+          "Stream 同步：必须确保 E 和 F 计算完全结束后，才能启动 G 的计算内核。",
+          "全局内存带宽限制：在未采用 Shared Memory Tiling 时，频繁的 Global Memory 读写会限制 GPU 算力发挥。"
+        ],
+        "expected_speedup": "50x - 200x (相比于单线程 CPU 原始版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "O(N) [具体为: (2 * N^3) FLOPs / (3 * N^2 * sizeof(double)) Bytes = N / 12 FLOPs/Byte (以双精度为例)]",
+        "cache_behavior": "在原始 i-j-k 结构中，`B[k][j]`、`D[k][j]` 和 `F[k][j]` 的访问在最内层循环中跨越整行（Stride = NJ/NL），导致 L1/L2 Cache Line 频繁失效，产生大量的 Capacity Misses 和 Compulsory Misses。重排为 i-k-j 后，最内层 `j` 实现了完美的连续内存步长（Stride = 1），极大提升了 L1 缓存命中率和硬件预取器（Hardware Prefetcher）的效率。",
+        "data_dependencies": [
+          "E[i][j] 在 k 循环上的写后写（WAW）和读后写（WAR）依赖（通过引入临时标量或重排循环可消除/优化）",
+          "矩阵 G 的计算依赖于前两个矩阵乘法结果 E 和 F 的完全写入（RAW 屏障，三个 GEMM 之间存在严格的顺序依赖）"
+        ]
+      },
+      "cost": 0.020763749999999997,
+      "bottleneck_raw": "Memory Bandwidth & Cache Misses (CPU) / Compute Bound (Theoretical)"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": true,
+      "s1_matches_gt": true,
+      "s2_matches_gt": false,
+      "correction_type": "over-correction"
+    },
+    "total_cost": 0.031974249999999996
+  }
+}

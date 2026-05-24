@@ -1,0 +1,108 @@
+{
+  "program": "hotspot",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory Bandwidth & Instruction Overhead",
+  "s1_score": 66.125,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.03379775,
+  "full_result": {
+    "code_name": "hotspot",
+    "program_key": "hotspot",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "compute_tran_temp() - inner loop at line 66",
+          "estimated_time_percentage": "85%",
+          "reason": "This loop performs the main 2D stencil computation, which is the core of the thermal simulation and involves multiple arithmetic operations per grid cell.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the intensive arithmetic operations required for the stencil computation across a large grid."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular grid updates with a 5-point stencil, which is highly parallelizable and suitable for GPU execution.",
+        "recommended_approach": "Port the inner loop to a GPU kernel using CUDA or OpenCL, ensuring each thread handles a single grid cell update. Use shared memory to optimize data access patterns."
+      },
+      "cost": 0.01117375,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Instruction Overhead",
+        "reasoning": "虽然该算法包含大量的浮点运算，但其本质是一个 5 点 stencil 模板计算。在 CPU 上，每个网格点需要加载 5 个温度值和 1 个功耗值，而仅进行约 15 次浮点运算，算术强度较低（约 0.31 FLOPs/byte），因此受限于内存带宽。此外，内层循环中存在大量的 `if-else` 分支判断（用于区分边界和内部区域），这导致了严重的指令分支预测开销，阻碍了编译器的自动向量化（SIMD）。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "compute_tran_temp() - Branch Elimination",
+          "technique": "Loop Peeling & Boundary Separation",
+          "code_changes": "将边界条件（第 0 行、最后一行、第 0 列、最后一列）从主循环中剥离，单独编写边界更新逻辑。使核心的双重循环仅处理内部区域（1 到 row-2，1 到 col-2），从而完全消除内层循环中的 `if-else` 分支，使编译器能够生成高效的向量化指令。",
+          "expected_speedup": "2.0x - 3.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "compute_tran_temp() - Parallelization",
+          "technique": "OpenMP Multi-threading & Loop Collapsing",
+          "code_changes": "在消除分支后的内部循环外层添加 `#pragma omp parallel for collapse(2)`，利用多核 CPU 进行并行计算。同时使用 `#pragma omp simd` 显式引导编译器进行 SIMD 向量化（如 AVX2/AVX-512）。",
+          "expected_speedup": "6.0x - 10.0x (取决于CPU核心数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "compute_tran_temp() - Cache Locality",
+          "technique": "Loop Tiling (Blocking)",
+          "code_changes": "对 2D 空间循环进行分块（Tiling），将大小调整为适合 L1/L2 缓存的 Block（例如 32x32 或 64x64），以提高 `temp` 数组在迭代过程中的缓存复用率，减少 L3 缓存和内存的带宽压力。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenACC 进行二维线程块映射。每个 CUDA 线程负责计算一个网格点的温度更新。利用共享内存（Shared Memory）暂存当前线程块所需的输入数据（包括边界光晕区 Halo），以减少对全局内存（Global Memory）的重复访问。利用双缓冲区（Double Buffering）在设备端直接交换指针，避免主机与设备间的数据拷贝。",
+        "data_layout": "保持现有的 1D 线性行优先（Row-Major）布局。在 GPU 上，这种布局可以确保相邻线程（ThreadIdx.x）访问相邻的内存地址，从而实现完美的全局内存合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "光晕区（Halo Exchange）处理：在共享内存分块时，边界线程需要加载相邻分块的数据，增加了代码复杂性。",
+          "时空切片（Temporal Blocking）：由于时间步迭代存在依赖，频繁启动 Kernel 会带来额外开销。需要设计时空分块 Kernel 以在一次启动中完成多个时间步的更新。"
+        ],
+        "expected_speedup": "30x - 50x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.31 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，由于按行遍历，`temp[i*col + j - 1]`、`temp[i*col + j]` 和 `temp[i*col + j + 1]` 具有良好的空间局部性。然而，跨行访问的 `temp[(i-1)*col + j]` 和 `temp[(i+1)*col + j]` 会导致频繁的 L1/L2 缓存缺失。当网格尺寸大于缓存容量时，会发生严重的缓存抖动（Cache Thrashing）。",
+        "data_dependencies": [
+          "时间步（k 循环）之间存在严格的数据依赖：第 k 步的输出 `result` 是第 k+1 步的输入 `temp`，无法在时间维度上直接并行。",
+          "在单次时间步内，空间网格点（i, j 循环）之间的计算是完全独立的，不存在数据依赖，可以任意并行化。"
+        ]
+      },
+      "cost": 0.022624,
+      "bottleneck_raw": "Memory Bandwidth & Instruction Overhead"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.03379775
+  }
+}

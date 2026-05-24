@@ -1,0 +1,100 @@
+{
+  "program": "seidel_2d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Loop-Carried Data Dependencies",
+  "s1_score": 61.50675675675675,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.027070750000000005,
+  "full_result": {
+    "code_name": "seidel_2d",
+    "program_key": "seidel_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_seidel_2d (lines 47-58)",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel with nested loops iterating over the entire data array multiple times.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel performs a large number of memory accesses relative to computations, especially due to the repeated access of neighboring elements in a 2D array."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular memory access patterns and can benefit from the parallel processing capabilities of a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the computation to the GPU, focusing on optimizing memory coalescing and using shared memory for neighboring element accesses."
+      },
+      "cost": 0.007266,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Loop-Carried Data Dependencies",
+        "reasoning": "该算法是典型的 Gauss-Seidel 2D 迭代。其核心瓶颈在于两点：第一，算术强度极低，每次从内存加载 9 个双精度浮点数（存在缓存复用，但仍需频繁访存）仅进行 8 次加法和 1 次除法/乘法，属于典型的内存带宽受限型（Memory-bound）内核。第二，存在严重的数据依赖性（Loop-carried dependencies），当前点 A[i][j] 的更新依赖于同一次迭代中已经更新过的左上方邻居节点（A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1]），这导致内层循环无法直接进行向量化（SIMD）或简单的多线程并行化。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_seidel_2d",
+          "technique": "Loop Tiling & Wavefront Parallelism (多维平铺与波前并行)",
+          "code_changes": "将空间循环 (i, j) 和时间循环 (t) 进行三维时空平铺（Time-Space Tiling）。由于存在数据依赖，平铺后的网格需要沿着斜对角线（波前方向 i+j+2*t）进行流水线并行化。可以使用 Polyhedral 编译器（如 Pluto）自动生成变换后的代码，或者手动实现斜向平铺（Skewed Tiling）以消除依赖并提高 L1/L2 缓存复用率。",
+          "expected_speedup": "2.0x - 4.0x (CPU 多核)",
+          "difficulty": "hard"
+        },
+        {
+          "target": "kernel_seidel_2d",
+          "technique": "Strength Reduction (乘法代替除法) & Vectorization Hints",
+          "code_changes": "将除以 9.0 替换为乘以常数倒数：`const DATA_TYPE inv_9 = 1.0 / 9.0;`，并在内层循环前加入 `#pragma omp simd` 或 `#pragma ivdep`（在通过波前变换消除依赖后），强制编译器进行向量化。同时使用局部变量暂存中间结果，减少对 A[i][j] 的重复写入。",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "由于存在严格的 Gauss-Seidel 依赖，无法直接在 GPU 上对 i 和 j 进行简单并行的 Thread 映射。必须采用以下两种策略之一：1. Wavefront (斜向波前) 并行：将线程映射到满足 i+j = const 的对角线上，随着时间推移更新对角线。2. Red-Black Coloring (红黑着色法) 近似：将网格点分为红点和黑点，交替更新。红点只依赖黑点，黑点只依赖红点，从而在红/黑内部实现完全并行（注意：这会微幅改变收敛轨迹，需确认应用是否允许）。",
+        "data_layout": "保持 2D 数组行优先布局（Row-Major），确保同一 Warp 内的线程在访问 A[i][j] 时能够实现合并内存访问（Coalesced Memory Access）。使用共享内存（Shared Memory）暂存 2D 瓷砖（Tile）数据，减少对全局显存的重复访问。",
+        "challenges": [
+          "波前并行会导致 GPU 线程利用率在边界处极低（线程发散和负载不均）。",
+          "红黑着色法虽然并行度极高，但改变了经典 Gauss-Seidel 的计算顺序，可能影响数值收敛性。"
+        ],
+        "expected_speedup": "5.0x - 15.0x (相比于单线程 CPU，取决于 N 的规模和是否采用红黑着色法)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.125 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，随着 N 的增大，三行数据无法完全容纳在 L1/L2 缓存中，导致大量的 Cache Line 换入换出（Capacity Misses）。在时间迭代 t 之间，数据完全被刷出缓存，无法实现时间局部性（Temporal Locality）的复用。优化后通过 Time Tiling 可以将数据块常驻 L2 缓存。",
+        "data_dependencies": [
+          "RAW (Read-After-Write) 依赖：A[i][j] 依赖于同一次迭代 t 中的 A[i-1][j-1], A[i-1][j], A[i-1][j+1] 和 A[i][j-1]（空间依赖）。",
+          "RAW 依赖：下一次迭代 t+1 的 A[i][j] 依赖于当前迭代 t 的 A[i+1][j-1], A[i+1][j], A[i+1][j+1] 等（时间依赖）。"
+        ]
+      },
+      "cost": 0.019804750000000003,
+      "bottleneck_raw": "Memory Bandwidth & Loop-Carried Data Dependencies"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.027070750000000005
+  }
+}

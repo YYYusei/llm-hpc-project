@@ -1,0 +1,100 @@
+{
+  "program": "2mm",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Misses (L1/L2/L3)",
+  "s1_score": 81.57507583417592,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": true,
+    "s1_matches_gt": true,
+    "s2_matches_gt": false,
+    "correction_type": "over-correction"
+  },
+  "cost": 0.033873,
+  "full_result": {
+    "code_name": "2mm",
+    "program_key": "2mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_2mm, line 66-84",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains two nested loops that perform matrix multiplications, which are computationally intensive operations.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the nested loops performing matrix multiplications, which involve a large number of floating-point operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "Matrix multiplication is highly parallelizable and can benefit from the massive parallelism offered by GPUs.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU. Ensure data transfer between CPU and GPU is minimized by keeping data on the GPU as much as possible."
+      },
+      "cost": 0.0085995,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Misses (L1/L2/L3)",
+        "reasoning": "虽然该程序执行了大量的浮点运算（矩阵乘法），但其原始实现存在严重的缓存局部性问题。在两个三层嵌套循环中，最内层循环 `k` 访问矩阵 `B[k][j]` 和 `C[k][j]` 时，其步长为 `NJ` 和 `NL`（非连续内存访问），这导致了极高的 Cache Miss 率。此外，未进行分块（Tiling）导致数据无法常驻高速缓存，使得计算单元长期处于等待数据的饥饿状态，因此实际瓶颈是内存带宽与缓存失效，而非纯计算限制。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_2mm (Loop Nest 1 & 2)",
+          "technique": "Loop Permutation (循环重排以实现连续内存访问)",
+          "code_changes": "将两个三层循环的顺序从 i-j-k 改为 i-k-j。这样最内层循环 `j` 的内存访问是完全连续的（Row-major），可以完美利用 CPU 的 L1 Cache 空间局部性并自动触发硬件预取，同时允许编译器进行 SIMD 向量化。\n\n修改后的代码：\n// 第一个矩阵乘法\nfor (i = 0; i < _PB_NI; i++) {\n  for (j = 0; j < _PB_NJ; j++) {\n    tmp[i][j] = SCALAR_VAL(0.0);\n  }\n  for (k = 0; k < _PB_NK; k++) {\n    DATA_TYPE alpha_A = alpha * A[i][k];\n    for (j = 0; j < _PB_NJ; j++) {\n      tmp[i][j] += alpha_A * B[k][j];\n    }\n  }\n}\n// 第二个矩阵乘法\nfor (i = 0; i < _PB_NI; i++) {\n  for (j = 0; j < _PB_NL; j++) {\n    D[i][j] *= beta;\n  }\n  for (k = 0; k < _PB_NJ; k++) {\n    DATA_TYPE tmp_val = tmp[i][k];\n    for (j = 0; j < _PB_NL; j++) {\n      D[i][j] += tmp_val * C[k][j];\n    }\n  }\n}",
+          "expected_speedup": "4.0x - 8.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_2mm (Memory Hierarchy)",
+          "technique": "Loop Tiling (循环分块) + OpenMP 多线程并行化",
+          "code_changes": "在循环重排的基础上，引入 2D/3D 循环分块（Tiling/Blocking）以适配 L2/L3 缓存大小，并使用 `#pragma omp parallel for` 进行多核并行化。\n\n示例代码片段：\n#pragma omp parallel for collapse(2) private(k, j)\nfor (int i = 0; i < _PB_NI; i += BLOCK_I) {\n  for (int k = 0; k < _PB_NK; k += BLOCK_K) {\n    for (int j = 0; j < _PB_NJ; j += BLOCK_J) {\n      // 内层微内核进行分块计算...\n    }\n  }\n}",
+          "expected_speedup": "10.0x - 20.0x (多核 CPU)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenACC 将两个矩阵乘法（GEMM）内核映射到 GPU。每个线程块（Thread Block）负责计算输出矩阵（`tmp` 或 `D`）的一个 2D 子块（例如 16x16 或 32x32）。利用 GPU 的共享内存（Shared Memory）进行分块协同加载，减少对全局内存（Global Memory）的重复访问。",
+        "data_layout": "保持现有的行优先（Row-Major）二维数组布局。在 GPU 内存中分配连续的线性内存（使用 `cudaMallocPitch` 确保对齐），以实现合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "共享内存冲突（Bank Conflicts）：在分块加载和转置访问时，需通过填充（Padding，如 `[BLOCK_SIZE][BLOCK_SIZE + 1]`）来避免 Bank 冲突。",
+          "数据传输开销：CPU 与 GPU 之间的数据拷贝（`A`, `B`, `C`, `D` 往返）可能成为瓶颈。应尽量将前后置任务都保留在 GPU 上，或使用统一内存（Unified Memory）及异步流（Streams）掩盖传输延迟。"
+        ],
+        "expected_speedup": "50.0x - 150.0x (相比于单线程 CPU 原始实现)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "O(N) [具体为 (2*NI*NJ*NK + 2*NI*NJ*NL) FLOPs / (sizeof(DATA_TYPE) * (NI*NK + NK*NJ + NJ*NL + NI*NL + NI*NJ)) Bytes]",
+        "cache_behavior": "在原始 i-j-k 结构中，最内层循环访问 `B[k][j]`（第一部分）和 `C[k][j]`（第二部分）。由于 `k` 每次递增，访问跨度为一整行的大小（`NJ` 或 `NL` 个元素）。当矩阵规模大于 L1/L2 Cache 容量时，每次 `k` 循环都会发生 Cache Line Miss，导致严重的缓存抖动（Cache Thrashing）。",
+        "data_dependencies": [
+          "第一部分：`tmp[i][j]` 存在跨 `k` 循环的写后读（RAW）自累加依赖，但由于 `k` 是最内层，可以通过寄存器重命名或临时变量规避。",
+          "第二部分：`D[i][j]` 存在跨 `k` 循环的写后读（RAW）自累加依赖，且在 `k` 循环开始前有基于 `beta` 的自乘初始化依赖。"
+        ]
+      },
+      "cost": 0.0252735,
+      "bottleneck_raw": "Memory Bandwidth & Cache Misses (L1/L2/L3)"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": true,
+      "s1_matches_gt": true,
+      "s2_matches_gt": false,
+      "correction_type": "over-correction"
+    },
+    "total_cost": 0.033873
+  }
+}

@@ -1,0 +1,107 @@
+{
+  "program": "heat_3d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03276875,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-78",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with nested loops iterating over the 3D grid, performing updates on each element.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 3D arrays with non-contiguous memory access patterns, leading to potential cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem is highly parallelizable due to the independent updates of grid points, making it suitable for GPU execution.",
+        "recommended_approach": "Port the kernel to CUDA or OpenCL, using a 3D grid of threads to map directly to the 3D data structure."
+      },
+      "cost": 0.00801325,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality",
+        "reasoning": "该程序是典型的 3D 7 点 stencil（模板）计算。在每次迭代中，计算一个网格点需要访问其自身以及 6 个相邻方向（前、后、左、右、上、下）的元素。虽然最内层循环 k 具有良好的空间局部性，但跨越 i 和 j 维度的访问（如 A[i+1][j][k] 和 A[i][j+1][k]）会导致非连续的内存跨步访问。当网格尺寸 N 较大时，这些跨步访问会超出 L1/L2 缓存容量，导致严重的缓存失效（Cache Misses）和高昂的内存带宽开销。此外，每个时间步（t）都需要在 A 和 B 数组之间进行全量数据拷贝/交替计算，产生了极高的内存流量，而算术强度极低。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Loop Tiling (3D Spatial Blocking) & Loop Fusion",
+          "code_changes": "将 3D 空间循环（i, j, k）划分为较小的 3D 块（Block Size: Ti, Tj, Tk），使每个块的数据能够完全容纳在 L1/L2 缓存中。代码改动示例：\n```cpp\nint Ti = 32, Tj = 32, Tk = 32;\nfor (int bi = 1; bi < _PB_N-1; bi += Ti) {\n    for (int bj = 1; bj < _PB_N-1; bj += Tj) {\n        for (int bk = 1; bk < _PB_N-1; bk += Tk) {\n            for (int i = bi; i < MIN(bi+Ti, _PB_N-1); i++) {\n                for (int j = bj; j < MIN(bj+Tj, _PB_N-1); j++) {\n                    #pragma omp simd\n                    for (int k = bk; k < MIN(bk+Tk, _PB_N-1); k++) {\n                        // Stencil computation\n                    }\n                }\n            }\n        }\n    }\n}\n```",
+          "expected_speedup": "2.0x - 3.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Temporal Blocking (时间套叠/时间分块)",
+          "code_changes": "打破时间步 t 与空间循环的严格顺序，在 3D 空间块上同时在时间维度（t）上进行分块。即在一个数据块被加载到缓存中时，连续计算多个时间步（例如 t=1 和 t=2），从而大幅减少从主内存中重复加载 A 和 B 的次数。这需要引入斜向分块（Tiling with dependency slopes）以处理时间依赖性。",
+          "expected_speedup": "3.0x - 5.0x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "OpenMP Parallelism & Vectorization (SIMD)",
+          "code_changes": "在最外层空间循环（分块后）引入 `#pragma omp parallel for collapse(2)` 实现多核并行化，并在最内层循环使用 `#pragma omp simd` 或编译器向量化引导，同时使用 `-ffast-math` 允许编译器优化浮点数乘加（FMA）。",
+          "expected_speedup": "8.0x - 15.0x (取决于 CPU 核心数)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将 3D 网格映射到 GPU 的 3D 线程块（Thread Blocks）。每个线程负责计算一个网格点 (i, j, k) 的更新。利用 GPU 的共享内存（Shared Memory）或只读数据缓存（Texture Cache/LDG）来缓存 3D 模板所需的邻域数据，减少对全局内存（Global Memory）的重复访问。采用双缓冲区（Double Buffering）指针交换技术，避免在每个时间步结束时进行物理数据拷贝。",
+        "data_layout": "保持行优先（Row-Major）布局，确保最内层维度 k 映射到 CUDA 的 `threadIdx.x`，以实现全局内存的合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "共享内存容量限制：3D 块导入共享内存时，边界元素（Halo cells）的加载开销较大，需要精细设计 Block 尺寸（如 32x4x4 或 16x8x4）。",
+          "线程束分化与边界处理：边缘处的线程不参与计算，可能导致轻微的分支分化，可通过填充（Padding）或统一分支条件来缓解。"
+        ],
+        "expected_speedup": "30x - 80x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.11 FLOPs/byte",
+        "cache_behavior": "在最内层 k 循环中，A[i][j][k-1]、A[i][j][k]、A[i][j][k+1] 具有极佳的空间局部性，命中 L1 Cache。然而，A[i][j-1][k] 和 A[i][j+1][k] 引入了大小为 N * sizeof(double) 的跨步，而 A[i-1][j][k] 和 A[i+1][j][k] 引入了大小为 N^2 * sizeof(double) 的跨步。当 N > 128 时，这些跨步会导致 L2/L3 缓存行被频繁替换，产生大量的 Capacity Misses 和 Conflict Misses。",
+        "data_dependencies": [
+          "时间步依赖：第 t 步的 B 依赖于第 t 步的 A；第 t 步的 A 依赖于第 t-1 步的 B（RAW 依赖）。",
+          "空间依赖：计算 (i, j, k) 位置的值依赖于前一状态下其周围 6 个邻域点的值，无同一步内的写后读（RAW）冲突，空间上完全可并行。"
+        ]
+      },
+      "cost": 0.0247555,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03276875
+  }
+}

@@ -65,6 +65,14 @@ class LLMClient:
                     "API Key not found. Set ARK_API_KEY environment variable "
                     "for DeepSeek (Volcengine Ark)."
                 )
+        elif model.startswith("gemini"):
+            self.api_key = api_key or os.getenv("GEMINI_API_KEY")
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            if not self.api_key:
+                raise ValueError(
+                    "API Key not found. Set GEMINI_API_KEY environment variable "
+                    "for Gemini (Google AI)."
+                )
         else:
             self.api_key = api_key or os.getenv("OPENAI_API_KEY")
             base_url = None
@@ -110,12 +118,17 @@ class LLMClient:
         logger.debug(f"Sending request to {self.model}...")
         start_time = time.time()
         
+        extra = {}
+        if self.model.startswith("gemini"):
+            extra["reasoning_effort"] = "none"
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=self.temperature,
-                max_completion_tokens=self.max_tokens
+                max_completion_tokens=self.max_tokens,
+                **extra
             )
         except Exception as e:
             logger.error(f"API request failed: {e}")

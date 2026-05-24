@@ -1,0 +1,100 @@
+{
+  "program": "fdtd_2d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03503325,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (lines 66-92)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel involves regular data access patterns and independent operations across iterations, which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, ensuring data transfer between host and device is minimized and overlapped with computation where possible."
+      },
+      "cost": 0.00885325,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality",
+        "reasoning": "该程序是典型的2D FDTD（时域有限差分）算法，其核心瓶颈在于内存带宽和缓存失效。首先，算法的算术强度极低，每个时步（t）中对数据的读写操作远多于浮点运算。其次，在更新 ey、ex 和 hz 时，存在跨行（如 hz[i-1][j]、ey[i+1][j]）和跨列（如 hz[i][j-1]、ex[i][j+1]）的非连续内存访问。在时间步循环（t）中，整个大数组被反复读写，当数据集大小超过 L3 缓存容量时，会导致严重的 DRAM 带宽瓶颈。此外，多个独立的嵌套循环导致了多次内存扫描，未能实现时间局部性（Temporal Locality）的复用。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_fdtd_2d 循环融合与向量化",
+          "technique": "Loop Fusion & SIMD Vectorization",
+          "code_changes": "将更新 ey、ex 和 hz 的多个独立 i, j 嵌套循环融合为一个统一的 i, j 循环（在处理边界条件的前提下），以提高空间局部性，并使用 #pragma omp parallel for simd 引导编译器进行多线程并行化和 SIMD 向量化。修改后的核心结构如下：\n\nfor (t = 0; t < _PB_TMAX; t++) {\n  // 1. 边界条件更新\n  for (j = 0; j < _PB_NY; j++) ey[0][j] = _fict_[t];\n  \n  // 2. 融合 ey 和 ex 的更新\n  #pragma omp parallel for collapse(2)\n  for (i = 1; i < _PB_NX; i++) {\n    for (j = 1; j < _PB_NY; j++) {\n      ey[i][j] = ey[i][j] - 0.5f * (hz[i][j] - hz[i-1][j]);\n      ex[i][j] = ex[i][j] - 0.5f * (hz[i][j] - hz[i][j-1]);\n    }\n  }\n  // 处理 i=0 的 ex 边界和 j=0 的 ey 边界...\n  \n  // 3. 更新 hz\n  #pragma omp parallel for collapse(2)\n  for (i = 0; i < _PB_NX - 1; i++) {\n    for (j = 0; j < _PB_NY - 1; j++) {\n      hz[i][j] = hz[i][j] - 0.7f * (ex[i][j+1] - ex[i][j] + ey[i+1][j] - ey[i][j]);\n    }\n  }\n}",
+          "expected_speedup": "2.0x - 4.0x (CPU 多核)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "时间与空间维度的瓷砖化 (Tiling)",
+          "technique": "Polyhedral Time-Space Tiling",
+          "code_changes": "利用多面体编译技术（如 PLUTO）或手动进行时间-空间联合分块（Time-Space Tiling）。将 t 循环与 i, j 循环进行倾斜（Skewing）并分块，使得一个数据块在 L2/L3 缓存中连续完成多个时步（t）的更新后再写回主存，从而彻底解决内存带宽瓶颈。",
+          "expected_speedup": "5.0x - 10.0x (对于超大网格)",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 将 ex, ey, hz 数组分配在 GPU 显存上，仅在初始化和结束时进行 Host-Device 数据拷贝。\n2. 将每个时间步内的 2D 空间循环映射为 GPU 的 2D Grid/Block 线程结构。\n3. 使用 2D 共享内存（Shared Memory）进行光晕区（Halo/Ghost Cells）缓存，以消除对全局显存（Global Memory）的重复跨步访问。\n4. 采用双缓冲（Double Buffering）或异步流（CUDA Streams）重叠时间步之间的部分计算与边界同步。",
+        "data_layout": "保持 C 语言的行优先（Row-Major）布局。在 GPU 线程映射时，确保 threadIdx.x 映射到最内层循环维度（j 维度），以实现合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "时步 t 之间的全局同步：GPU 无法跨 Block 进行硬件级全局同步，必须在每个时步结束时退出 Kernel 或使用 CUDA Cooperative Groups，这会引入额外的同步开销。",
+          "共享内存的边界处理（Halo Exchange）：在 Shared Memory 中加载邻域元素（如 i-1, j-1, i+1, j+1）时，需要处理复杂的边界分支条件，容易导致线程束分歧（Warp Divergence）。"
+        ],
+        "expected_speedup": "20x - 50x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.15 FLOPs/byte",
+        "cache_behavior": "在每个时间步 t 中，ex, ey, hz 数组被完整扫描多次。由于数组大小通常远超 L2/L3 缓存，每次扫描都会将之前的数据冲刷出缓存，导致极高的 L3 Cache Miss Rate。跨行访问（如 hz[i-1][j] 和 ey[i+1][j]）在 C 语言按行存储的布局下，会导致非连续的内存跨步（Stride）访问，无法有效利用 CPU 的硬件预取器（Hardware Prefetcher）。",
+        "data_dependencies": [
+          "时间步 t 之间的 RAW（写后读）依赖：t+1 步的 ey, ex 依赖于 t 步的 hz，而 t 步的 hz 又依赖于 t 步的 ey, ex。",
+          "空间依赖：ey[i][j] 依赖于 hz[i-1][j]（i 维度空间依赖）；ex[i][j] 依赖于 hz[i][j-1]（j 维度空间依赖）；hz[i][j] 依赖于 ex[i][j+1] 和 ey[i+1][j]（前向空间依赖）。"
+        ]
+      },
+      "cost": 0.02618,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03503325
+  }
+}

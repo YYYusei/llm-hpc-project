@@ -1,0 +1,118 @@
+{
+  "program": "gramschmidt",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Misses (Non-contiguous Access)",
+  "s1_score": 52.52710843373494,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.02986725,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt, line 66",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with multiple nested loops, which are likely to dominate the execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "inner loop in kernel_gramschmidt, line 73",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs a reduction operation to compute the norm, which is computationally intensive.",
+          "confidence": "high"
+        },
+        {
+          "location": "inner loop in kernel_gramschmidt, line 78",
+          "estimated_time_percentage": "30%",
+          "reason": "This loop updates the Q matrix, involving division operations which are costly.",
+          "confidence": "medium"
+        },
+        {
+          "location": "nested loops in kernel_gramschmidt, lines 81-86",
+          "estimated_time_percentage": "20%",
+          "reason": "These loops perform matrix updates, which involve multiple memory accesses and arithmetic operations.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The algorithm involves frequent memory accesses for matrix operations, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm involves parallelizable operations on large matrices, which are well-suited for GPU acceleration.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix operations to the GPU, ensuring data is transferred efficiently between host and device."
+      },
+      "cost": 0.01160775,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Misses (Non-contiguous Access)",
+        "reasoning": "该算法的核心瓶颈在于非连续的内存访问模式。在 C 语言中，二维数组是按行优先（Row-major）存储的。然而，在 `kernel_gramschmidt` 的所有内层循环中，访问 `A[i][k]`、`Q[i][k]` 和 `A[i][j]` 时，最内层循环变量都是 `i`（对应行索引）。这意味着程序在以跨步（Stride）为 `N` 的方式访问内存，导致极差的空间局部性（Spatial Locality），引发频繁的 L1/L2 缓存失效和 TLB 抖动。此外，在计算 `R[k][j]` 和更新 `A[i][j]` 时，存在重复的内存加载。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_gramschmidt (Memory Layout & Loop Nest)",
+          "technique": "Matrix Transposition & Loop Fusion",
+          "code_changes": "1. 在计算前将矩阵 A 转置为 A_T (N x M)，使得对 A 的列访问变为对 A_T 的行连续访问。\n2. 将计算 R[k][j] 和更新 A[i][j] 的两个 i 循环合并（Loop Fusion），减少对 Q[i][k] 和 A[i][j] 的重复加载。\n3. 使用 SIMD 向量化指令（如 #pragma omp simd 或 #pragma vector always）加速连续内存的累加和更新。",
+          "expected_speedup": "3.0x - 5.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Inner Loops (i-loops)",
+          "technique": "Loop Unrolling & Cache Blocking",
+          "code_changes": "对合并后的内层 i 循环进行 4x 或 8x 循环展开（Loop Unrolling），以充分利用 CPU 的向量寄存器并隐藏 L1 缓存延迟。对于超大矩阵，引入分块（Blocking）技术以适应 L2/L3 缓存大小。",
+          "expected_speedup": "1.5x - 2.0x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 将 A 矩阵转置后拷贝至 GPU 显存，或直接在 GPU 端使用 Col-major 布局。\n2. 每次外层循环 k，使用一个 Reduction Kernel 计算 R[k][k]（向量模长）。\n3. 使用一个 Element-wise Kernel 并行计算 Q[i][k]。\n4. 使用自定义的 GEMV/GEMM 算子或调用 cuBLAS（如 cublasDger）并行更新剩余的 A 矩阵列（j = k+1 到 N）。",
+        "data_layout": "强烈建议在 GPU 端使用列优先（Column-major）布局存储 A 和 Q 矩阵，以确保在 CUDA 线程块（Thread Block）内实现合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "外层循环 k 的串行依赖导致需要频繁启动 GPU Kernel，带来额外的 API 启动开销。",
+          "在 k 较大时，剩余未处理的列数（N-k）变少，GPU 的并行度会逐渐降低，导致尾部效应。"
+        ],
+        "expected_speedup": "20x - 50x (相比于未优化的 CPU 单线程版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.25 FLOPs/byte",
+        "cache_behavior": "极差。由于以跨步 N 访问 A[i][k] 和 Q[i][k]，每次加载一个 cache line（64字节）却只使用其中一个 double/float 元素，导致 cache 污染和极低的带宽利用率。转置后，cache 命中率可接近 100%。",
+        "data_dependencies": [
+          "Loop-carried dependence: 迭代 k 依赖于前一个迭代 k-1 产生的 Q 和 R 矩阵的值（MGS 算法的固有串行性）。",
+          "Read-after-Write (RAW) dependency: 在更新 A[i][j] 时，必须先完成 R[k][j] 的计算。"
+        ]
+      },
+      "cost": 0.0182595,
+      "bottleneck_raw": "Memory Bandwidth & Cache Misses (Non-contiguous Access)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.02986725
+  }
+}

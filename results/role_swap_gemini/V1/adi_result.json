@@ -1,0 +1,107 @@
+{
+  "program": "adi",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality (Stride Access)",
+  "s1_score": 60.74999999999999,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03051475,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_adi, Column Sweep loop, line 66",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs multiple nested iterations over the array, leading to significant computational workload.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi, Row Sweep loop, line 80",
+          "estimated_time_percentage": "40%",
+          "reason": "Similar to the Column Sweep, this loop also involves nested iterations and array accesses, contributing heavily to execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays, which can lead to cache misses and memory bandwidth limitations, indicating a memory-bound bottleneck."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent operations within the sweeps, making it suitable for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the sweeps, with each thread handling a portion of the array. Optimize memory access patterns to utilize shared memory effectively."
+      },
+      "cost": 0.00942725,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality (Stride Access)",
+        "reasoning": "在 Column Sweep 阶段，内层循环 `j` 访问 `u[j][i-1]`、`u[j][i]` 和 `u[j][i+1]`。由于 C 语言是行优先存储（Row-major），而此处 `j` 作为行索引在最内层变化，导致了跨步（Stride）为 `N` 的非连续内存访问。这会引发严重的 Cache Miss。此外，在 Row Sweep 阶段，虽然对 `u` 的访问是连续的，但对 `v[i-1][j]`、`v[i][j]` 和 `v[i+1][j]` 的访问同样存在非连续访问问题。这种不匹配的数据布局导致内存带宽利用率极低。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep & Row Sweep Loops",
+          "technique": "Loop Transposition & Array Transposition (数据转置与循环重构)",
+          "code_changes": "在 Column Sweep 之前，将矩阵 `u` 进行转置，使得 `u[j][i]` 的访问变为连续访问；或者利用多维并行化（如 OpenMP 结合 Tiling）来提高缓存复用率。对于 CPU 优化，可以使用 OpenMP 强行并行化外层 `i` 循环，并对内层进行向量化（SIMD）阻碍消除。具体改动：在 `i` 循环外加入 `#pragma omp parallel for private(j)`，并对 `p` 和 `q` 数组进行一维化或局部标量化以消除不必要的内存写回。",
+          "expected_speedup": "2.0x - 4.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Temporary Arrays p and q",
+          "technique": "Scalar Replacement & Register Promotion (标量替换与寄存器提升)",
+          "code_changes": "在内层循环中，`p[i][j]` 和 `q[i][j]` 的计算仅依赖于前一个元素 `p[i][j-1]` 和 `q[i][j-1]`。可以将这些数组的当前迭代值缓存在寄存器/标量变量中，减少对 L1/L2 缓存的频繁读写，最后再批量写回内存。",
+          "expected_speedup": "1.3x - 1.5x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "由于 ADI 算法在单扫（Sweep）的行/列之间是完全独立的，可以采用并行三对角求解器（如 Thomas 算法的并行变体 PCR 或 Hybrid Solver）。在 GPU 上，将外层 `i` 循环映射到 CUDA Thread Blocks。对于 Column Sweep，每个线程处理一列的求解；为了解决非连续访问，在加载 `u` 和 `v` 时，利用 Shared Memory（共享内存）进行协同合并加载（Coalesced Load），并在 Shared Memory 中进行转置后再进行计算。",
+        "data_layout": "建议在 GPU 端维持两套数据布局（原矩阵与转置矩阵），在 Column Sweep 和 Row Sweep 之间进行高效的 GPU 显存转置（Out-of-place Transpose），以确保两个 Sweep 阶段的内层迭代都能实现 100% 的合并内存访问（Coalesced Access）。",
+        "challenges": [
+          "线程间的数据依赖：Thomas 算法本身是串行的（前向消元后向回代），在单列/单行内部无法直接简单并行化，导致 GPU 线程利用率受限。",
+          "非合并内存访问：若不进行转置，跨步访问将导致 GPU 显存带宽下降一个数量级。"
+        ],
+        "expected_speedup": "15x - 30x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.15 FLOPs/byte",
+        "cache_behavior": "在 Column Sweep 中，`u[j][i]` 的非连续访问（跨步为 N）导致每次加载都会将整条 Cache Line（通常 64 字节）载入，但只使用其中一个 `DATA_TYPE`（8 字节），造成严重的缓存污染和极低的缓存空间局部性。Row Sweep 中对 `v` 的访问也存在相同问题。",
+        "data_dependencies": [
+          "Column Sweep 内部: `p[i][j]` 依赖于 `p[i][j-1]`，`q[i][j]` 依赖于 `q[i][j-1]` 和 `p[i][j-1]`（行内一维前缀依赖）。",
+          "Row Sweep 内部: `u[i][j]` 依赖于 `u[i][j+1]`（行内反向依赖）。",
+          "外层时间步 `t` 之间存在全局数据依赖：当前步的 `u` 依赖于上一步计算出的 `v`，而 `v` 又依赖于 `u`。"
+        ]
+      },
+      "cost": 0.0210875,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality (Stride Access)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03051475
+  }
+}

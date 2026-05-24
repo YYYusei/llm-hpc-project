@@ -1,0 +1,113 @@
+{
+  "program": "jacobi2d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth Bound & Cache Misses",
+  "s1_score": 81.15909090909092,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03665375,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "program_key": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel() - Forward sweep loop (line 54)",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop performs the main computation of the Jacobi method, iterating over the grid and updating values, leading to high memory traffic.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel() - Backward sweep loop (line 66)",
+          "estimated_time_percentage": "45%",
+          "reason": "Similar to the forward sweep, this loop also performs the main computation and is responsible for high memory traffic.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code is memory-bound due to the low arithmetic intensity of the Jacobi stencil operation, which involves 5 loads and 1 store per grid point with only 5 FLOPs, resulting in a low FLOPs/byte ratio."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi method is highly suitable for GPU execution due to its regular memory access patterns and lack of data dependencies within each iteration.",
+        "recommended_approach": "Port the kernel to CUDA or OpenCL, using a 2D grid of threads where each thread computes a single grid point, and leverage shared memory to reduce global memory accesses."
+      },
+      "cost": 0.010087,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth Bound & Cache Misses",
+        "reasoning": "该程序是典型的二维五点雅可比模板（Stencil）计算。其核心瓶颈在于极低的算术强度（FLOPs/byte ≈ 0.10）以及巨大的内存流量。在 CPU 上，当网格大小 N=4096 时，两个双精度浮点数组（A 和 B）的总工作集大小为 2 * 4096 * 4096 * 8 字节 = 256 MB，这远远超出了现代 CPU 的 L3 缓存容量。在每次时间步迭代中，程序必须从主内存（DRAM）中重新加载整个数据集，导致严重的内存带宽瓶颈。此外，由于没有进行时间维度的分块（Temporal Blocking），数据在 L3 缓存中的驻留时间极短，无法实现跨时间步的缓存复用。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel (CPU 向量化与多线程)",
+          "technique": "OpenMP 多线程并行化 + 编译器向量化提示 (SIMD)",
+          "code_changes": "void jacobi_kernel(int tsteps, int n, double *A, double *B)\n{\n    int t, i, j;\n    for (t = 0; t < tsteps; t++) {\n        #pragma omp parallel for default(shared) private(i, j)\n        for (i = 1; i < n - 1; i++) {\n            #pragma omp simd\n            for (j = 1; j < n - 1; j++) {\n                B[i * n + j] = 0.2 * (A[i * n + j] + A[i * n + j - 1] + A[i * n + j + 1] + A[(i + 1) * n + j] + A[(i - 1) * n + j]);\n            }\n        }\n        #pragma omp parallel for default(shared) private(i, j)\n        for (i = 1; i < n - 1; i++) {\n            #pragma omp simd\n            for (j = 1; j < n - 1; j++) {\n                A[i * n + j] = 0.2 * (B[i * n + j] + B[i * n + j - 1] + B[i * n + j + 1] + B[(i + 1) * n + j] + B[(i - 1) * n + j]);\n            }\n        }\n    }\n}",
+          "expected_speedup": "4.0x - 8.0x (取决于 CPU 核心数和内存通道数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "jacobi_kernel (缓存局部性优化)",
+          "technique": "2D 空间分块 (Spatial Blocking / Tiling) + 循环展开",
+          "code_changes": "// 将外层循环分解为 Block_i 和 Block_j，以确保工作集拟合在 L2/L3 缓存中\n#define BLOCK_I 64\n#define BLOCK_J 64\n// 在多线程基础上，对 i 和 j 维度进行分块处理，限制活跃数据集大小，减少 Cache Line 冲突失效。",
+          "expected_speedup": "1.5x - 2.5x (在多线程基础上)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel (高级算法优化)",
+          "technique": "时间分块 (Temporal Blocking / Overlapped Tiling)",
+          "code_changes": "// 结合空间分块，在 L3 缓存中一次性推进多个时间步 (t)，从而避免每次迭代都将数据写回并从 DRAM 重新读取。\n// 实现较为复杂，需要处理分块边界的依赖关系（如梯形分块或金字塔分块）。",
+          "expected_speedup": "3.0x - 5.0x (大幅降低 DRAM 带宽压力)",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 或 OpenACC 进行并行化。将 2D 网格映射到 GPU 的 2D 线程块（例如 32x8 或 16x16 的 Thread Block）。利用 GPU 共享内存（Shared Memory）或只读纹理缓存（Texture/Read-Only Cache）来加载中心点及四周的邻居元素，减少对全局内存（Global Memory）的重复访问。使用双缓冲（Ping-Pong Buffer）指针交换，避免物理内存拷贝。",
+        "data_layout": "保持行优先（Row-Major）的一维线性布局。确保最内层线程索引（threadIdx.x）映射到连续的列（j 维度），以实现全局内存的合并访问（Coalesced Memory Access）。",
+        "challenges": [
+          "边界条件处理：边缘线程需要进行分支判断，可能导致线程束分化（Warp Divergence）。可以通过扩大分配边界（Padding）或在内核中进行边界条件特化来解决。",
+          "全局同步开销：每个时间步（Sweep）之间需要进行全局同步。在 CUDA 中，通常通过多次启动轻量级 Kernel 或使用 Cooperative Groups 来实现网格级同步。"
+        ],
+        "expected_speedup": "30x - 100x (相比于单线程 CPU 版本的基准测试)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.104 FLOPs/byte",
+        "cache_behavior": "在内层循环中，A[i * n + j - 1]、A[i * n + j] 和 A[i * n + j + 1] 具有极佳的空间局部性，可复用 Cache Line。然而，南北向邻居 A[(i - 1) * n + j] 和 A[(i + 1) * n + j] 跨越了整行（32KB），会导致频繁的 L1/L2 缓存缺失。当 N=4096 时，由于工作集（256MB）远超 L3 缓存，每次时间步迭代都会发生完全的 L3 缓存失效，导致数据不断从内存中换入换出。",
+        "data_dependencies": [
+          "空间依赖：在单次 Sweep（A->B 或 B->A）内部，网格点计算仅依赖于前一个时间步的旧值，网格点之间不存在数据依赖，可完全并行化。",
+          "时间依赖：第 t 步的 Forward Sweep 强依赖于第 t-1 步的 Backward Sweep 结果，反之亦然。这限制了时间维度的无脑并行，必须通过同步（Barrier）或时间分块来解决。"
+        ]
+      },
+      "cost": 0.02656675,
+      "bottleneck_raw": "Memory Bandwidth Bound & Cache Misses"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03665375
+  }
+}

@@ -1,0 +1,115 @@
+{
+  "program": "nas_cg",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Latency (Irregular Access)",
+  "s1_score": 83.58133971291866,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.039886000000000005,
+  "full_result": {
+    "code_name": "nas_cg",
+    "program_key": "nas_cg",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "sparse_matvec() - line 54",
+          "estimated_time_percentage": "65%",
+          "reason": "This function performs sparse matrix-vector multiplication, which is memory-bound due to irregular memory access patterns and low arithmetic intensity.",
+          "confidence": "high"
+        },
+        {
+          "location": "dot_product() - line 92",
+          "estimated_time_percentage": "15%",
+          "reason": "This function performs a vector inner product, which is memory-bound due to streaming access and low arithmetic intensity.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The primary bottleneck is memory-bound due to irregular memory access patterns in sparse_matvec() and low arithmetic intensity in both sparse_matvec() and dot_product()."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The sparse matrix-vector multiplication can benefit from GPU acceleration, although irregular memory access patterns may limit efficiency.",
+        "recommended_approach": "Port the sparse_matvec() function to GPU using CUDA or OpenCL, focusing on optimizing memory access patterns and using shared memory to reduce global memory access latency."
+      },
+      "cost": 0.010956750000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Latency (Irregular Access)",
+        "reasoning": "在 sparse_matvec() 中，由于稀疏矩阵的非零元素分布不连续，通过 colidx[j] 间接寻址访问向量 x[colidx[j]] 会导致严重的 L1/L2/L3 缓存缺失。此外，该内核的算术强度极低，每次循环迭代仅执行 1 次乘法和 1 次加法（2 FLOPs），却需要加载 1 个 double（8 字节）、1 个 int（4 字节）以及间接加载 1 个 double（8 字节），导致内存带宽成为绝对瓶颈。dot_product() 同样受限于内存带宽，其算术强度仅为 0.125 FLOPs/byte。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "sparse_matvec",
+          "technique": "OpenMP 多线程并行化与循环展开 (Loop Unrolling)",
+          "code_changes": "void sparse_matvec(int n, const int *rowptr, const int *colidx, const double *values, const double *x, double *y) {\n    #pragma omp parallel for schedule(static)\n    for (int i = 0; i < n; i++) {\n        double sum = 0.0;\n        int start = rowptr[i];\n        int end = rowptr[i + 1];\n        int j = start;\n        // 4路循环展开\n        for (; j <= end - 4; j += 4) {\n            sum += values[j] * x[colidx[j]]\n                 + values[j+1] * x[colidx[j+1]]\n                 + values[j+2] * x[colidx[j+2]]\n                 + values[j+3] * x[colidx[j+3]];\n        }\n        for (; j < end; j++) {\n            sum += values[j] * x[colidx[j]];\n        }\n        y[i] = sum;\n    }\n}",
+          "expected_speedup": "4x - 8x (取决于 CPU 核心数和内存通道数)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "dot_product",
+          "technique": "OpenMP 规约与 SIMD 向量化",
+          "code_changes": "double dot_product(const double *x, const double *y, int n) {\n    double sum = 0.0;\n    #pragma omp parallel for reduction(+:sum) simd\n    for (int i = 0; i < n; i++) {\n        sum += x[i] * y[i];\n    }\n    return sum;\n}",
+          "expected_speedup": "3x - 6x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "sparse_matvec",
+          "technique": "软件预取 (Software Prefetching)",
+          "code_changes": "void sparse_matvec(int n, const int *rowptr, const int *colidx, const double *values, const double *x, double *y) {\n    #pragma omp parallel for schedule(static)\n    for (int i = 0; i < n; i++) {\n        double sum = 0.0;\n        int start = rowptr[i];\n        int end = rowptr[i + 1];\n        for (int j = start; j < end; j++) {\n            // 预取后续的 colidx 和 x 元素\n            #if defined(__GNUC__) || defined(__clang__)\n            __builtin_prefetch(&colidx[j + 8], 0, 3);\n            __builtin_prefetch(&x[colidx[j + 4]], 0, 0);\n            #endif\n            sum += values[j] * x[colidx[j]];\n        }\n        y[i] = sum;\n    }\n}",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA 将 SpMV (sparse_matvec) 和 dot_product 移植到 GPU。对于 SpMV，采用 'Merge-Path' 或 'CSR-Vector' 算法，使一个 Warp (32线程) 协同处理一个或多个稀疏行，以确保对 values 和 colidx 的合并内存访问 (Coalesced Access)。利用 GPU 的高带宽显存 (HBM/GDDR) 缓解带宽瓶颈。使用 NVIDIA cuSPARSE 库中的 cusparseSpMV 和 cuBLAS 中的 cublasDdot 可以获得极致的性能。",
+        "data_layout": "保持 CSR 格式，但需确保 rowptr、colidx、values、x 和 y 均分配在 GPU 显存中（使用 cudaMalloc）。为了进一步提升 GPU 上的合并访问效率，可考虑将数据布局转换为 ELLPACK 或 Hybrid 格式。",
+        "challenges": [
+          "由于稀疏矩阵每行的非零元素个数可能不均匀，会导致 Warp 内的线程分支分化 (Thread Divergence) 和负载不均衡。",
+          "x 向量的随机全局内存访问在 GPU 上会产生高延迟，需要依赖 L1/L2 缓存及只读数据缓存 (LDG) 进行缓解。",
+          "频繁在 CPU 和 GPU 之间传输数据会抵消加速效果，必须将整个 CG 迭代循环（包括向量更新）全部移至 GPU 端执行。"
+        ],
+        "expected_speedup": "15x - 30x (相比于单线程 CPU 性能)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.10 - 0.15 FLOPs/byte (对于 sparse_matvec，每次迭代执行 2 FLOPs，需加载 values[j] 8字节、colidx[j] 4字节，以及间接加载 x[colidx[j]] 8字节，总计 20 字节，算术强度为 2/20 = 0.1 FLOPs/byte)",
+        "cache_behavior": "rowptr、values 和 colidx 数组为连续顺序访问，具有良好的 L1/L2 空间局部性。然而，x[colidx[j]] 的访问是随机且不连续的，导致频繁的 L3 缓存缺失和 TLB 抖动。由于矩阵规模较大，x 向量无法完全驻留在 CPU 高速缓存中。",
+        "data_dependencies": [
+          "sparse_matvec() 中，外层循环的各迭代步骤（计算 y[i]）之间完全独立，无数据依赖，可完美进行并行化。",
+          "dot_product() 存在循环迭代间的累加依赖（sum += ...），在并行化时需要使用 Reduction（规约）操作来避免数据竞争。"
+        ]
+      },
+      "cost": 0.02892925,
+      "bottleneck_raw": "Memory Bandwidth & Latency (Irregular Access)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.039886000000000005
+  }
+}

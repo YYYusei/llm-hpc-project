@@ -1,0 +1,101 @@
+{
+  "program": "doitgen",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality",
+  "s1_score": 66.65890481064484,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0256305,
+  "full_result": {
+    "code_name": "doitgen",
+    "program_key": "doitgen",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_doitgen function, lines 54-70",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains nested loops over the dimensions of the input arrays, performing a large number of operations.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The performance is likely limited by memory bandwidth due to the repeated access to large arrays A and C4, especially in the innermost loop where A[r][q][s] and C4[s][p] are accessed."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves a high degree of data parallelism with independent operations across large arrays, making it suitable for GPU acceleration.",
+        "recommended_approach": "Port the kernel_doitgen function to GPU using CUDA or OpenCL, focusing on parallelizing the outer loops and optimizing memory access patterns."
+      },
+      "cost": 0.0081865,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality",
+        "reasoning": "在最内层循环中，`C4[s][p]` 的访问步长为 `NP`（非连续内存访问），导致严重的 Cache Miss。此外，一维临时数组 `sum` 在外层循环 `r` 和 `q` 迭代时被反复写入和读取，产生了不必要的内存流量。由于 `A[r][q][s]` 在内层循环中被重复加载 `NP` 次，缺乏寄存器或高速缓存级别的复用，导致计算访存比极低，受限于内存带宽。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_doitgen",
+          "technique": "Loop Tiling & Register Blocking & Array Transposition",
+          "code_changes": "将 C4 矩阵转置为 C4_trans[p][s] 以实现最内层循环的连续内存访问；同时对 r, q 维度进行 OpenMP 多线程并行化；在最内层引入局部寄存器变量暂存 A[r][q][s] 的值，减少对主存的重复访问。",
+          "expected_speedup": "3x - 5x (CPU)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_doitgen",
+          "technique": "Vectorization (AVX2/AVX-512)",
+          "code_changes": "通过重构循环顺序（Loop Permutation），将 p 循环移至最内层，使得对 sum[p] 和 C4[s][p] 的访问都是连续的，从而允许编译器自动生成高效的 SIMD 向量化指令（如 VFMADD）。",
+          "expected_speedup": "2x - 4x (CPU)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将 `r` 和 `q` 维度映射到 CUDA 的 Grid 维度（Block X 和 Block Y），将 `p` 维度映射到 Thread Block 内部的 Thread 维度。利用 GPU 的 Shared Memory 缓存 `C4` 矩阵的分块（Tiling），并利用寄存器缓存 `A[r][q][s]` 的值，在 Thread Block 内部进行并行规约或直接累加，最后并行写回 `A`。",
+        "data_layout": "保持 A 的 3D 布局（Row-major）不变。为了在 GPU 上实现 coalesced memory access（合并访存），应确保最内层活跃维度（如 `p`）映射到 `threadIdx.x`。C4 矩阵在传输到 GPU 前或在 GPU 内部进行转置，以确保 Shared Memory 加载时避免 Bank Conflict。",
+        "challenges": [
+          "Shared Memory 容量限制：当 `NP` 较大时，无法一次性将整个 `C4` 载入 Shared Memory，需要进行分块（Tiling）处理。",
+          "线程束分化与合并访存：必须仔细设计 Thread Mapping，确保对 `A` 和 `sum` 的读写满足 32 字节对齐的合并访问要求。"
+        ],
+        "expected_speedup": "20x - 50x (相比于单线程 CPU 原始版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.25 FLOPs/byte",
+        "cache_behavior": "原始代码中，`C4[s][p]` 随着 `s` 的增加跨行访问，导致 L1/L2 Cache 命中率极低。`A[r][q][s]` 在 `p` 循环中被重复加载 `NP` 次，若 `NP` 较大，超出了 L1 Cache 容量，会导致严重的 Cache 抖动（Thrashing）。",
+        "data_dependencies": [
+          "在给定的 r 和 q 迭代步内，`sum[p]` 的计算依赖于 `A[r][q][s]` 和 `C4[s][p]` 的乘加结果。",
+          "写回操作 `A[r][q][p] = sum[p]` 必须在当前 `r, q` 下的所有 `sum` 计算完成后才能进行，但不同 `r` 和 `q` 之间的计算是完全独立的，无数据依赖。"
+        ]
+      },
+      "cost": 0.017444,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0256305
+  }
+}

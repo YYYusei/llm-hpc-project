@@ -1,0 +1,100 @@
+{
+  "program": "hotspot",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "Memory Bandwidth & Instruction Overhead",
+  "s1_score": 66.125,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": false,
+    "s2_matches_gt": true,
+    "correction_type": "correction"
+  },
+  "cost": 0.032109,
+  "full_result": {
+    "code_name": "hotspot",
+    "program_key": "hotspot",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "compute_tran_temp() - inner loop at line 66",
+          "estimated_time_percentage": "85%",
+          "reason": "This loop performs the main 2D stencil computation, which is the core of the thermal simulation and involves multiple arithmetic operations per grid cell.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the intensive arithmetic operations required for the 5-point stencil computation across a large grid."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular grid updates with a 5-point stencil, which is highly parallelizable and suitable for GPU execution.",
+        "recommended_approach": "Use CUDA or OpenCL to implement the stencil computation on the GPU, leveraging the parallel nature of the grid updates to achieve significant speedup."
+      },
+      "cost": 0.010949750000000001,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Instruction Overhead",
+        "reasoning": "虽然初步分析认为该程序是计算密集型（Compute-bound），但深入分析 5 点 stencil 结构可以发现，其算术强度（Arithmetic Intensity）较低。每个网格点需要加载 5 个温度值和 1 个功耗值（共 48 字节），仅进行约 11 次浮点运算，算术强度约为 0.23 FLOPs/byte，远低于现代 CPU 的上限，因此实际受限于内存带宽。此外，内循环中存在大量的 `if-else` 分支判断（用于区分边界和内部节点），导致严重的控制流分支预测失败和指令流水线停顿。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "compute_tran_temp() 循环结构",
+          "technique": "边界剥离 (Boundary Peeling) 与分支消除",
+          "code_changes": "将 0 和 row-1 行、0 和 col-1 列的边界计算剥离到独立的循环中处理。内部核心循环（1 到 row-2，1 到 col-2）完全消除 if-else 条件分支，仅保留纯粹的 5 点 stencil 核心计算，从而允许编译器进行高效的向量化（SIMD）。",
+          "expected_speedup": "2.0x - 3.0x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "compute_tran_temp() 内存访问",
+          "technique": "循环分块 (Loop Tiling/Blocking) 与 OpenMP 多线程并行化",
+          "code_changes": "引入二维空间分块（Tiling）以提高 L1/L2 缓存命中率。同时，使用 `#pragma omp parallel for collapse(2)` 对外层分块循环进行多线程并行化，并使用 `__restrict__` 关键字修饰指针以消除别名假定，促进 SIMD 自动向量化。",
+          "expected_speedup": "8.0x - 15.0x (在多核 CPU 上)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenACC 进行二维线程块映射。每个线程负责计算一个网格点。利用 GPU 共享内存（Shared Memory）加载一个 `(BlockDimX + 2) * (BlockDimY + 2)` 的光晕区（Halo Region），以减少对全局内存（Global Memory）的重复访问。时间步迭代在 Host 端循环控制，核函数在 Device 端异步发射。",
+        "data_layout": "保持现有的 1D 线性行优先（Row-Major）布局，确保相邻线程（ThreadIdx.x）访问连续的内存地址，从而实现完全的合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "边界分支处理：GPU 线程束（Warp）内若执行不同的边界分支会导致严重的线程束分歧（Warp Divergence）。解决方案：在 Shared Memory 载入时统一处理边界填充（Padding），使核心计算逻辑完全一致。",
+          "全局内存带宽瓶颈：5 点 stencil 极易触发 GPU 内存带宽瓶颈。必须通过 Shared Memory 协作缓存或使用 Read-Only Cache (`__ldg()`) 来最大化带宽利用率。"
+        ],
+        "expected_speedup": "30x - 80x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.229 FLOPs/byte",
+        "cache_behavior": "在未优化的版本中，由于按行扫描，读取 `temp[(i+1)*col + j]`（南向节点）会产生跨行非连续访问，导致 L1/L2 缓存行频繁替换。随着网格尺寸增大，缓存抖动（Cache Thrashing）加剧。通过分块（Tiling）可以将数据复用限制在 L1/L2 缓存内。",
+        "data_dependencies": [
+          "时间步迭代依赖：第 k+1 次迭代的 temp 数组完全依赖于第 k 次迭代的 result 数组，无法跨时间步直接并行。",
+          "空间无依赖：在单次时间步迭代内，`result[i*col + j]` 的更新仅依赖于上一时间步的 `temp` 周边节点，空间网格点之间不存在写后读（RAW）冲突，可完全并行化。"
+        ]
+      },
+      "cost": 0.021159249999999998,
+      "bottleneck_raw": "Memory Bandwidth & Instruction Overhead"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": false,
+      "s2_matches_gt": true,
+      "correction_type": "correction"
+    },
+    "total_cost": 0.032109
+  }
+}

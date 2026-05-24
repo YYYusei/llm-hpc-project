@@ -1,0 +1,100 @@
+{
+  "program": "trmm",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Misses",
+  "s1_score": 65.00675675675676,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.02785125,
+  "full_result": {
+    "code_name": "trmm",
+    "program_key": "trmm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_trmm, line 56",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the matrix operations are performed, involving nested loops over large matrices.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The performance is likely limited by memory bandwidth due to the frequent access to matrix elements in a non-contiguous manner, especially in the innermost loop where B[k][j] is accessed."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves large matrix operations which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the outer loops, ensuring that each thread handles a portion of the matrix multiplication."
+      },
+      "cost": 0.0073377500000000005,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Cache Misses",
+        "reasoning": "原始实现中，最内层循环 `k` 遍历时，`B[k][j]` 的访问跨度为 `N` 个元素（非连续内存访问），导致严重的 Cache Miss。同时，`A[k][i]` 的访问跨度为 `M` 个元素，同样不连续。这使得计算单元（ALU）在大部分时间内都在等待内存数据，属于典型的内存带宽与缓存局部性瓶颈。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_trmm",
+          "technique": "Loop Nest Optimization (Permutation & Tiling)",
+          "code_changes": "通过交换循环顺序（Loop Permutation），将对 `j` 的循环移到最内层，使得 `B[i][j]` 和 `B[k][j]` 的内存访问在空间上连续（Row-major 友好）。同时，引入分块（Tiling）以提高 L1/L2 缓存命中率，并利用 SIMD 向量化。\n\n优化后的核心计算逻辑如下：\n```cpp\n// 循环重组：i -> k -> j\nfor (int i = 0; i < _PB_M; i++) {\n  for (int j = 0; j < _PB_N; j++) {\n    B[i][j] = alpha * B[i][j]; // 先应用 alpha 缩放（或在最后统一缩放）\n  }\n}\n// 重新组织累加过程以实现连续访问\nfor (int i = 0; i < _PB_M; i++) {\n  for (int k = i + 1; k < _PB_M; k++) {\n    DATA_TYPE tmp = A[k][i];\n    #pragma omp simd\n    for (int j = 0; j < _PB_N; j++) {\n      B[i][j] += tmp * B[k][j];\n    }\n  }\n}\n```",
+          "expected_speedup": "4x - 8x (CPU 单核，取决于编译器向量化效果)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_trmm",
+          "technique": "OpenMP Parallelism",
+          "code_changes": "在最外层 `i` 循环引入多线程并行化，结合上述循环重组，最大化多核 CPU 利用率。\n```cpp\n#pragma omp parallel for collapse(1) schedule(static)\nfor (int i = 0; i < _PB_M; i++) {\n  // 内部执行重组后的 k-j 循环\n}\n```",
+          "expected_speedup": "10x - 30x (多核 CPU 扩展)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "将矩阵 B 划分为 2D 线程块（Thread Blocks）。每个线程负责计算 B 矩阵中的一个或多个元素。利用 GPU 共享内存（Shared Memory）对 A 的子块和 B 的子块进行协同加载（Coalesced Loading），在 Shared Memory 中完成乘加累加，最后写回全局内存（Global Memory）。",
+        "data_layout": "保持行优先（Row-Major）布局。由于 GPU 线程束（Warp）内的线程访问连续的 `j` 维度，`B[k][j]` 的访问将天然满足合并访存（Coalesced Memory Access）的要求。",
+        "challenges": [
+          "由于 A 是下三角矩阵且转置使用（`A[k][i]`，其中 `k > i`），在分块（Tiling）时需要处理边界不对称问题，避免加载无用的上三角零元素。",
+          "需要精细控制 Shared Memory 的大小，防止 Register Spilling（寄存器溢出）降低 Occupancy（活跃线程束比例）。"
+        ],
+        "expected_speedup": "50x - 100x (相比于未优化的 CPU 串行版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "O(M^2 * N) FLOPs / O(M^2 + M*N) Bytes ≈ O(M) FLOPs/Byte。当 M, N 较大时，理论上属于计算密集型，但由于原始代码极差的访存局部性，实际表现为严重的访存受限（Memory-bound）。",
+        "cache_behavior": "原始代码中，最内层 `k` 循环导致 `B[k][j]` 每次迭代跨越 `N * sizeof(DATA_TYPE)` 字节，无法利用 Cache Line 的空间局部性。`A[k][i]` 每次迭代跨越 `M * sizeof(DATA_TYPE)` 字节，同样导致 L1/L2 D-Cache 频繁失效。",
+        "data_dependencies": [
+          "在 `k` 循环中，`B[i][j]` 存在写后读（RAW）和读后写（WAR）的自依赖，但由于 `i` 和 `k`（k > i）不重叠，不同 `j` 之间的计算是完全独立的，可以安全地进行向量化和并行化。"
+        ]
+      },
+      "cost": 0.0205135,
+      "bottleneck_raw": "Memory Bandwidth & Cache Misses"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.02785125
+  }
+}

@@ -1,0 +1,113 @@
+{
+  "program": "hpcg_symgs",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Latency (Bound by Data Dependency)",
+  "s1_score": 80.0391432791728,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.032800249999999996,
+  "full_result": {
+    "code_name": "hpcg",
+    "program_key": "hpcg_symgs",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "forward sweep loop starting at line 47",
+          "estimated_time_percentage": "50%",
+          "reason": "Iterates over all rows and non-zero elements, performing multiple memory accesses and computations.",
+          "confidence": "high"
+        },
+        {
+          "location": "backward sweep loop starting at line 67",
+          "estimated_time_percentage": "50%",
+          "reason": "Similar to the forward sweep, iterates over all rows and non-zero elements, performing multiple memory accesses and computations.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent memory accesses to matrix values and indices, which is typical in sparse matrix operations. The computation is relatively simple compared to the cost of memory access."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem is suitable for GPU acceleration due to its high degree of parallelism in processing independent rows of the matrix.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the row-wise operations, ensuring that each thread handles one or more rows of the matrix. Optimize memory access patterns to coalesce global memory accesses."
+      },
+      "cost": 0.008505,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Latency (Bound by Data Dependency)",
+        "reasoning": "SYMGS (Symmetric Gauss-Seidel) 算法本质上是稀疏矩阵向量乘法 (SpMV) 与三角解 (Triangular Solve) 的结合。其核心瓶颈在于：1. 极低的算术强度，每个浮点操作都需要从内存加载大量的非零元数值、列索引以及向量元素；2. 严重的行间数据依赖性（当前行的计算依赖于前面行已更新的 xv[curCol] 值），这导致了循环无法直接并行化，造成 CPU 流水线停顿和高昂的缓存一致性开销；3. 间接寻址（xv[curCol]）导致非连续的、随机的内存访问，极易引起 L1/L2 缓存缺失。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "消除前向与后向扫尾循环中的冗余对角线计算",
+          "technique": "Diagonal Extraction & Loop Splitting",
+          "code_changes": "在循环外提取对角线元素，或在存储时将对角线元素与非对角线元素分离。在内层循环中，避免将对角线元素乘入 sum 再在循环外减去的冗余操作。通过调整数据结构，使内层循环仅遍历非对角线元素：\n```cpp\n// 优化后内层循环示例\nfor (int j = 0; j < currentNumberOfNonzeros; j++) {\n  local_int_t curCol = currentColIndices[j];\n  if (curCol != i) {\n    sum -= currentValues[j] * xv[curCol];\n  }\n}\nxv[i] = sum / currentDiagonal;\n```\n更彻底的改动是在预处理阶段将对角线元素单独存储在连续数组 `invDiagonal[i] = 1.0 / matrixDiagonal[i][0]` 中，消除除法并减少指针间接引用。",
+          "expected_speedup": "1.15x - 1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "消除多级指针间接寻址 (Pointer Chasing)",
+          "technique": "Data Layout Flattening (CSR/ELLPACK)",
+          "code_changes": "原始代码中 `A.matrixValues[i]` 和 `A.mtxIndL[i]` 是二维指针数组，导致每次外层循环都要进行两次指针跳转。应将其扁平化为标准的一维 CSR (Compressed Sparse Row) 格式：\n```cpp\n// 使用一维连续数组\nconst double * const values = A.flatMatrixValues; // 一维数组\nconst local_int_t * const colIndices = A.flatMtxIndL;\nconst local_int_t * const rowOffsets = A.rowOffsets;\n// 循环内部：\nlocal_int_t rowStart = rowOffsets[i];\nlocal_int_t rowEnd = rowOffsets[i+1];\nfor (local_int_t j = rowStart; j < rowEnd; j++) {\n  // 连续内存访问...\n}\n```",
+          "expected_speedup": "1.3x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "并行化前向与后向扫尾",
+          "technique": "Multi-Coloring (多色染色法) 并行化",
+          "code_changes": "由于行与行之间存在数据依赖，无法直接使用 `#pragma omp parallel for`。必须在预处理阶段对矩阵的邻接图进行染色（Coloring），使得相同颜色的行之间没有数据依赖。然后按颜色顺序进行并行计算：\n```cpp\nfor (int color = 0; color < numColors; color++) {\n  int colorSize = colorSizes[color];\n  const local_int_t* rows = colorPointer[color];\n  #pragma omp parallel for schedule(static)\n  for (int k = 0; k < colorSize; k++) {\n    local_int_t i = rows[k];\n    // 执行该行的 GS 迭代...\n  }\n}\n```",
+          "expected_speedup": "3.0x - 8.0x (在多核 CPU 上)",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "基于多色染色法 (Multi-Coloring) 的并行化。将矩阵行分为若干不相关的颜色组，同一颜色组内的所有行在 GPU 上通过不同的 Thread Block/Thread 完全并行发射。利用 CUDA Block 内部的 Shared Memory 缓存高频访问的 `xv` 局部片段。",
+        "data_layout": "将二维指针结构彻底扁平化。推荐使用 1) 适合 GPU 合并访问的 Sliced-ELLPACK 格式，或 2) 经过行重排（Row Reordering，按颜色分组排列）的标准 CSR 格式，以确保同一 Warp 内的线程访问连续的内存地址。",
+        "challenges": [
+          "染色数（Color Count）与并行度的权衡：颜色太多会导致内核启动开销大、同步频繁；颜色太少可能导致负载不均衡。",
+          "GPU 上的非合并内存访问：`xv[curCol]` 的随机读取会导致严重的 DRAM 带宽浪费。需要通过重排矩阵列索引或使用 L2 Cache / Texture Cache 缓解。"
+        ],
+        "expected_speedup": "10x - 30x (相比于单线程 CPU 基准)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.15 - 0.25 FLOPs/byte",
+        "cache_behavior": "由于稀疏矩阵的间接寻址 `xv[curCol]`，导致 L1/L2 Data Cache 命中率极低。此外，原始代码中 `matrixValues[i]` 和 `mtxIndL[i]` 的多级指针结构破坏了空间局部性，使得 CPU 硬件预取器（Hardware Prefetcher）无法有效工作。",
+        "data_dependencies": [
+          "Loop-carried dependence: 前向扫尾中，第 i 行的计算依赖于 `xv[curCol]`（其中 curCol < i 且已被前面步骤更新的值）。",
+          "Write-after-Read / Read-after-Write: 后向扫尾中，第 i 行的计算依赖于 `xv[curCol]`（其中 curCol > i 且已被后向步骤更新的值）。"
+        ]
+      },
+      "cost": 0.024295249999999997,
+      "bottleneck_raw": "Memory Bandwidth & Latency (Bound by Data Dependency)"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.032800249999999996
+  }
+}

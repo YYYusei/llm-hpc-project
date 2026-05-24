@@ -1,0 +1,101 @@
+{
+  "program": "syrk",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality",
+  "s1_score": 66.52031093279838,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.029553999999999997,
+  "full_result": {
+    "code_name": "syrk",
+    "program_key": "syrk",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_syrk, lines 61-75",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the matrices.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The performance is likely limited by memory bandwidth due to the repeated access to matrix elements in a non-contiguous manner, especially in the innermost loop."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves dense matrix operations which are well-suited for the parallel architecture of GPUs.",
+        "recommended_approach": "Port the kernel to use CUDA or OpenCL, focusing on optimizing memory access patterns and maximizing occupancy."
+      },
+      "cost": 0.00746725,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality",
+        "reasoning": "原始实现中，最内层循环 `for (j = 0; j <= i; j++)` 访问 `C[i][j]` 和 `A[j][k]`。由于 `A` 的布局是 `[N][M]`，在最内层循环中，`A[j][k]` 的访问跨越了不同的行（`j` 变化，而 `k` 固定），这导致了非连续的内存访问（Stride-M 访问）。当 `M` 较大时，这会引发严重的 Cache Miss。此外，`C[i][j]` 在 `k` 循环的每次迭代中都被重复读写，缺乏寄存器复用。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_syrk",
+          "technique": "Loop Interchange & Loop Fusion",
+          "code_changes": "将 `k` 循环与 `j` 循环调换位置，使最内层循环变为对 `j` 的连续访问。同时，将 `C[i][j] *= beta` 的初始化与累加计算合并或分离优化，以提高向量化效率。\n\n优化后的核心代码：\n```cpp\n#pragma omp parallel for private(j, k)\nfor (int i = 0; i < _PB_N; i++) {\n  for (int j = 0; j <= i; j++) {\n    C[i][j] *= beta;\n  }\n  for (int k = 0; k < _PB_M; k++) {\n    DATA_TYPE temp = alpha * A[i][k];\n    #pragma omp simd\n    for (int j = 0; j <= i; j++) {\n      C[i][j] += temp * A[j][k];\n    }\n  }\n}\n```",
+          "expected_speedup": "3x - 5x (CPU 单核，得益于 SIMD 向量化和 Cache 命中率提升)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_syrk",
+          "technique": "Loop Tiling (Blocking)",
+          "code_changes": "对 `i`, `j`, `k` 维度进行分块（Tiling），将数据缓存在 L1/L2 Cache 中，最大化时间局部性。结合 OpenMP 多线程并行化。\n\n```cpp\nint BLOCK_I = 64;\nint BLOCK_J = 64;\nint BLOCK_K = 64;\n#pragma omp parallel for collapse(2) private(i, j, k)\nfor (int ii = 0; ii < _PB_N; ii += BLOCK_I) {\n  for (int jj = 0; jj < _PB_N; jj += BLOCK_J) {\n    // 结合分块进行局部乘加更新...\n  }\n}\n```",
+          "expected_speedup": "5x - 10x (多核并行 + 分块)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "利用 CUDA/HIP 将其映射为二维 Thread Block。每个 Thread Block 负责计算 `C` 矩阵的一个子块（Tile）。利用 GPU 的 Shared Memory 缓存 `A` 矩阵的子块，避免对全局内存（Global Memory）的重复和非连续访问。最内层使用外积（Outer Product）形式在寄存器中累加，最后写回 Global Memory。或者直接调用高度优化的 cuBLAS 库中的 `cublasDsyrk` / `cublasSsyrk`。",
+        "data_layout": "保持行优先（Row-Major）布局。在 GPU 载入 Shared Memory 时，通过合并访存（Coalesced Memory Access）将 `A[j][k]` 转置或按行连续读取，以消除 Bank Conflict 并最大化总线带宽利用率。",
+        "challenges": [
+          "由于 `C` 是对称矩阵且只更新下三角（`j <= i`），线程块划分时会存在负载不均衡（三角区域的边界 Thread Block 只有部分线程工作）。",
+          "Shared Memory 的大小限制了 Tile 的尺寸，需要精细调优 Block Size（如 16x16 或 32x32）。"
+        ],
+        "expected_speedup": "20x - 50x (相比于优化前的单线程 CPU 版本)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "O(N^2 * M) FLOPs / O(N^2 + N*M) Bytes ≈ O(M) FLOPs/Byte。当 M 较小时，属于典型的访存受限（Memory-bound）任务；当 M 较大且进行良好分块时，可转化为计算受限（Compute-bound）。",
+        "cache_behavior": "原始代码中，`A[j][k]` 沿列方向（`j` 维）访问，每次访问跨越 `M` 个元素，导致 L1/L2 Cache 命中率极低。优化后，通过循环交换，`A[j][k]` 变为沿行方向或在分块内访问，空间局部性显著提升；同时 `C[i][j]` 的写回被延迟，提高了寄存器和 L1 Cache 的时间局部性。",
+        "data_dependencies": [
+          "对 `C[i][j]` 的累加存在 Read-After-Write (RAW) 依赖，但由于 `i` 和 `j` 的迭代相互独立，在 `j` 维度上可以安全地进行并行化和向量化。",
+          "对 `A` 矩阵只有只读操作，不存在数据竞争。"
+        ]
+      },
+      "cost": 0.02208675,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.029553999999999997
+  }
+}

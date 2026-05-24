@@ -1,0 +1,100 @@
+{
+  "program": "trmm",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "gemini-3.5-flash",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "Memory Bandwidth & Cache Locality",
+  "s1_score": 66.50675675675676,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.022911,
+  "full_result": {
+    "code_name": "trmm",
+    "program_key": "trmm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_trmm function, lines 56-66",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the matrix operations are performed, involving nested loops over large matrices.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel involves accessing elements of matrices A and B in a non-contiguous manner, leading to inefficient memory access patterns and potential cache misses."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves a high degree of parallelism due to the independent operations on matrix elements, which is well-suited for GPU execution.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the outer loops, ensuring that each thread handles a portion of the matrix operations."
+      },
+      "cost": 0.00767375,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gemini-3.5-flash",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "Memory Bandwidth & Cache Locality",
+        "reasoning": "在核心计算循环中，A[k][i] 的访问步长为 M（按列遍历），导致严重的 Cache Miss。同时，B[k][j] 的访问在最内层循环中跨行进行，无法有效利用空间局部性。此外，由于缺乏向量化（SIMD）支持，且算术强度较低，导致 CPU 执行效率低下。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_trmm 循环重构与向量化",
+          "technique": "Loop Permutation & Tiling & Vectorization",
+          "code_changes": "将循环顺序从 i-j-k 调整为 i-k-j，使最内层循环对 B[i][j] 和 B[k][j] 的访问变为连续内存访问（行优先），从而允许编译器自动生成 SIMD 向量化指令。同时引入分块（Tiling）以提高 L1/L2 缓存命中率。",
+          "expected_speedup": "4.0x - 8.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "矩阵 A 转置优化",
+          "technique": "Explicit Transposition",
+          "code_changes": "在计算前，显式地将下三角矩阵 A 的转置存储到连续的临时缓冲区中，使 A[k][i] 的读取在计算时变为连续的 A_transposed[i][k] 访问，彻底消除非连续内存步长问题。",
+          "expected_speedup": "2.0x - 3.0x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "使用 CUDA/OpenCL 进行二维线程块映射。将线程块（Thread Block）映射到 B 矩阵的 (i, j) 维度。利用共享内存（Shared Memory）对 A 的子块和 B 的子块进行协同加载（Coalesced Loading），在 Block 内部进行分块乘法累加。",
+        "data_layout": "保持行优先（Row-Major）布局。确保最内层线程（threadIdx.x）映射到 j 维度，以实现对 B 矩阵合并内存访问（Coalesced Memory Access）。",
+        "challenges": [
+          "由于 A 是三角矩阵（k 从 i+1 开始），线程块内部会存在分支发散（Branch Divergence）和负载不均衡问题。解决方案：采用动态任务划分或在 Warp 级别进行掩码计算。",
+          "全局内存带宽瓶颈。解决方案：必须使用 Shared Memory 缓存 A 和 B 的热点数据。"
+        ],
+        "expected_speedup": "20x - 50x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.16 FLOPs/byte",
+        "cache_behavior": "在原始 i-j-k 循环中，A[k][i] 每次迭代都会发生 L1/L2 Cache Miss，因为其跨步为 M 个元素。B[k][j] 的访问同样跨越了 B 的整行（步长为 N）。重构为 i-k-j 后，最内层对 B[k][j] 的访问变为连续的，缓存命中率将接近 100%。",
+        "data_dependencies": [
+          "B[i][j] 在 k 循环中存在读后写（RAW）自依赖，但由于 k 循环是累加操作，可以通过引入临时寄存器变量消除对内存的频繁写入。",
+          "不同 j 迭代之间不存在数据依赖，可以完全并行化。"
+        ]
+      },
+      "cost": 0.01523725,
+      "bottleneck_raw": "Memory Bandwidth & Cache Locality"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.022911
+  }
+}
