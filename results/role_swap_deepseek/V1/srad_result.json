@@ -1,0 +1,123 @@
+{
+  "program": "srad",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "compute",
+  "s1_score": 63.19036697247705,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "compute",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0336175,
+  "full_result": {
+    "code_name": "srad",
+    "program_key": "srad",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "srad_kernel - Phase 1: Compute diffusion coefficients (lines 47-97)",
+          "estimated_time_percentage": "45%",
+          "reason": "Heavy arithmetic operations including gradients, ICOV, and exponential function calls.",
+          "confidence": "high"
+        },
+        {
+          "location": "srad_kernel - Phase 2: Update image using diffusion equation (lines 100-118)",
+          "estimated_time_percentage": "33%",
+          "reason": "Involves divergence computation and image update, which are computationally intensive.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The code is dominated by arithmetic operations, particularly the computation of gradients, ICOV, and the use of exponential functions, which are computationally expensive."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm has a regular grid access pattern and each element's computation is independent per step, making it well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the srad_kernel function to CUDA or OpenCL, using a grid of threads where each thread computes the diffusion for a single pixel."
+      },
+      "cost": 0.01109675,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "compute",
+        "reasoning": "程序的主要计算集中在srad_kernel函数中，包含大量浮点运算，特别是昂贵的指数函数exp()（通过c[idx] = 1.0 / (1.0 + den)实现，其中den涉及除法运算）、除法、平方根（在ICOV计算中隐含）和梯度计算。虽然内存访问模式规则，但计算密度高，每个像素需要约40-50次浮点运算，而每次迭代需要访问约10个双精度值（8字节），算术强度约为0.5-0.6 FLOPs/byte，属于计算密集型。指数函数的近似计算是主要瓶颈。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "指数函数近似",
+          "technique": "使用查找表或多项式近似替代昂贵的exp()函数",
+          "code_changes": "将c[idx] = 1.0 / (1.0 + den)中的指数计算替换为：\n1. 预计算查找表：static const float exp_table[TABLE_SIZE];\n2. 使用分段多项式近似：\n   float x = den;\n   if (x < -4.0f) c = 1.0f;\n   else if (x > 4.0f) c = 0.0f;\n   else c = 1.0f / (1.0f + polynomial_approx(x));",
+          "expected_speedup": "2-3倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "循环优化",
+          "technique": "循环展开、数据预取、减少边界检查",
+          "code_changes": "1. 展开内层循环4-8次：for (j = 0; j < cols-7; j+=8) { ... }\n2. 预取数据：__builtin_prefetch(&image[(i+1)*cols + j]);\n3. 边界处理分离：先处理内部区域，再单独处理边界",
+          "expected_speedup": "1.2-1.5倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "内存访问优化",
+          "technique": "数据布局转换、缓存分块",
+          "code_changes": "1. 将二维数组转换为结构体数组以提高局部性：\n   struct Pixel { double val, dN, dS, dW, dE, c; };\n2. 实施缓存分块：\n   for (ii = 0; ii < rows; ii += TILE) {\n     for (jj = 0; jj < cols; jj += TILE) {\n       for (i = ii; i < min(ii+TILE, rows); i++) {\n         for (j = jj; j < min(jj+TILE, cols); j++) { ... }",
+          "expected_speedup": "1.3-1.8倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "数值精度优化",
+          "technique": "使用单精度浮点数",
+          "code_changes": "将double改为float，调整常数：\n1. float *image, *dN, *dS, *dW, *dE, *c;\n2. 调整lambda和q0sqr为float类型\n3. 在关键计算中使用单精度数学函数",
+          "expected_speedup": "1.5-2.0倍（内存带宽和计算速度提升）",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 每个线程处理一个像素，线程块大小16x16或32x8\n2. 使用共享内存缓存像素块及其halo区域\n3. 将两次循环合并为单个内核以减少全局内存访问\n4. 使用CUDA流实现异步传输和计算重叠",
+        "data_layout": "1. 使用行主序存储（与CPU一致）\n2. 考虑使用纹理内存或只读缓存存储image数组\n3. 将中间结果（dN,dS,dW,dE,c）存储在寄存器或共享内存中",
+        "challenges": [
+          "边界处理：需要特殊处理边界像素，可通过填充（padding）或条件判断",
+          "寄存器压力：每个线程需要存储多个双精度值，可能限制occupancy",
+          "全局内存带宽：每次迭代需要读取image和写入image，带宽可能成为瓶颈",
+          "迭代间同步：需要全局同步确保每次迭代完成"
+        ],
+        "expected_speedup": "50-200倍（相对于单核CPU），具体取决于GPU架构和优化程度"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.5-0.6 FLOPs/byte",
+        "cache_behavior": "1. 空间局部性良好：每个像素访问其4个邻居，在行主序存储中，水平邻居（jW/jE）具有良好缓存局部性，垂直邻居（iN/iS）可能跨缓存行。\n2. 时间局部性有限：每个像素的中间结果（dN,dS,dW,dE,c）在Phase 1计算后立即在Phase 2使用，但跨迭代时数据重用有限。\n3. 缓存容量问题：对于2048x2048双精度数组（32MB），超过典型L3缓存，导致缓存颠簸。",
+        "data_dependencies": [
+          "迭代内依赖：Phase 2依赖Phase 1计算的dN,dS,dW,dE和c数组",
+          "迭代间依赖：每次迭代的image更新作为下一次迭代的输入，形成强数据依赖",
+          "空间依赖：每个像素计算需要其4邻域值，但无跨像素依赖，可并行计算"
+        ]
+      },
+      "cost": 0.02252075,
+      "bottleneck_raw": "compute"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "compute",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0336175
+  }
+}

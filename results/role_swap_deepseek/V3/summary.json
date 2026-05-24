@@ -1,0 +1,600 @@
+{
+  "variant": {
+    "key": "V3",
+    "label": "Role-Swap V3 Biased agreement"
+  },
+  "timestamp": "2026-05-24T16:12:53.704800",
+  "programs_tested": [
+    "trmm",
+    "adi",
+    "fdtd_2d",
+    "heat_3d",
+    "seidel_2d"
+  ],
+  "results": {
+    "trmm": {
+      "program": "trmm",
+      "config": "Role-Swap V3 Biased agreement",
+      "s1_model": "gpt-4o",
+      "s2_model": "deepseek-v3-2-251201",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 66.50675675675676,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "compute",
+        "changed": false,
+        "s1_matches_gt": false,
+        "s2_matches_gt": false,
+        "correction_type": "no-change"
+      },
+      "cost": 0.028133,
+      "full_result": {
+        "code_name": "trmm",
+        "program_key": "trmm",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_trmm, line 56",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel with nested loops iterating over matrices A and B, performing a large number of operations.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The performance is likely limited by memory bandwidth due to the frequent access to matrices A and B, especially in the innermost loop where B[i][j] is updated multiple times."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The computation involves a large number of independent operations on matrices, which is well-suited for parallel execution on a GPU.",
+            "recommended_approach": "Port the kernel_trmm function to CUDA or OpenCL, using shared memory to optimize memory access patterns and maximize parallel execution."
+          },
+          "cost": 0.0075337500000000005,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "deepseek-v3-2-251201",
+          "validation": {},
+          "analysis": {
+            "agree_with_initial": true,
+            "primary_bottleneck": "memory",
+            "reasoning": "该代码的核心瓶颈确实是内存带宽。分析循环结构：外层循环i遍历M，中层循环j遍历N，内层循环k从i+1到M-1。对于每个B[i][j]的更新，需要访问A[k][i]和B[k][j]。由于B矩阵按行存储，B[k][j]的访问在j循环中具有良好的空间局部性，但A[k][i]的访问模式是跨行的（k变化时访问不同行的第i列），这导致缓存效率低下。特别是当M较大时，每次内层循环都会产生大量的缓存缺失。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "循环重排序",
+              "technique": "交换循环顺序以改善数据局部性",
+              "code_changes": "将循环顺序从i-j-k改为k-j-i。具体实现：\nfor (k = 1; k < _PB_M; k++)\n  for (j = 0; j < _PB_N; j++)\n    for (i = 0; i < k; i++)\n      B[i][j] += A[k][i] * B[k][j];\nfor (i = 0; i < _PB_M; i++)\n  for (j = 0; j < _PB_N; j++)\n    B[i][j] = alpha * B[i][j];",
+              "expected_speedup": "2-5倍（取决于缓存大小）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "循环分块",
+              "technique": "对B矩阵进行分块以利用缓存",
+              "code_changes": "对j循环进行分块，块大小设为适合L1缓存：\nint jb = 32; // 根据实际缓存调整\nfor (jj = 0; jj < _PB_N; jj += jb)\n  for (i = 0; i < _PB_M; i++)\n    for (j = jj; j < min(jj+jb, _PB_N); j++)\n      for (k = i+1; k < _PB_M; k++)\n        B[i][j] += A[k][i] * B[k][j];",
+              "expected_speedup": "1.5-3倍",
+              "difficulty": "medium"
+            },
+            {
+              "target": "数据布局优化",
+              "technique": "对A矩阵进行转置或使用块存储",
+              "code_changes": "在计算前对A矩阵的部分进行转置：\n// 预处理：将A的列转换为行存储\nfor (i = 0; i < M; i++)\n  for (k = i+1; k < M; k++)\n    A_trans[i][k] = A[k][i];\n// 然后在循环中使用A_trans[i][k]",
+              "expected_speedup": "1.2-2倍",
+              "difficulty": "hard"
+            },
+            {
+              "target": "向量化",
+              "technique": "使用SIMD指令优化内层循环",
+              "code_changes": "使用编译器指令或内联汇编实现向量化：\n#pragma omp simd\nfor (j = 0; j < _PB_N; j++)\n  B[i][j] += A[k][i] * B[k][j];",
+              "expected_speedup": "2-4倍（取决于SIMD宽度）",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "1. 将B矩阵的列分配给不同的线程块\n2. 每个线程块处理一列或几列B矩阵\n3. 使用共享内存缓存A矩阵的块以减少全局内存访问\n4. 使用归约操作处理内层k循环的累加",
+            "data_layout": "1. 保持B矩阵的行主序存储\n2. 对A矩阵进行转置或使用纹理内存以提高访问效率\n3. 使用共享内存缓存A的列块和B的行块",
+            "challenges": [
+              "内层k循环的归约需要同步操作",
+              "A矩阵的跨行访问模式在GPU上效率低下",
+              "B矩阵的写入需要处理数据竞争（当多个k迭代更新同一个B[i][j]时）",
+              "负载不平衡：不同i值的循环长度不同（k从i+1到M-1）"
+            ],
+            "expected_speedup": "10-50倍（相对于优化后的CPU版本），取决于GPU内存带宽和计算能力"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "约0.5 FLOPs/byte（每个内层迭代：1次乘加（2FLOPs），读取A[k][i]（8字节），读取B[k][j]（8字节），写入B[i][j]（8字节），共24字节）",
+            "cache_behavior": "1. B矩阵访问：在j循环中具有良好的空间局部性（连续访问）\n2. A矩阵访问：跨行访问模式差，导致缓存行利用率低\n3. 数据重用：B[k][j]在i循环中被重用，但A[k][i]在j循环中被重用",
+            "data_dependencies": [
+              "B[i][j]在i和j循环间存在流依赖（flow dependency）",
+              "内层循环k可并行化，但需要原子操作或归约",
+              "外层循环i存在反依赖（anti-dependency），因为B[i][j]被读取和写入"
+            ]
+          },
+          "cost": 0.02059925,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "compute",
+          "changed": false,
+          "s1_matches_gt": false,
+          "s2_matches_gt": false,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.028133
+      }
+    },
+    "adi": {
+      "program": "adi",
+      "config": "Role-Swap V3 Biased agreement",
+      "s1_model": "gpt-4o",
+      "s2_model": "deepseek-v3-2-251201",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 60.74999999999999,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.03205125,
+      "full_result": {
+        "code_name": "adi",
+        "program_key": "adi",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_adi, Column Sweep loop, line 66",
+              "estimated_time_percentage": "40%",
+              "reason": "This loop performs multiple nested iterations over the array, leading to significant computational workload.",
+              "confidence": "high"
+            },
+            {
+              "location": "kernel_adi, Row Sweep loop, line 80",
+              "estimated_time_percentage": "40%",
+              "reason": "Similar to the Column Sweep, this loop also involves nested iterations and array accesses, contributing heavily to execution time.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The code involves frequent access to large 2D arrays, which can lead to cache misses and memory bandwidth limitations, indicating a memory-bound bottleneck."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The code involves regular data access patterns and independent operations within loops, making it suitable for parallel execution on a GPU.",
+            "recommended_approach": "Use CUDA or OpenCL to parallelize the loops, focusing on distributing the work across multiple threads and optimizing memory access patterns."
+          },
+          "cost": 0.00925925,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "deepseek-v3-2-251201",
+          "validation": {},
+          "analysis": {
+            "agree_with_initial": true,
+            "primary_bottleneck": "memory",
+            "reasoning": "代码中涉及对大型二维数组的频繁访问，存在以下内存瓶颈：1) 列扫描循环中访问u[j][i±1]导致跨行访问，破坏了空间局部性；2) 行扫描循环中访问v[i±1][j]导致跨列访问；3) p和q数组的访问模式为p[i][j-1]，存在跨步访问；4) 每个时间步需要多次遍历整个数组，导致高内存带宽需求。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "Column Sweep loop (line 66)",
+              "technique": "循环分块和数组转置",
+              "code_changes": "1) 在列扫描前对u数组进行转置，使u[j][i]变为u[i][j]；2) 对循环进行分块处理：\n// 转置u数组\n#pragma omp parallel for collapse(2)\nfor (int i=0; i<n; i++)\n  for (int j=0; j<n; j++)\n    u_trans[i][j] = u[j][i];\n// 分块列扫描\nint block_size = 64; // 根据缓存大小调整\nfor (int ii=1; ii<n-1; ii+=block_size) {\n  int i_end = min(ii+block_size, n-1);\n  for (int i=ii; i<i_end; i++) {\n    // 原列扫描代码，使用转置后的u_trans\n  }\n}",
+              "expected_speedup": "2-3倍",
+              "difficulty": "medium"
+            },
+            {
+              "target": "Row Sweep loop (line 80)",
+              "technique": "循环交换和数据预取",
+              "code_changes": "1) 将内层循环展开4次以减少分支开销；2) 添加预取指令：\nfor (i=1; i<_PB_N-1; i++) {\n  u[i][0] = SCALAR_VAL(1.0);\n  p[i][0] = SCALAR_VAL(0.0);\n  q[i][0] = u[i][0];\n  // 预取下一行数据\n  __builtin_prefetch(&v[i+1][0], 0, 3);\n  // 循环展开\n  for (j=1; j<_PB_N-1; j+=4) {\n    // 展开4次迭代\n    p[i][j] = -f / (d*p[i][j-1]+e);\n    q[i][j] = (-a*v[i-1][j]+(SCALAR_VAL(1.0)+SCALAR_VAL(2.0)*a)*v[i][j] - c*v[i+1][j]-d*q[i][j-1])/(d*p[i][j-1]+e);\n    // 重复3次...\n  }\n  // 处理剩余迭代...\n}",
+              "expected_speedup": "1.5-2倍",
+              "difficulty": "easy"
+            },
+            {
+              "target": "整体算法",
+              "technique": "数据布局优化和缓存阻塞",
+              "code_changes": "1) 将p,q数组改为结构体数组以提高局部性；2) 使用SoA布局：\ntypedef struct { DATA_TYPE p, q; } pq_t;\npq_t POLYBENCH_2D(pq, N, N, n, n);\n// 修改访问为pq[i][j].p和pq[i][j].q\n// 添加缓存阻塞策略\nint tile_size = 32;\nfor (int t=1; t<=_PB_TSTEPS; t++) {\n  for (int ti=1; ti<n-1; ti+=tile_size) {\n    for (int tj=1; tj<n-1; tj+=tile_size) {\n      // 处理tile内的计算\n    }\n  }\n}",
+              "expected_speedup": "1.2-1.5倍",
+              "difficulty": "hard"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "1) 每个时间步分为两个内核：列扫描内核和行扫描内核；2) 列扫描内核：每个线程块处理一列，线程处理一列中的多个元素；3) 行扫描内核：每个线程块处理一行；4) 使用共享内存存储临时数据以减少全局内存访问",
+            "data_layout": "使用行优先存储，对于列扫描内核，通过共享内存转置或使用纹理内存优化访问模式",
+            "challenges": [
+              "1) 列扫描中的递归依赖(p[i][j]依赖p[i][j-1])需要并行前缀扫描算法；2) 内存访问模式不连续；3) 需要频繁的内核启动和数据传输开销；4) 需要仔细处理边界条件"
+            ],
+            "expected_speedup": "10-50倍（相对于优化后的CPU版本）"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "约0.5 FLOPs/byte",
+            "cache_behavior": "1) 列扫描中u[j][i±1]访问导致缓存行利用率低（每缓存行仅使用1-2个元素）；2) p[i][j-1]访问模式具有时间局部性但空间局部性差；3) 工作集大小约4×N²个元素，当N较大时超出缓存容量",
+            "data_dependencies": [
+              "列扫描内层循环存在反依赖：p[i][j]依赖p[i][j-1]；q[i][j]依赖q[i][j-1]和u[j][i±1]",
+              "行扫描类似依赖模式",
+              "时间步之间存在流依赖：v依赖前一时间步的u，u依赖前一时间步的v"
+            ]
+          },
+          "cost": 0.022792,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.03205125
+      }
+    },
+    "fdtd_2d": {
+      "program": "fdtd_2d",
+      "config": "Role-Swap V3 Biased agreement",
+      "s1_model": "gpt-4o",
+      "s2_model": "deepseek-v3-2-251201",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 61.533919597989936,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.02779875,
+      "full_result": {
+        "code_name": "fdtd_2d",
+        "program_key": "fdtd_2d",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_fdtd_2d (lines 66-95)",
+              "estimated_time_percentage": "90%",
+              "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The code consists of regular, data-parallel operations on large arrays, which are well-suited for GPU acceleration.",
+            "recommended_approach": "Port the main computational loops in kernel_fdtd_2d to CUDA or OpenCL, ensuring data is transferred efficiently between host and device."
+          },
+          "cost": 0.00893725,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "deepseek-v3-2-251201",
+          "validation": {},
+          "analysis": {
+            "agree_with_initial": true,
+            "primary_bottleneck": "memory",
+            "reasoning": "该代码存在严重的内存访问问题：1) 循环嵌套顺序导致非连续内存访问（j循环在外层，i循环在内层时访问ex[i][j]和ey[i][j]是跨步访问）；2) 三个嵌套循环分别访问不同的数组，导致缓存行利用率低；3) 数据依赖限制了循环融合和重排的优化空间；4) 每个浮点操作需要多次内存访问，算术强度低。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "循环顺序优化",
+              "technique": "循环交换",
+              "code_changes": "将j和i循环顺序交换，确保内存连续访问。\n修改前：for (i = 1; i < _PB_NX; i++)\n          for (j = 0; j < _PB_NY; j++)\n修改后：for (j = 0; j < _PB_NY; j++)\n          for (i = 1; i < _PB_NX; i++)",
+              "expected_speedup": "1.5-2x",
+              "difficulty": "easy"
+            },
+            {
+              "target": "数据局部性优化",
+              "technique": "循环分块",
+              "code_changes": "对循环进行分块处理，提高缓存利用率。\nint block_size = 64; // 根据L1缓存大小调整\nfor (ii = 1; ii < _PB_NX; ii += block_size)\n  for (jj = 0; jj < _PB_NY; jj += block_size)\n    for (i = ii; i < min(ii+block_size, _PB_NX); i++)\n      for (j = jj; j < min(jj+block_size, _PB_NY); j++)",
+              "expected_speedup": "1.2-1.5x",
+              "difficulty": "medium"
+            },
+            {
+              "target": "指令级并行",
+              "technique": "循环展开",
+              "code_changes": "手动展开内层循环4-8次，减少循环开销。\nfor (i = 1; i < _PB_NX-3; i+=4) {\n    ey[i][j] = ey[i][j] - 0.5*(hz[i][j]-hz[i-1][j]);\n    ey[i+1][j] = ey[i+1][j] - 0.5*(hz[i+1][j]-hz[i][j]);\n    // ... 继续展开\n}",
+              "expected_speedup": "1.1-1.3x",
+              "difficulty": "medium"
+            },
+            {
+              "target": "内存访问优化",
+              "technique": "数据预取",
+              "code_changes": "在关键位置插入预取指令，隐藏内存延迟。\n#ifdef __INTEL_COMPILER\n    #pragma prefetch hz:0:1\n    #pragma prefetch ey:1:1\n#endif",
+              "expected_speedup": "1.05-1.15x",
+              "difficulty": "hard"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "2D网格划分，每个线程处理一个网格点。使用三层内核分别对应三个嵌套循环，通过全局同步确保数据依赖。",
+            "data_layout": "使用行优先存储，确保合并内存访问。考虑使用纹理内存或常量内存存储_fict_数组。",
+            "challenges": [
+              "时间循环依赖：t循环不能直接并行化，需要顺序执行",
+              "边界处理：需要特殊处理边界条件（j=0, i=0等）",
+              "全局同步开销：三个内核间的同步可能成为瓶颈",
+              "寄存器压力：每个线程需要存储多个数组元素"
+            ],
+            "expected_speedup": "10-50x (相比优化后的CPU版本)，具体取决于GPU内存带宽和问题规模"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "约0.25 FLOPs/byte (每个循环迭代约4次浮点运算，16字节内存访问)",
+            "cache_behavior": "差。当前循环顺序导致缓存行利用率低，每次内存访问可能只使用缓存行中的少量数据。跨循环的数组访问导致缓存污染。",
+            "data_dependencies": [
+              "流依赖：ey[i][j]依赖于hz[i][j]和hz[i-1][j]",
+              "反依赖：无明显的写后读冲突",
+              "输出依赖：无明显的写后写冲突",
+              "循环携带依赖：t循环存在跨迭代的依赖，限制了t循环的并行化"
+            ]
+          },
+          "cost": 0.0188615,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.02779875
+      }
+    },
+    "heat_3d": {
+      "program": "heat_3d",
+      "config": "Role-Swap V3 Biased agreement",
+      "s1_model": "gpt-4o",
+      "s2_model": "deepseek-v3-2-251201",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 63.02710843373494,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.03068625,
+      "full_result": {
+        "code_name": "heat_3d",
+        "program_key": "heat_3d",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_heat_3d, lines 54-80",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the 3D grid.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The kernel involves multiple accesses to large 3D arrays A and B, with each element being accessed multiple times in a stencil pattern. This results in a high memory bandwidth requirement, making it memory-bound."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The problem is highly parallelizable due to its regular data access patterns and independent computations across grid points, making it suitable for GPU execution.",
+            "recommended_approach": "Port the kernel to CUDA or OpenCL, using a 3D grid of threads to map directly to the 3D data structure, ensuring coalesced memory accesses for efficiency."
+          },
+          "cost": 0.00848925,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "deepseek-v3-2-251201",
+          "validation": {},
+          "analysis": {
+            "agree_with_initial": true,
+            "primary_bottleneck": "memory",
+            "reasoning": "该内核执行3D热传导的七点模板计算，每个网格点需要访问7个相邻元素（i±1, j±1, k±1）。对于每个时间步，需要两次完整遍历整个3D数组（A→B和B→A）。计算与访存比很低：每个网格点约15次浮点运算，但需要访问7个输入元素和1个输出元素（假设双精度，共64字节）。算术强度约为15 FLOPs / 64 bytes = 0.23 FLOPs/byte，远低于现代CPU的机器平衡点（通常>1 FLOPs/byte），因此是典型的内存带宽受限问题。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "内存访问模式",
+              "technique": "循环分块（tiling）",
+              "code_changes": "将3D循环分解为外层块循环和内层点循环，使每个块能放入CPU缓存。例如：将i,j,k循环分块为BLK_SIZE的子块，确保子块数据（约BLK_SIZE³个元素）能放入L2/L3缓存。",
+              "expected_speedup": "1.5-3倍（取决于缓存大小和问题规模）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "数据局部性",
+              "technique": "循环交换（loop interchange）",
+              "code_changes": "将最内层循环改为连续内存访问维度。在C语言中，数组按行优先存储，因此最内层应为k维度（A[i][j][k]中k连续）。当前代码已是最优布局（k在最内层）。",
+              "expected_speedup": "已优化，无额外收益",
+              "difficulty": "easy"
+            },
+            {
+              "target": "计算强度",
+              "technique": "标量替换和寄存器重用",
+              "code_changes": "将A[i][j][k]加载到寄存器变量，避免多次从内存加载。例如：double center = A[i][j][k]; 然后在三个方向的计算中复用center值。",
+              "expected_speedup": "1.1-1.2倍",
+              "difficulty": "easy"
+            },
+            {
+              "target": "并行化",
+              "technique": "OpenMP并行化",
+              "code_changes": "在最外层循环（i循环）添加OpenMP指令：#pragma omp parallel for collapse(2) private(j,k) schedule(static)。注意：需要处理时间步之间的数据依赖，但同一时间步内的网格点计算是独立的。",
+              "expected_speedup": "接近核心数倍（如8-32倍）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "数据布局",
+              "technique": "数组填充（padding）",
+              "code_changes": "在数组声明时添加填充，避免缓存行冲突。例如：将维度从N改为N+16，确保不同行的起始地址不在同一缓存组。",
+              "expected_speedup": "轻微（5-10%）",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "1. 每个CUDA线程块处理一个3D子块（如8×8×8）。2. 使用共享内存存储子块及其halo区域（边界多一层）。3. 全局内存中，将3D数组存储为线性化的一维数组，按行优先顺序（i*N*N + j*N + k）。4. 每个时间步：a) 将子块数据加载到共享内存；b) 同步线程；c) 计算更新；d) 写回全局内存。5. 使用双缓冲技术（两个数组A和B）避免数据竞争。",
+            "data_layout": "一维线性化，行优先（i为最慢变化维度，k为最快变化维度）。对于GPU，考虑使用cudaMallocPitch进行二维内存对齐，但3D数组可能需要自定义分配。",
+            "challenges": [
+              "共享内存容量限制：子块大小受限于共享内存（通常48-96KB）。例如8×8×8双精度=4KB，加上halo后约6KB，可行。",
+              "halo交换：子块边界需要从相邻线程块加载数据，需要线程间同步或额外通信。",
+              "分支发散：边界处理（i,j,k=0或N-1）会导致分支发散，应使用条件判断或单独处理边界。",
+              "全局内存合并访问：确保线程访问连续内存地址，最内层循环（k）应由连续线程处理。"
+            ],
+            "expected_speedup": "与CPU相比，预计10-50倍加速（取决于GPU型号和问题规模）。主要受益于GPU的高内存带宽（如NVIDIA A100 1.5TB/s vs CPU 100GB/s）和大量并行线程。"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "0.23 FLOPs/byte（双精度）或0.46 FLOPs/byte（单精度）。每个网格点计算：3*(3次加法+2次乘法)+1次加法=15 FLOPs。访存：7次读+1次写=8次访问，双精度为64字节，单精度为32字节。",
+            "cache_behavior": "空间局部性良好（连续k方向访问），但时间局部性差：每个元素在每个时间步被访问7次（作为中心点或邻居），但两次访问间隔较大（整个数组遍历一次）。如果没有分块，缓存未命中率高。",
+            "data_dependencies": "1. 同一时间步内：网格点之间无数据依赖，可并行计算。2. 时间步之间：存在强依赖，必须完成前一时间步所有计算才能开始下一时间步。3. 红黑更新模式：可通过将网格分为奇偶子集（红黑排序）实现时间步重叠，但当前代码未使用。"
+          },
+          "cost": 0.022197,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.03068625
+      }
+    },
+    "seidel_2d": {
+      "program": "seidel_2d",
+      "config": "Role-Swap V3 Biased agreement",
+      "s1_model": "gpt-4o",
+      "s2_model": "deepseek-v3-2-251201",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 61.50675675675675,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.0302575,
+      "full_result": {
+        "code_name": "seidel_2d",
+        "program_key": "seidel_2d",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-4o",
+          "hotspots": [
+            {
+              "location": "kernel_seidel_2d (lines 47-58)",
+              "estimated_time_percentage": "90%",
+              "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the array.",
+              "confidence": "high"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "The kernel performs a large number of memory accesses relative to the amount of computation, particularly due to the repeated access of neighboring elements in a 2D array."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The computation involves regular data access patterns and can benefit from parallel execution on a GPU.",
+            "recommended_approach": "Port the kernel to CUDA or OpenCL, using a grid of threads where each thread computes one element of the array."
+          },
+          "cost": 0.007154,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "deepseek-v3-2-251201",
+          "validation": {},
+          "analysis": {
+            "agree_with_initial": true,
+            "primary_bottleneck": "memory",
+            "reasoning": "该内核执行9点stencil计算，每次迭代需要访问9个不同的内存位置（A[i-1][j-1]到A[i+1][j+1]），但只执行8次浮点运算（7次加法+1次除法）。这导致极低的算术强度（约0.22 FLOPs/byte），使得性能受限于内存带宽而非计算能力。此外，由于数据依赖关系，无法进行有效的循环展开或向量化。"
+          },
+          "detailed_optimizations": [
+            {
+              "target": "kernel_seidel_2d",
+              "technique": "循环分块（tiling）",
+              "code_changes": "将内层循环分块以改善缓存局部性。将j循环分成大小为B的块，确保在计算每个块时，所需的数据能保留在L1缓存中。\n\nfor (t = 0; t <= _PB_TSTEPS - 1; t++)\n  for (i = 1; i <= _PB_N - 2; i++)\n    for (jj = 1; jj <= _PB_N - 2; jj += B)\n      for (j = jj; j <= min(jj+B-1, _PB_N-2); j++)\n        A[i][j] = (A[i-1][j-1] + A[i-1][j] + A[i-1][j+1]\n                   + A[i][j-1] + A[i][j] + A[i][j+1]\n                   + A[i+1][j-1] + A[i+1][j] + A[i+1][j+1])/SCALAR_VAL(9.0);",
+              "expected_speedup": "2-3倍（取决于缓存大小和问题规模）",
+              "difficulty": "medium"
+            },
+            {
+              "target": "kernel_seidel_2d",
+              "technique": "时间步合并（time step merging）",
+              "code_changes": "合并多个时间步以减少数据访问次数。对于每个网格点，一次性计算多个时间步，使用临时变量存储中间结果。\n\nfor (t = 0; t <= _PB_TSTEPS - 1; t += K) {\n  for (i = 1; i <= _PB_N - 2; i++) {\n    for (j = 1; j <= _PB_N - 2; j++) {\n      DATA_TYPE temp = A[i][j];\n      for (k = 0; k < K && t+k <= _PB_TSTEPS-1; k++) {\n        temp = (A[i-1][j-1] + A[i-1][j] + A[i-1][j+1]\n                + A[i][j-1] + temp + A[i][j+1]\n                + A[i+1][j-1] + A[i+1][j] + A[i+1][j+1])/SCALAR_VAL(9.0);\n      }\n      A[i][j] = temp;\n    }\n  }\n}",
+              "expected_speedup": "1.5-2.5倍（取决于K值）",
+              "difficulty": "hard"
+            },
+            {
+              "target": "kernel_seidel_2d",
+              "technique": "数据布局优化",
+              "code_changes": "将二维数组转换为一维数组并采用行优先存储，改善内存访问模式。\n\nDATA_TYPE* A_flat = (DATA_TYPE*)malloc(n * n * sizeof(DATA_TYPE));\n// 在计算中通过A_flat[i*n + j]访问元素\nfor (t = 0; t <= _PB_TSTEPS - 1; t++)\n  for (i = 1; i <= _PB_N - 2; i++)\n    for (j = 1; j <= _PB_N - 2; j++)\n      A_flat[i*n + j] = (A_flat[(i-1)*n + (j-1)] + A_flat[(i-1)*n + j] + A_flat[(i-1)*n + (j+1)]\n                         + A_flat[i*n + (j-1)] + A_flat[i*n + j] + A_flat[i*n + (j+1)]\n                         + A_flat[(i+1)*n + (j-1)] + A_flat[(i+1)*n + j] + A_flat[(i+1)*n + (j+1)])/SCALAR_VAL(9.0);",
+              "expected_speedup": "1.2-1.5倍",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "每个GPU线程块处理一个2D瓦片（tile），每个线程处理瓦片内的一个元素。使用共享内存存储瓦片数据以减少全局内存访问。采用双缓冲技术处理时间步迭代。",
+            "data_layout": "行优先存储的一维数组，确保合并内存访问。对于每个线程块，将瓦片数据（包括halo区域）加载到共享内存中。",
+            "challenges": [
+              "halo交换开销：每个瓦片需要与相邻瓦片交换边界数据",
+              "共享内存容量限制：限制了瓦片大小",
+              "线程同步：需要在每个时间步后进行线程块内同步",
+              "负载均衡：边界区域的计算量较小"
+            ],
+            "expected_speedup": "10-50倍（相比优化后的CPU版本），具体取决于GPU型号和问题规模"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "0.22 FLOPs/byte（每次迭代：8次浮点运算，访问9个双精度浮点数=72字节）",
+            "cache_behavior": "较差的空间局部性。每次迭代需要访问3行数据（i-1, i, i+1），导致缓存行利用率低。对于大型数组，会产生大量缓存缺失。",
+            "data_dependencies": [
+              "流依赖：A[i][j]的新值依赖于前一时间步的9个邻居值",
+              "反依赖：A[i][j]的更新会覆盖旧值，但不会影响同一时间步内其他点的计算",
+              "输出依赖：每个时间步完全重写数组（边界除外）",
+              "跨迭代依赖：时间步t+1依赖于时间步t的完整结果"
+            ]
+          },
+          "cost": 0.0231035,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.0302575
+      }
+    }
+  }
+}

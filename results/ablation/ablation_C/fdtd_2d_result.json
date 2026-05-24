@@ -1,0 +1,135 @@
+{
+  "program": "fdtd_2d",
+  "config": "Ablation C (4o→5.4)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.06583149999999999,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (lines 66-95)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular data access patterns and can benefit from the parallel processing capabilities of a GPU.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, focusing on maximizing data parallelism and minimizing memory transfers between host and device."
+      },
+      "cost": 0.00883925,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步判断基本正确：kernel_fdtd_2d 是典型的低算术强度 stencil/FDTD 更新核，主瓶颈是内存带宽而不是计算吞吐。三段主更新中每个网格点只执行少量加减乘操作，却需要读写 ex/ey/hz 多个数组元素。访问模式总体规则、以行为主，严格来说并不存在严重的随机或高度非连续访问；在 C 行主序下，内层 j 循环访问 ex[i][j]、ey[i][j]、hz[i][j] 是连续的，缓存友好。真正的问题是：1) 每个时间步对大数组进行多次全域扫描；2) hz 在 ey/ex 更新后又被再次读取，数据重用距离较短但总体仍受带宽限制；3) 存在跨时间步依赖，限制时间维并行。因此应将瓶颈更准确表述为“以内存带宽为主、伴随一定缓存容量/层次效率问题的低算术强度 stencil 核”。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "提升 CPU 单核/多核内存效率",
+          "technique": "指针限定 + 对齐 + 编译器向量化友好改写",
+          "code_changes": "将 kernel 参数改为扁平 1D 指针并添加 restrict/assume_aligned，减少别名分析障碍；把常量提取到局部变量；保留 j 为内层循环以匹配行主序。示例：\n\nvoid kernel_fdtd_2d_opt(int tmax, int nx, int ny,\n    DATA_TYPE * __restrict ex,\n    DATA_TYPE * __restrict ey,\n    DATA_TYPE * __restrict hz,\n    DATA_TYPE * __restrict fict) {\n  const DATA_TYPE c1 = SCALAR_VAL(0.5);\n  const DATA_TYPE c2 = SCALAR_VAL(0.7);\n  for (int t = 0; t < tmax; ++t) {\n    DATA_TYPE ft = fict[t];\n    DATA_TYPE * __restrict ey0 = ey;\n    #pragma omp simd\n    for (int j = 0; j < ny; ++j) ey0[j] = ft;\n\n    for (int i = 1; i < nx; ++i) {\n      DATA_TYPE * __restrict ey_i   = ey + (size_t)i * ny;\n      DATA_TYPE * __restrict hz_i   = hz + (size_t)i * ny;\n      DATA_TYPE * __restrict hz_im1 = hz + (size_t)(i - 1) * ny;\n      #pragma omp simd\n      for (int j = 0; j < ny; ++j)\n        ey_i[j] -= c1 * (hz_i[j] - hz_im1[j]);\n    }\n\n    for (int i = 0; i < nx; ++i) {\n      DATA_TYPE * __restrict ex_i = ex + (size_t)i * ny;\n      DATA_TYPE * __restrict hz_i = hz + (size_t)i * ny;\n      #pragma omp simd\n      for (int j = 1; j < ny; ++j)\n        ex_i[j] -= c1 * (hz_i[j] - hz_i[j - 1]);\n    }\n\n    for (int i = 0; i < nx - 1; ++i) {\n      DATA_TYPE * __restrict hz_i   = hz + (size_t)i * ny;\n      DATA_TYPE * __restrict ex_i   = ex + (size_t)i * ny;\n      DATA_TYPE * __restrict ey_i   = ey + (size_t)i * ny;\n      DATA_TYPE * __restrict ey_ip1 = ey + (size_t)(i + 1) * ny;\n      #pragma omp simd\n      for (int j = 0; j < ny - 1; ++j)\n        hz_i[j] -= c2 * (ex_i[j + 1] - ex_i[j] + ey_ip1[j] - ey_i[j]);\n    }\n  }\n}\n\n同时建议编译选项使用 -O3 -march=native -ffast-math（若允许数值语义放宽）并检查向量化报告。",
+          "expected_speedup": "1.1x-1.4x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "降低缓存失效率与内存流量压力",
+          "technique": "空间分块/缓存阻塞（沿 i 维或二维 tile）",
+          "code_changes": "对 ey/ex/hz 三个阶段采用块化处理，使相邻行的 hz、ey、ex 更可能驻留在 LLC/L2 中。由于 hz 更新依赖 ex[i][j+1] 和 ey[i+1][j]，推荐按 i 方向分块，必要时结合 j 方向块。示例框架：\n\nconst int Bi = 32;\nfor (int t = 0; t < tmax; ++t) {\n  #pragma omp simd\n  for (int j = 0; j < ny; ++j) ey[j] = fict[t];\n\n  for (int ii = 1; ii < nx; ii += Bi) {\n    int iend = (ii + Bi < nx) ? ii + Bi : nx;\n    for (int i = ii; i < iend; ++i)\n      #pragma omp simd\n      for (int j = 0; j < ny; ++j)\n        ey[i*ny + j] -= 0.5 * (hz[i*ny + j] - hz[(i-1)*ny + j]);\n  }\n\n  for (int ii = 0; ii < nx; ii += Bi) {\n    int iend = (ii + Bi < nx) ? ii + Bi : nx;\n    for (int i = ii; i < iend; ++i)\n      #pragma omp simd\n      for (int j = 1; j < ny; ++j)\n        ex[i*ny + j] -= 0.5 * (hz[i*ny + j] - hz[i*ny + j - 1]);\n  }\n\n  for (int ii = 0; ii < nx - 1; ii += Bi) {\n    int iend = (ii + Bi < nx - 1) ? ii + Bi : nx - 1;\n    for (int i = ii; i < iend; ++i)\n      #pragma omp simd\n      for (int j = 0; j < ny - 1; ++j)\n        hz[i*ny + j] -= 0.7 * (ex[i*ny + j + 1] - ex[i*ny + j] + ey[(i+1)*ny + j] - ey[i*ny + j]);\n  }\n}\n\nBi 需要通过 profiling 调优，通常 16/32/64 行较合适。",
+          "expected_speedup": "1.1x-1.3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "利用多核 CPU 带宽",
+          "technique": "OpenMP 并行化三个空间循环",
+          "code_changes": "时间步 t 不能并行，但每个 t 内的三个空间更新阶段可分别并行。建议在每个阶段使用 #pragma omp parallel for schedule(static)，并保留阶段间隐式 barrier 以满足依赖。示例：\n\nfor (int t = 0; t < tmax; ++t) {\n  DATA_TYPE ft = fict[t];\n  #pragma omp parallel for schedule(static)\n  for (int j = 0; j < ny; ++j)\n    ey[j] = ft;\n\n  #pragma omp parallel for schedule(static)\n  for (int i = 1; i < nx; ++i)\n    for (int j = 0; j < ny; ++j)\n      ey[i*ny + j] -= 0.5 * (hz[i*ny + j] - hz[(i-1)*ny + j]);\n\n  #pragma omp parallel for schedule(static)\n  for (int i = 0; i < nx; ++i)\n    for (int j = 1; j < ny; ++j)\n      ex[i*ny + j] -= 0.5 * (hz[i*ny + j] - hz[i*ny + j - 1]);\n\n  #pragma omp parallel for schedule(static)\n  for (int i = 0; i < nx - 1; ++i)\n    for (int j = 0; j < ny - 1; ++j)\n      hz[i*ny + j] -= 0.7 * (ex[i*ny + j + 1] - ex[i*ny + j] + ey[(i+1)*ny + j] - ey[i*ny + j]);\n}\n\n若线程创建开销明显，可将 parallel 区域外提：#pragma omp parallel { for(t...) { #pragma omp for ... } }。",
+          "expected_speedup": "2x-8x（取决于内存带宽、核数和问题规模）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "减少循环开销并改善流水线",
+          "technique": "循环融合/阶段局部融合（谨慎）",
+          "code_changes": "完全融合三段更新不可行，因为 hz 更新依赖已更新的 ex/ey；但可在块内做局部阶段融合：先更新一个 i-block 的 ey/ex，再在满足依赖的范围内更新对应 hz 子块，从而缩短数据重用距离。示意：按 ii 块处理 ey/ex，然后对 ii..iend-2 的 hz 做更新，确保 ey[i+1][j] 已就绪。该改动需要仔细处理边界和块间依赖，适合手工优化或 polyhedral 工具生成。",
+          "expected_speedup": "1.1x-1.25x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "提升 SIMD 利用率",
+          "technique": "数据对齐、数组填充、避免边界分支影响向量化",
+          "code_changes": "确保 ex/ey/hz 起始地址 64B 对齐；若 ny 不是 SIMD 宽度整数倍，可对 ny 做 padding，例如 ny_pad = ((ny + 15)/16)*16（AVX-512 double 时按 8 或 16 元素对齐，视类型而定），并在分配时使用 padded leading dimension。访问改为 ex[i*ld + j]。这样可减少尾处理和提升向量 load/store 效率。",
+          "expected_speedup": "1.05x-1.2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "降低 NUMA 与带宽竞争损失",
+          "technique": "NUMA first-touch + 线程绑定",
+          "code_changes": "在多路 CPU 上，用并行初始化 ex/ey/hz，使页面按 first-touch 分布到本地 NUMA 节点；运行时设置 OMP_PROC_BIND=close 或 spread，并结合 numactl --interleave=all 或按 socket 绑定测试。初始化代码改为 OpenMP 并行版本，保证后续访问局部性。",
+          "expected_speedup": "1.1x-1.5x（多路系统上更明显）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "适合 GPU。采用“每个时间步 3 个 kernel”或“单时间步融合 kernel”的二维网格并行。推荐基础方案：kernel1 更新 ey[0][j] 边界；kernel2 更新 ey(i>=1,j)；kernel3 更新 ex(i,j>=1)；kernel4 更新 hz(i<nx-1,j<ny-1)。每个线程负责一个网格点，线程块建议 2D 布局如 (32,8) 或 (16,16)。若追求更高性能，可将 ex/ey 更新与 hz 更新做块内融合，使用 shared memory 缓存 hz/ex/ey 邻域，但需严格处理阶段依赖和同步，通常以单时间步多 kernel 更稳妥。由于时间维串行，优化重点是最大化每步吞吐并减少 kernel launch 与全局内存流量。",
+        "data_layout": "使用扁平连续 1D 行主序数组，索引 idx = i * ny + j。保持 j 为最快变化维，使同一 warp 访问连续地址，实现全局内存合并访问。若 ny 不是 warp 对齐友好尺寸，可考虑 padding 到 32 或 64 元素倍数。ex/ey/hz 分离存储（SoA）已经是合适布局，不建议改为 AoS。可将 _fict_[t] 通过常量内存或每步传标量方式提供。",
+        "challenges": [
+          "时间步串行依赖导致无法在 t 维直接展开大规模并行，只能在每个时间步内做空间并行",
+          "每个时间步至少 3-4 次全局数组遍历，GPU 性能仍可能受显存带宽限制",
+          "hz 更新依赖已更新的 ex/ey，限制 kernel 融合自由度",
+          "边界处理（ey[0][j]、ex 的 j=0、hz 的最后一行/列）会引入少量分支或单独 kernel",
+          "若问题规模较小，kernel launch 开销和 PCIe 数据传输会吞噬收益；应将数据常驻 GPU，仅首尾传输"
+        ],
+        "expected_speedup": "相对单线程 CPU 通常 10x-40x；相对优化后的多核 CPU 常见 2x-8x，具体取决于网格规模、GPU 显存带宽、是否使用 shared memory/融合优化以及数据是否常驻设备端"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.10-0.17 FLOPs/byte，属于很低的算术强度。估算：ey 更新每点约 3 FLOPs，内存流量约 3 次读 + 1 次写 = 32B（double）=> 0.094 FLOPs/B；ex 更新同量级；hz 更新每点约 5 FLOPs，约 5 次读 + 1 次写 = 48B => 0.104 FLOPs/B。若考虑写分配(RFO)和缓存未命中，实际有效 AI 可能更低；若部分数据命中缓存，表观 AI 可接近 0.15-0.17。",
+        "cache_behavior": "访问模式总体规则且对 j 维连续，适合硬件预取。ey/ex/hz 都按行扫描，单个循环内部空间局部性较好。问题在于每个时间步需要对整个网格进行 3 次主遍历，数组规模一旦超过 LLC，跨阶段重用主要依赖较短时间窗口内的缓存保留，容易退化为流式带宽受限。ey 更新读取 hz 的当前行和上一行；ex 更新读取 hz 当前行相邻列；hz 更新读取 ex 当前行相邻列以及 ey 当前行/下一行。由于三个数组都被反复读写，缓存容量不足时会出现容量失效，但不是由随机访问导致。边界行/列处理简单，不构成主要开销。",
+        "data_dependencies": [
+          "时间依赖：t 步的 ex/ey/hz 依赖于 t-1 步结果，因此时间维不可直接并行",
+          "阶段依赖：每个时间步内 hz 更新依赖本时间步已更新后的 ex 和 ey，因此三个主阶段必须保持顺序",
+          "空间依赖（ey）：ey[i][j] 依赖 hz[i][j] 和 hz[i-1][j]，但不同 (i,j) 的 ey 写入彼此独立，可做空间并行",
+          "空间依赖（ex）：ex[i][j] 依赖 hz[i][j] 和 hz[i][j-1]，不同 (i,j) 的 ex 写入彼此独立，可做空间并行",
+          "空间依赖（hz）：hz[i][j] 依赖 ex[i][j+1]、ex[i][j]、ey[i+1][j]、ey[i][j]，但对 hz 的写入彼此独立，可做空间并行"
+        ]
+      },
+      "cost": 0.056992249999999994,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.06583149999999999
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "program": "adi",
+  "model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The kernel performs stencil-like sweeps over large 2D arrays u, v, p, and q across many time steps. The column sweep accesses row-major arrays with poor spatial locality (u[j][i], v[j][i]), causing cache inefficiency and likely bandwidth pressure. Although there are divisions and recurrences that add compute cost, the dominant limitation on modern CPUs is typically memory hierarchy behavior combined with limited vectorization due to loop-carried dependencies.",
+  "ground_truth": "memory",
+  "correct": true,
+  "eval_score": 63.375,
+  "cost": 0.026869499999999998,
+  "stage1": {
+    "model": "gpt-5.4",
+    "hotspots": [
+      {
+        "location": "kernel_adi(): Column Sweep forward solve, inner loop for (j=1; j<_PB_N-1; j++) updating p[i][j] and q[i][j]",
+        "estimated_time_percentage": "35-45%",
+        "reason": "Executed for every time step and every interior grid point. Contains multiple floating-point operations, repeated divisions, loop-carried dependencies through p[i][j-1] and q[i][j-1], and accesses u[j][i-1], u[j][i], u[j][i+1] with strided memory access due to column-wise traversal on row-major storage.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Row Sweep forward solve, inner loop for (j=1; j<_PB_N-1; j++) updating p[i][j] and q[i][j]",
+        "estimated_time_percentage": "30-40%",
+        "reason": "Also executed over all time steps and interior points. Includes recurrence dependencies and repeated divisions. Memory access to v[i-1][j], v[i][j], v[i+1][j] is more cache-friendly than the column sweep, but still dominates due to arithmetic intensity and total iteration count.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Column Sweep backward substitution, loop for (j=_PB_N-2; j>=1; j--) updating v[j][i]",
+        "estimated_time_percentage": "10-15%",
+        "reason": "Runs over all interior columns and time steps. Has loop-carried dependency on v[j+1][i], preventing straightforward SIMD/vectorization and parallelization. Also suffers from strided writes/reads in row-major layout.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Row Sweep backward substitution, loop for (j=_PB_N-2; j>=1; j--) updating u[i][j]",
+        "estimated_time_percentage": "10-15%",
+        "reason": "Runs over all interior rows and time steps. Dependency on u[i][j+1] limits vectorization. More cache-friendly than the column backward sweep, but still a significant fraction of runtime.",
+        "confidence": "high"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The kernel performs stencil-like sweeps over large 2D arrays u, v, p, and q across many time steps. The column sweep accesses row-major arrays with poor spatial locality (u[j][i], v[j][i]), causing cache inefficiency and likely bandwidth pressure. Although there are divisions and recurrences that add compute cost, the dominant limitation on modern CPUs is typically memory hierarchy behavior combined with limited vectorization due to loop-carried dependencies."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The code has substantial data parallelism across independent tridiagonal systems in the outer i-loops for each sweep and time step. However, each individual j-loop has sequential dependencies, so naive GPU mapping is inefficient. GPU acceleration is still viable using batched tridiagonal solvers or parallel cyclic reduction methods, especially for large N and many independent systems.",
+      "recommended_approach": "Port each sweep as a batched tridiagonal solve on the GPU. Map each row/column system to a thread block or warp and replace the sequential Thomas recurrence with parallel cyclic reduction or hybrid PCR-Thomas. Keep data resident on the GPU across all time steps, use transposed layouts to make both sweep directions coalesced, and fuse kernels where possible to reduce global memory traffic."
+    },
+    "cost": 0.026869499999999998,
+    "bottleneck_raw": "memory"
+  }
+}

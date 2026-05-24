@@ -1,0 +1,117 @@
+{
+  "program": "2mm",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "compute",
+  "s2_bottleneck_raw": "compute",
+  "s1_score": 81.57507583417592,
+  "classification": {
+    "s1_primary": "compute",
+    "s2_primary": "compute",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.030239999999999996,
+  "full_result": {
+    "code_name": "2mm",
+    "program_key": "2mm",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_2mm, line 66-84",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains two nested loops that perform matrix multiplications, which are computationally intensive operations.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "compute",
+        "reasoning": "The primary bottleneck is compute-bound due to the nested loops performing matrix multiplications, which involve a large number of floating-point operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "Matrix multiplication is highly parallelizable and can benefit from the massive parallelism offered by GPUs.",
+        "recommended_approach": "Use CUDA or OpenCL to offload the matrix multiplication operations to the GPU. This involves copying data to the GPU, performing the computation, and then copying the results back."
+      },
+      "cost": 0.0084875,
+      "bottleneck_raw": "compute"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "compute",
+        "reasoning": "The kernel performs two dense matrix multiplications: tmp = α*A*B (NI×NK × NK×NJ) and D = β*D + tmp*C (NI×NJ × NJ×NL). Each multiplication involves O(NI×NJ×NK) and O(NI×NL×NJ) FLOPs respectively, totaling O(NI×NJ×NK + NI×NL×NJ) FLOPs. With typical large matrix dimensions (e.g., NI=NJ=NK=NL=1024), this yields ~2×10⁹ FLOPs. The arithmetic intensity is high (~2 FLOPs/byte for double precision), making it compute-bound. The triple-nested loops have no significant data dependencies, allowing full parallelization."
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_2mm, first matrix multiply (tmp = α*A*B)",
+          "technique": "Loop tiling (blocking) for cache reuse",
+          "code_changes": "Add tiling loops with block sizes (TI, TJ, TK). For (ii in 0..NI step TI), (jj in 0..NJ step TJ), (kk in 0..NK step TK), compute partial sums in tmp[ii:ii+TI][jj:jj+TJ] using A[ii:ii+TI][kk:kk+TK] and B[kk:kk+TK][jj:jj+TJ]. Choose block sizes to fit in L1/L2 cache (e.g., TI=64, TJ=64, TK=64 for double).",
+          "expected_speedup": "2-5x (depends on cache hierarchy)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_2mm, second matrix multiply (D = β*D + tmp*C)",
+          "technique": "Loop interchange and tiling",
+          "code_changes": "Interchange loops to have k as innermost for better stride-1 access: for (i) for (k) for (j) D[i][j] += tmp[i][k] * C[k][j]. Then apply tiling similar to first multiply. Also fuse the β scaling with the computation: D[i][j] = β*D[i][j] + tmp[i][k]*C[k][j].",
+          "expected_speedup": "2-4x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_2mm, both multiplies",
+          "technique": "SIMD vectorization (AVX/AVX2/AVX-512)",
+          "code_changes": "Use compiler pragmas: #pragma omp simd collapse(2) for inner loops, or manually unroll loops and use intrinsics (e.g., _mm256_load_pd, _mm256_fmadd_pd). Ensure data alignment to 32/64 bytes.",
+          "expected_speedup": "4-8x (for AVX2) to 8-16x (for AVX-512)",
+          "difficulty": "hard"
+        },
+        {
+          "target": "kernel_2mm, entire function",
+          "technique": "Multithreading with OpenMP",
+          "code_changes": "Add #pragma omp parallel for collapse(2) before outer i-j loops. Use static scheduling. Ensure tmp is private or correctly shared (each thread writes to distinct i-j blocks).",
+          "expected_speedup": "~core_count (e.g., 16-64x)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use cuBLAS for both matrix multiplications: cublasDgemm for tmp = α*A*B and D = β*D + tmp*C. If custom kernel needed, use tiled matrix multiplication with shared memory (e.g., 32×32 blocks). Launch 2D grid: (NI/32, NJ/32) blocks for first multiply, (NI/32, NL/32) for second.",
+        "data_layout": "Column-major for cuBLAS (default), or row-major with transpose flags. For custom kernel, use row-major for coalesced global memory access: A[i][k] stored linearly, B[k][j] stored linearly (may need transpose for coalesced access).",
+        "challenges": [
+          "GPU memory bandwidth: matrices may not fit in GPU memory (e.g., 1024² doubles = 8 MB each). Need streaming or chunking.",
+          "Kernel launch overhead for two separate multiplies.",
+          "Optimal tile size tuning for specific GPU architecture (e.g., 32×32 for V100, 16×16 for older GPUs)."
+        ],
+        "expected_speedup": "50-200x compared to single-threaded CPU, depending on GPU (e.g., V100 vs. Xeon)."
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "~2 FLOPs/byte (for double precision). Each multiply does 2 FLOPs (multiply+add) per 8 bytes loaded (assuming no cache reuse). With tiling, intensity can increase to ~10-20 FLOPs/byte.",
+        "cache_behavior": "Poor without optimization: A accessed row-wise (good), B accessed column-wise (poor stride), C accessed column-wise in second multiply. tmp is written then read, causing cache capacity misses. Tiling improves locality by keeping blocks in cache.",
+        "data_dependencies": [
+          "No loop-carried dependencies in inner k loops (reduction to tmp[i][j] and D[i][j] is associative).",
+          "Anti-dependency: D is read (for β scaling) and written in second multiply, but safe.",
+          "True dependency: tmp must be fully computed before second multiply (sequential)."
+        ]
+      },
+      "cost": 0.021752499999999998,
+      "bottleneck_raw": "compute"
+    },
+    "classification": {
+      "s1_primary": "compute",
+      "s2_primary": "compute",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.030239999999999996
+  }
+}

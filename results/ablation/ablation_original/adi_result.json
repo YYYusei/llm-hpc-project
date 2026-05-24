@@ -1,0 +1,131 @@
+{
+  "program": "adi",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "compute+latency bound（标量递推/除法主导），并伴随明显的内存访问低效（列向跨行步长访问导致缓存/TLB 压力）",
+  "s1_score": 60.74999999999999,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "compute",
+    "ground_truth": "memory",
+    "changed": true,
+    "s1_matches_gt": true,
+    "s2_matches_gt": false,
+    "correction_type": "over-correction"
+  },
+  "cost": 0.05301275,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_adi, Column Sweep loop, line 66",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs multiple nested iterations over the array, leading to significant computational workload.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi, Row Sweep loop, line 80",
+          "estimated_time_percentage": "40%",
+          "reason": "Similar to the Column Sweep, this loop also involves nested iterations and array accesses, contributing heavily to execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays, which can lead to cache misses and memory bandwidth limitations, making it memory-bound."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent operations across iterations, which are suitable for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the outer loops, ensuring that each thread block handles a tile of the array to maximize memory coalescing and minimize global memory access latency."
+      },
+      "cost": 0.00942725,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": false,
+        "corrected_bottleneck": "compute+latency bound（标量递推/除法主导），并伴随明显的内存访问低效（列向跨行步长访问导致缓存/TLB 压力）",
+        "reasoning": "两段热点（Column/Row sweep）本质是 Thomas 三对角求解的前向消去+回代：p/q 的递推使 j 循环存在 loop-carried dependency，难以向量化/并行化；每步包含 1 次除法（以及多次乘加），除法延迟高且限制流水。与此同时 Column sweep 访问 u[j][i]（j 为行索引）在 C 行主序下是大步长跨行访问，导致缓存行利用率低、TLB miss 风险高。综合看并非纯 memory-bandwidth bound：算术强度不算极低，但依赖+除法延迟使其更像 latency/compute 受限，同时存在可修复的访存局部性问题。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep（line ~66）跨行步长访问导致的缓存/TLB 低效",
+          "technique": "数据布局/转置：为列扫提供连续内存访问（u 的转置视图或显式转置缓冲）",
+          "code_changes": "方案A（推荐，侵入中等）：新增 uT/vT（转置存储），每个 tstep 开始将 u 转置到 uT（或维护双布局），Column sweep 用 uT[i][j] 代替 u[j][i]，写回 vT 后再转置回 v。\n伪代码：\n1) transpose(u -> uT)\n2) Column sweep: 使用 uT[i][j-1],uT[i][j],uT[i][j+1]（连续）\n3) transpose(vT -> v)\n注意边界同样处理。\n方案B（低侵入但收益较小）：将数组声明改为 [N][N] 但交换索引含义（把物理存储按列主序模拟），需要全局改索引。",
+          "expected_speedup": "Column sweep 1.3x–2.0x（取决于 N、页大小、TLB/LLC），整体 1.15x–1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Column/Row Sweep 前向消去循环（p/q 递推）除法与重复分母计算",
+          "technique": "代数化简 + 预计算倒数（reciprocal）+ FMA 友好重写",
+          "code_changes": "将重复出现的 denom = a*p[i][j-1]+b（或 d*p+e）提取，并用 inv = 1/denom；用 inv 复用到 p/q：\n原：\n  p = -c/(a*p_prev+b);\n  q = (rhs - a*q_prev)/(a*p_prev+b);\n改：\n  denom = a*p_prev + b;\n  inv = SCALAR_VAL(1.0)/denom;\n  p = (-c)*inv;\n  q = (rhs - a*q_prev)*inv;\n并将 rhs 写成 FMA 形式（若编译器支持 -ffp-contract=fast）：\n  rhs = (-d)*uL + (1+2*d)*uC + (-f)*uR;\n同理 Row sweep。\n编译选项：-O3 -ffast-math（若允许数值差异）或至少 -fno-math-errno -funsafe-math-optimizations；并启用 FMA（-mfma）。",
+          "expected_speedup": "热点循环 1.1x–1.3x；整体 1.08x–1.2x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "p/q 数组写回带宽与缓存占用（p、q 为 N×N 但每次只用一行 i）",
+          "technique": "将 p/q 从 2D 全量存储降为 1D 行缓冲（streaming buffers）",
+          "code_changes": "把 p、q 改为长度 N 的临时数组（每个 i 一条线）：\n在 kernel_adi 内部：\n  DATA_TYPE *p1 = (DATA_TYPE*)aligned_alloc(64, n*sizeof(DATA_TYPE));\n  DATA_TYPE *q1 = (DATA_TYPE*)aligned_alloc(64, n*sizeof(DATA_TYPE));\nColumn sweep：用 p1[j], q1[j] 替代 p[i][j], q[i][j]；回代同样用 p1/q1。\nRow sweep 同理（可复用同一对缓冲）。\n这样避免对 p/q 的大规模写入与读出，显著降低内存流量与缓存污染。",
+          "expected_speedup": "整体 1.2x–1.8x（N 越大越明显；同时降低内存占用 2×N×N）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "回代阶段 v[j][i] / u[i][j] 写入的访存效率与向量化",
+          "technique": "回代循环的连续化（配合转置/布局）+ restrict + 对齐 + pragma 向量化（在可行处）",
+          "code_changes": "1) 若采用转置布局，回代写入也变为连续（vT[i][j]）。\n2) 为指针添加 restrict（PolyBench 宏可改为指针形参版本）：\n  void kernel_adi(..., DATA_TYPE (*restrict u)[N], ...)\n3) 确保 64B 对齐（PolyBench 分配可替换为 aligned_alloc 或 posix_memalign）。\n4) 对无依赖的循环（例如 i 外层）加 OpenMP 并行：\n  #pragma omp parallel for schedule(static)\n  for (i=1; i<n-1; ++i) { ... }\n注意：j 前向消去不可向量化，但 i 维可并行。",
+          "expected_speedup": "CPU 多核：随核数近线性到 4x–20x（取决于核数/带宽）；单核仅靠对齐/restrict 约 1.05x–1.15x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "除法延迟与标量递推导致的 ILP 不足",
+          "technique": "批处理多条独立线（batch multiple i) 以提升指令级并行（software pipelining across lines）",
+          "code_changes": "将 i 循环按块处理，例如一次处理 2 或 4 条 i（i, i+1, ...）的前向消去：\n  for (i=1; i<n-1; i+=2) {\n    // 维护 p1/q1 与 p2/q2 两套递推\n    for (j=1; j<n-1; ++j) { ... }\n  }\n这样可让 CPU 在等待一条线的除法结果时执行另一条线的运算，提高吞吐。\n与 1D p/q 缓冲结合更自然（每条线一对缓冲）。",
+          "expected_speedup": "单核 1.1x–1.4x（依赖微架构与编译器调度）",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "采用“每条线一个线程块/一个warp”的并行三对角求解（batched tridiagonal）。外层 i 维（多条独立线）高度并行；每条线内部 j 维存在递推，需用并行三对角算法（PCR/CR/Thomas+warp-serial）或让单 warp 串行但批量并行很多条线。\n推荐两级方案：\n1) 中等 N（<=1024）：每条线用一个 warp 串行 Thomas（j 由 lane0 执行或全 warp 协作加载），通过大量 i 线并行隐藏延迟。\n2) 更大 N：使用 Parallel Cyclic Reduction (PCR) 或 CR/PCR 混合实现每条线 O(log N) 步并行求解。",
+        "data_layout": "GPU 上建议将 Column sweep 的输入按列连续：维护 u 的转置副本 uT（或使用 pitched memory + 转置 kernel）。这样两次 sweep 都能做到合并访问（coalesced）：\n- Column sweep 读 uT[i][j] 连续\n- Row sweep 读 v[i][j] 连续\n同时 p/q 不建议全局存 N×N：使用每个 block 的 shared memory 或寄存器保存该线的临时量（或仅保存必要的系数）。",
+        "challenges": [
+          "三对角递推的串行依赖：直接映射到 GPU 会导致每条线线程利用率低；需 PCR/CR 或 warp-serial+batched 并行",
+          "数值稳定性与 fast-math：PCR/CR 的舍入误差特性与 Thomas 不同；需要验证误差容忍度",
+          "内存占用与带宽：若保留 u/v/p/q 四个 N×N，会占用大量显存并增加带宽压力；应将 p/q 局部化并尽量避免全局写回",
+          "边界条件与两次 sweep 间的数据交换：需要额外 kernel 或融合策略，注意同步与全局内存往返"
+        ],
+        "expected_speedup": "相对单核 CPU：10x–80x（取决于 N、GPU、是否采用 PCR/CR、以及是否做转置/局部化 p/q）。相对多核 CPU（如 16–32 核）：2x–10x 更常见。若仅用 warp-serial Thomas（不做 PCR）但 i 很多，仍可获得可观加速；若 N 很大且采用 PCR，吞吐更高但实现复杂。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.25–0.6 FLOPs/byte（取决于是否将 p/q 降为 1D 缓冲、以及 Column sweep 是否转置以减少无效加载）。粗估：每个内部点前向消去需要读取 u 的 3 个点 + 读取 p/q 前值 + 写 p/q（若 2D 存储）并做 ~10–20 FLOPs 且含 1 次除法；回代每点读 p/q + 读下一点解并写当前解，~2–4 FLOPs。若 p/q 用 1D 缓冲且缓存命中好，字节数显著下降，算术强度上升。",
+        "cache_behavior": "Row sweep：u[i][j]、v[i][j] 在行主序下按 j 连续，L1/L2 命中较好；p/q 若为 2D 会产生额外写流量但仍是连续。\nColumn sweep：u[j][i] 随 j 跨行访问，步长为 N*sizeof(DATA_TYPE)，每次触及新缓存行，空间局部性差；同时访问 u[j][i-1/i/i+1] 会触及相邻列但仍跨行，易造成 LLC/TLB 压力。若 N 大，Column sweep 更可能受内存层次与 TLB 限制。\n回代阶段同样存在 Column sweep 写 v[j][i] 的跨行写入问题（写分配/写回开销）。转置或改变布局可显著改善。",
+        "data_dependencies": [
+          "前向消去：p[i][j] 依赖 p[i][j-1]；q[i][j] 依赖 q[i][j-1] 与 p[i][j-1]（强 loop-carried dependency）",
+          "回代：v[j][i] 依赖 v[j+1][i]；u[i][j] 依赖 u[i][j+1]（反向递推依赖）",
+          "时间步依赖：t 的下一步依赖上一步的 u/v（整体为时序迭代）"
+        ]
+      },
+      "cost": 0.0435855,
+      "bottleneck_raw": "compute+latency bound（标量递推/除法主导），并伴随明显的内存访问低效（列向跨行步长访问导致缓存/TLB 压力）"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "compute",
+      "ground_truth": "memory",
+      "changed": true,
+      "s1_matches_gt": true,
+      "s2_matches_gt": false,
+      "correction_type": "over-correction"
+    },
+    "total_cost": 0.05301275
+  }
+}

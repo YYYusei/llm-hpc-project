@@ -66,6 +66,11 @@ BENCHMARK_SOURCES = {
     "syr2k":       "benchmarks/syr2k/syr2k.c",
     "doitgen":     "benchmarks/doitgen/doitgen.c",
     "gramschmidt": "benchmarks/gramschmidt/gramschmidt.c",
+    "trmm":      "benchmarks/trmm/trmm.c",
+    "adi":       "benchmarks/adi/adi.c",
+    "fdtd_2d":   "benchmarks/fdtd_2d/fdtd-2d.c",
+    "heat_3d":   "benchmarks/heat_3d/heat-3d.c",
+    "seidel_2d": "benchmarks/seidel_2d/seidel-2d.c",
 }
 
 CONFIG_NAME_MAP = {
@@ -85,6 +90,11 @@ CONFIG_NAME_MAP = {
     "syr2k":       "syr2k",
     "doitgen":     "doitgen",
     "gramschmidt": "gramschmidt",
+    "trmm":      "trmm",
+    "adi":       "adi",
+    "fdtd_2d":   "fdtd_2d",
+    "heat_3d":   "heat_3d",
+    "seidel_2d": "seidel_2d",
 }
 
 

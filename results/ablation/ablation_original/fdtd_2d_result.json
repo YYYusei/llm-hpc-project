@@ -1,0 +1,117 @@
+{
+  "program": "fdtd_2d",
+  "config": "Original (4o→5.2)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.058730000000000004,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d, line 66",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem is highly parallelizable due to its regular data access patterns and independent operations across grid points, making it suitable for GPU execution.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, focusing on maximizing occupancy and minimizing memory transfer overhead."
+      },
+      "cost": 0.00892325,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.2",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "kernel_fdtd_2d 的 4 个 stencil/差分更新循环每次迭代只做少量 FLOPs，却需要对 ex/ey/hz 进行多次读写；整体算术强度很低，典型受内存带宽限制。访问模式在 j 为内层时对 C 行主序是连续的（并非“非连续”），因此主要问题不是随机访问，而是：多次全数组扫掠导致的带宽压力 + 写回流量大 + 时间步之间无法并行导致缓存复用受限。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_fdtd_2d：减少内存流量/提升缓存复用（CPU）",
+          "technique": "时间步内的空间分块（cache blocking / tiling）+ 循环重排，尽量让 hz/ex/ey 的相邻行在 LLC/L2 中复用",
+          "code_changes": "将每个 t 内的 3 个 2D 更新按 tile 执行（保持语义：ey 依赖旧 hz；ex 依赖旧 hz；hz 依赖更新后的 ex/ey）。示例（伪代码，需处理边界）：\n\nconst int Ti=64, Tj=256; // 依据缓存/NUMA 调参\nfor (t=0; t<TMAX; ++t) {\n  // ey[0][:]\n  #pragma omp parallel for simd\n  for (j=0;j<NY;++j) ey[0][j]=_fict_[t];\n\n  for (int ii=1; ii<NX; ii+=Ti) {\n    int iend = (ii+Ti<NX)? ii+Ti : NX;\n    for (int jj=0; jj<NY; jj+=Tj) {\n      int jend = (jj+Tj<NY)? jj+Tj : NY;\n\n      // 1) ey tile (i in [ii,iend), j in [jj,jend)\n      #pragma omp parallel for collapse(2)\n      for (int i=ii;i<iend;++i)\n        for (int j=jj;j<jend;++j)\n          ey[i][j] = ey[i][j] - (DATA_TYPE)0.5*(hz[i][j]-hz[i-1][j]);\n\n      // 2) ex tile (note j starts at 1)\n      int jj2 = (jj==0)? 1 : jj;\n      #pragma omp parallel for collapse(2)\n      for (int i=ii-1;i<iend;++i) { // 需要覆盖 hz 更新会用到的 ex[i][j] 与 ex[i][j+1]\n        if (i<0 || i>=NX) continue;\n        for (int j=jj2;j<jend;++j)\n          ex[i][j] = ex[i][j] - (DATA_TYPE)0.5*(hz[i][j]-hz[i][j-1]);\n      }\n\n      // 3) hz tile (i in [ii-1,iend-1), j in [jj,jend-1)\n      int i0 = (ii-1<0)? 0 : ii-1;\n      int i1 = (iend-1<NX-1)? iend-1 : NX-1;\n      int j1 = (jend-1<NY-1)? jend-1 : NY-1;\n      #pragma omp parallel for collapse(2)\n      for (int i=i0;i<i1;++i)\n        for (int j=jj;j<j1;++j)\n          hz[i][j] = hz[i][j] - (DATA_TYPE)0.7*( (ex[i][j+1]-ex[i][j]) + (ey[i+1][j]-ey[i][j]) );\n    }\n  }\n}\n\n要点：tile 内按依赖顺序执行 ey->ex->hz；tile 边界需额外覆盖 i-1、j+1 的 halo（上面用扩大循环范围示意）。",
+          "expected_speedup": "1.2x–1.8x（取决于 NX/NY、缓存大小、带宽与是否 NUMA；若原本已接近 STREAM 带宽上限则收益偏小）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "kernel_fdtd_2d：线程级并行（CPU）",
+          "technique": "OpenMP 并行 + collapse(2) + 合理调度；避免对 t 并行（时间依赖）",
+          "code_changes": "对每个 2D 循环加 OpenMP，并优先并行 i 维（行块）以减少线程间写冲突与提升局部性：\n\nfor (t=0; t<TMAX; ++t) {\n  #pragma omp parallel for simd\n  for (j=0;j<NY;++j) ey[0][j]=_fict_[t];\n\n  #pragma omp parallel for collapse(2) schedule(static)\n  for (i=1;i<NX;++i)\n    for (j=0;j<NY;++j)\n      ey[i][j] -= (DATA_TYPE)0.5*(hz[i][j]-hz[i-1][j]);\n\n  #pragma omp parallel for collapse(2) schedule(static)\n  for (i=0;i<NX;++i)\n    for (j=1;j<NY;++j)\n      ex[i][j] -= (DATA_TYPE)0.5*(hz[i][j]-hz[i][j-1]);\n\n  #pragma omp parallel for collapse(2) schedule(static)\n  for (i=0;i<NX-1;++i)\n    for (j=0;j<NY-1;++j)\n      hz[i][j] -= (DATA_TYPE)0.7*((ex[i][j+1]-ex[i][j])+(ey[i+1][j]-ey[i][j]));\n}\n\n并配合：OMP_PROC_BIND=close, OMP_PLACES=cores；NUMA 机器上 first-touch 初始化（init_array 也并行化）。",
+          "expected_speedup": "按内存带宽扩展：2x–10x（取决于核数/带宽；通常到达带宽饱和后不再线性）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_fdtd_2d：SIMD/向量化与编译器友好（CPU）",
+          "technique": "显式 SIMD 提示 + restrict/对齐 + 常量折叠；减少别名阻碍",
+          "code_changes": "1) 将数组指针以 restrict 形式传入（或在函数内创建 restrict 别名），并确保对齐：\n\nvoid kernel_fdtd_2d(...,\n  DATA_TYPE (* restrict ex)[NY],\n  DATA_TYPE (* restrict ey)[NY],\n  DATA_TYPE (* restrict hz)[NY],\n  DATA_TYPE * restrict _fict_)\n\n2) 在内层 j 循环加 #pragma omp simd 或 #pragma GCC ivdep：\n#pragma omp simd\nfor (j=0; j<NY; ++j) ...\n\n3) 将 0.5/0.7 提前为 DATA_TYPE 常量，避免重复转换：\nconst DATA_TYPE c1=(DATA_TYPE)0.5, c2=(DATA_TYPE)0.7;\n\n4) 编译选项：-O3 -march=native -ffast-math（若允许）并检查向量化报告。",
+          "expected_speedup": "1.05x–1.3x（通常受带宽限制，SIMD 主要降低指令开销/提升单核带宽利用率）",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_fdtd_2d：减少写分配/写回开销（CPU，视平台）",
+          "technique": "非临时写（streaming store）/写合并；仅在确实不复用且写占主导时使用",
+          "code_changes": "对明显“写后很久才读”的数组更新尝试 non-temporal store（依赖编译器/ISA）：\n- Intel: 使用 _mm_stream_pd/_mm_stream_ps 或编译器 pragma（如 #pragma vector nontemporal）对 ey/ex/hz 的 store。\n- 注意：若后续很快读取（同一 t 内 hz 读取 ex/ey），则对 ex/ey 不宜；对 hz 在下一时间步会被读取，是否适合取决于 t 循环与缓存容量（多数情况下不建议对 hz 用 nontemporal）。\n\n更现实的做法：仅对 ey[0][j] 这种一次性边界写尝试 nontemporal（收益有限）。",
+          "expected_speedup": "0%–10%（高度依赖缓存容量与实现；可能无收益甚至变慢）",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "每个时间步 3 个 kernel（或 2 个：边界 ey[0][:] + 合并 ey/ex，再单独 hz），在 GPU 上以 2D grid 映射 (i,j)。推荐：\n1) Kernel A: 设置 ey[0][j]=fict[t]\n2) Kernel B: 更新 ey(i>=1,j) 与 ex(i,j>=1)（可做成两个 kernel 以简化边界与减少分支；或在一个 kernel 内分别处理并用 if 判断）\n3) Kernel C: 更新 hz(i<NX-1,j<NY-1)\n\n每个 kernel 内：thread 对应一个 (i,j) 点；block 采用 (Tx,Ty) 如 (32,8)/(16,16)。对 hz 更新使用 shared memory 做 halo（加载 ex tile + 1 列、ey tile + 1 行）以减少全局读与提升合并访问。",
+        "data_layout": "保持行主序（C contiguous in j）并确保 pitch 对齐：\n- 使用 cudaMallocPitch 或手动对齐 NY 到 128B/256B 边界以提升合并访问。\n- 将 ex/ey/hz 作为线性数组 ex[i*ld + j]，ld 为 pitch/leading dimension。\n- _fict_ 放 constant memory 或在每个时间步作为标量参数传入（ey[0][:] kernel 直接用标量广播）。",
+        "challenges": [
+          "Kernel 启动开销与同步：每个时间步至少 3 次 kernel launch；TMAX 大时可接受，但小规模会被 launch 开销影响。可用 CUDA Graph 捕获整个时间步循环降低开销。",
+          "带宽受限：算术强度低，性能主要取决于 HBM 带宽与访问合并；需要尽量减少冗余读（shared memory tile/只读缓存）并避免不必要的全局写回。",
+          "边界处理导致分支：j=0、i=0、i=NX-1、j=NY-1 等。建议拆分 kernel 或使用不同 grid 范围避免 warp divergence。",
+          "精度与吞吐：double 在部分 GPU 上吞吐较低，但本问题通常仍带宽受限；若允许用 float 可显著提升有效带宽与缓存容量。"
+        ],
+        "expected_speedup": "相对单核 CPU：20x–100x；相对多核带宽已饱和的 CPU（如双路服务器）：3x–15x。实际取决于问题规模、double/float、GPU HBM 带宽与 CPU 内存带宽。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.08–0.12 FLOPs/byte（double）/ 0.15–0.25 FLOPs/byte（float）。估算：\n- ey 更新：每点 ~2 FLOPs（sub+mul）+ 读 ey,hz,hz(i-1) + 写 ey ≈ 3R+1W => 32B（double）=> ~0.0625\n- ex 更新：同上 ~0.0625\n- hz 更新：每点 ~6 FLOPs（3 sub + 2 add + 1 mul + 1 sub 约 6-7）+ 读 hz, ex(j+1), ex, ey(i+1), ey + 写 hz ≈ 5R+1W => 48B => ~0.125\n加权后整体 ~0.08–0.12（考虑边界与缓存命中会略升，但仍明显带宽受限）",
+        "cache_behavior": "1) 访问连续性：j 为内层，ex[i][j], ey[i][j], hz[i][j] 在内存中连续，硬件预取友好。\n2) 主要问题：每个时间步对 3 个大 2D 数组进行多次全扫（ey 扫一次、ex 扫一次、hz 扫一次），工作集通常远大于 L2/L3，导致每个时间步基本以流式方式从内存搬运。\n3) 复用机会：hz 在 ey/ex 两个循环中被读取两次；若能通过分块让同一块 hz 在缓存中被两次使用，可减少带宽压力。\n4) 写流量：ey/ex/hz 都是读-改-写，存在写分配（RFO）与写回；在带宽受限下写流量占比很高。",
+        "data_dependencies": [
+          "时间步依赖：t+1 依赖 t 的 ex/ey/hz（无法跨 t 并行）。",
+          "同一时间步内：ey 更新依赖旧 hz(i,j) 与 hz(i-1,j)；ex 更新依赖旧 hz(i,j) 与 hz(i,j-1)；hz 更新依赖“已更新”的 ex(i,j), ex(i,j+1), ey(i,j), ey(i+1,j) 以及旧 hz(i,j)。因此三段循环不能随意融合/重排，必须保持 ey/ex 在 hz 之前完成（或采用更复杂的波前/时空分块）。"
+        ]
+      },
+      "cost": 0.049806750000000004,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.058730000000000004
+  }
+}

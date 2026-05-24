@@ -239,6 +239,8 @@ def main():
     parser.add_argument("--output-dir", default="results/role_swap")
     parser.add_argument("--force", action="store_true",
                         help="Re-run even if per-program result JSON exists")
+    parser.add_argument("--s2-model", default="gpt-5.2",
+                        help="S2 model (default gpt-5.2; e.g. deepseek-v3-2-251201 for cross-family)")
     args = parser.parse_args()
     
     logging.basicConfig(
@@ -264,10 +266,10 @@ def main():
     for vkey in variants_to_run:
         v = VARIANTS[vkey]
         logger.info(f"\n{'#'*60}")
-        logger.info(f"Running {v['label']} (S1=gpt-4o, S2=gpt-5.2)")
+        logger.info(f"Running {v['label']} (S1=gpt-4o, S2={args.s2_model})")
         logger.info(f"{'#'*60}")
         
-        pipeline = v["class"](s1_model="gpt-4o", s2_model="gpt-5.2")
+        pipeline = v["class"](s1_model="gpt-4o", s2_model=args.s2_model)
         
         variant_dir = output_dir / vkey
         variant_dir.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,63 @@
+{
+  "program": "adi",
+  "model": "gpt-5.2",
+  "s1_bottleneck_raw": "memory",
+  "s1_primary": "memory",
+  "s1_reasoning": "The kernel performs relatively few FLOPs per byte moved: each inner iteration loads/stores multiple arrays (u/v/p/q) and writes p/q plus v/u, with limited data reuse. Additionally, the Column Sweep accesses u and v with strided (non-contiguous) patterns in row-major layout, increasing cache/TLB misses and reducing effective bandwidth. Divisions add compute cost, but overall arithmetic intensity remains low and performance is typically limited by memory bandwidth/latency and locality rather than ",
+  "ground_truth": "memory",
+  "correct": true,
+  "eval_score": 67.87500000000001,
+  "cost": 0.0305515,
+  "stage1": {
+    "model": "gpt-5.2",
+    "hotspots": [
+      {
+        "location": "kernel_adi(): time-step loop t=1..TSTEPS (overall), especially Column Sweep + Row Sweep (around lines in kernel_adi for-loops over t/i/j)",
+        "estimated_time_percentage": "95-99%",
+        "reason": "Dominant O(TSTEPS*N^2) work; four large stencil/tri-diagonal-solve-like sweeps per time step with multiple array reads/writes and divisions in the inner loops.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Column Sweep forward elimination loop: for (j=1; j<N-1; j++) computing p[i][j], q[i][j]",
+        "estimated_time_percentage": "25-35%",
+        "reason": "Inner loop performs multiple loads from u plus recurrence on p/q and two divisions by (a*p[i][j-1]+b); also accesses u[j][i±1] with poor spatial locality (effectively strided/transpose access in row-major layout).",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Column Sweep back substitution loop: for (j=N-2; j>=1; j--) computing v[j][i]",
+        "estimated_time_percentage": "10-18%",
+        "reason": "Streaming recurrence with dependency on v[j+1][i]; still suffers from strided access to v in row-major layout (varying first index j while second index i fixed).",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Row Sweep forward elimination loop: for (j=1; j<N-1; j++) computing p[i][j], q[i][j]",
+        "estimated_time_percentage": "25-35%",
+        "reason": "Inner loop does multiple loads from v with good spatial locality (contiguous in j) but includes recurrence and divisions; heavy memory traffic to p/q.",
+        "confidence": "high"
+      },
+      {
+        "location": "kernel_adi(): Row Sweep back substitution loop: for (j=N-2; j>=1; j--) computing u[i][j]",
+        "estimated_time_percentage": "10-18%",
+        "reason": "Streaming recurrence with dependency on u[i][j+1]; contiguous access but still bandwidth-heavy due to p/q reads and u write.",
+        "confidence": "high"
+      },
+      {
+        "location": "print_array(): nested loops over i/j with fprintf (after timing, but can dominate wall time if enabled)",
+        "estimated_time_percentage": "0% (excluded from PolyBench kernel timing) / potentially >>50% of end-to-end runtime if I/O not suppressed",
+        "reason": "Formatted I/O per element is extremely slow compared to computation; can dwarf compute for moderate/large N.",
+        "confidence": "medium"
+      }
+    ],
+    "bottleneck_type": {
+      "primary": "memory",
+      "reasoning": "The kernel performs relatively few FLOPs per byte moved: each inner iteration loads/stores multiple arrays (u/v/p/q) and writes p/q plus v/u, with limited data reuse. Additionally, the Column Sweep accesses u and v with strided (non-contiguous) patterns in row-major layout, increasing cache/TLB misses and reducing effective bandwidth. Divisions add compute cost, but overall arithmetic intensity remains low and performance is typically limited by memory bandwidth/latency and locality rather than peak FLOPs."
+    },
+    "gpu_suitability": {
+      "suitable": true,
+      "reasoning": "The computation is dominated by many independent 1D tridiagonal-like solves along rows/columns per time step. Each line has a sequential dependency in j (Thomas-like recurrence), which limits fine-grain parallelism, but there is abundant parallelism across i-lines (O(N) independent lines) and across the two sweeps. GPUs can accelerate this using parallel tridiagonal solvers (PCR/CR) or batched Thomas with one warp/block per line. Memory access for the column sweep is problematic unless data is transposed or stored in a layout that makes lines contiguous.",
+      "recommended_approach": "Use a batched tridiagonal solver on GPU: (1) transpose u (or store u/v in a layout enabling coalesced column access), (2) run batched solve for all lines in parallel (one block/warp per line) to produce v, (3) transpose as needed, (4) run batched solve for row sweep to update u. Prefer cyclic reduction/PCR for more parallelism within a line, or warp-level Thomas for moderate N. Keep p/q as per-line shared/local memory buffers to reduce global traffic."
+    },
+    "cost": 0.0305515,
+    "bottleneck_raw": "memory"
+  }
+}

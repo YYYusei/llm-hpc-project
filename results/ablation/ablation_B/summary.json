@@ -4,25 +4,23 @@
     "s2_model": "gpt-4o",
     "label": "Ablation B (5.2→4o)"
   },
-  "timestamp": "2026-05-24T02:42:01.830639",
+  "timestamp": "2026-05-24T15:35:45.663837",
   "programs_tested": [
-    "gemm",
-    "2mm",
-    "3mm",
-    "syrk",
-    "syr2k",
-    "doitgen",
-    "gramschmidt"
+    "trmm",
+    "adi",
+    "fdtd_2d",
+    "heat_3d",
+    "seidel_2d"
   ],
   "results": {
-    "gemm": {
-      "program": "gemm",
+    "trmm": {
+      "program": "trmm",
       "config": "Ablation B (5.2→4o)",
       "s1_model": "gpt-5.2",
       "s2_model": "gpt-4o",
       "s1_bottleneck_raw": "memory",
       "s2_bottleneck_raw": "memory",
-      "s1_score": 72.57507583417593,
+      "s1_score": 71.38213213213214,
       "classification": {
         "s1_primary": "memory",
         "s2_primary": "memory",
@@ -32,43 +30,37 @@
         "s2_matches_gt": false,
         "correction_type": "no-change"
       },
-      "cost": 0.03537975,
+      "cost": 0.030912,
       "full_result": {
-        "code_name": "gemm",
-        "program_key": "gemm",
+        "code_name": "trmm",
+        "program_key": "trmm",
         "prompt_type": "zero_shot",
         "stage1": {
           "model": "gpt-5.2",
           "hotspots": [
             {
-              "location": "kernel_gemm(): nested loops i-k-j (C[i][j] += alpha*A[i][k]*B[k][j])",
-              "estimated_time_percentage": "90-99%",
-              "reason": "This is the O(ni*nj*nk) GEMM update performing the vast majority of floating-point operations and memory traffic; dominates runtime for any non-trivial sizes.",
+              "location": "kernel_trmm(): nested loops i/j/k (around lines 86-95)",
+              "estimated_time_percentage": "95-99%",
+              "reason": "This is the only O(M^2*N) compute region: for each (i,j) it performs a reduction over k=i+1..M-1 with a multiply-add and loads/stores B; dominates runtime for realistic PolyBench sizes.",
               "confidence": "high"
             },
             {
-              "location": "kernel_gemm(): scaling loop i-j (C[i][j] *= beta)",
-              "estimated_time_percentage": "1-8%",
-              "reason": "Touches the entire C matrix once (O(ni*nj)) and adds extra memory bandwidth demand; smaller than the GEMM update but can be noticeable for small nk.",
-              "confidence": "medium"
-            },
-            {
-              "location": "print_array(): full matrix dump (i-j with fprintf)",
-              "estimated_time_percentage": "0-95% (depends on whether dumping is enabled and output target)",
-              "reason": "If POLYBENCH_DUMP_* is enabled, formatted I/O can dominate runtime and completely mask kernel performance; otherwise it is typically compiled out or redirected.",
+              "location": "print_array(): full scan + formatted I/O (around lines 52-67) [usually excluded from timing but can dominate wall time if enabled]",
+              "estimated_time_percentage": "0-5% (timed region), but can be >90% of end-to-end wall time when dumping output",
+              "reason": "Formatted fprintf in a doubly-nested loop is extremely slow; however PolyBench typically excludes it from the measured kernel timing.",
               "confidence": "medium"
             }
           ],
           "bottleneck_type": {
             "primary": "memory",
-            "reasoning": "The i-k-j ordering streams B[k][j] and updates C[i][j] for every k, causing repeated loads/stores of C and poor cache reuse of B across i. Without blocking, arithmetic intensity is reduced by excessive memory traffic (especially C read-modify-write each k), making performance largely limited by memory bandwidth and cache behavior rather than peak FLOPs. If sizes fit well in cache, it can become more compute-bound, but the naive loop order typically makes it memory-dominated for realistic NI/NJ/NK."
+            "reasoning": "The inner k-loop streams through B[k][j] and A[k][i] with low arithmetic intensity (~2 flops per ~16 bytes for double, plus repeated read/modify/write of B[i][j] unless kept in a register). Access to A is strided (A[k][i] with k varying) which is cache-unfriendly in row-major layout, and B is read for each k. Overall performance is limited by memory bandwidth and cache behavior more than peak FLOPs."
           },
           "gpu_suitability": {
             "suitable": true,
-            "reasoning": "This is a classic dense GEMM (highly parallel, regular memory access when properly tiled) and maps extremely well to GPUs. Naive CPU-style loops are not ideal, but using a GPU GEMM implementation achieves very high utilization.",
-            "recommended_approach": "Use cuBLAS/rocBLAS gemm (e.g., cublasGemmEx/cublasSgemm/Dgemm) with device-resident A/B/C. Transfer A/B/C to GPU once, run GEMM, and copy back C if needed. If implementing manually, use 2D thread blocks, shared-memory tiling for A and B, and accumulate C in registers; fuse beta scaling into the kernel."
+            "reasoning": "The kernel is a dense triangular matrix-matrix multiply (TRMM), which maps well to GPUs when implemented with blocked GEMM-like kernels. However, the naive loop order has poor locality and would be inefficient on GPU; using a tuned library is strongly preferred.",
+            "recommended_approach": "Use cuBLAS/rocBLAS trmm (or implement via blocked GEMM: treat triangular A with masking/packed storage). Keep A and B on device, launch TRMM once, and avoid host-device transfers inside timing. Use column/row-major conventions carefully (may need to swap operands or use transposes) to match cuBLAS layout."
           },
-          "cost": 0.023317,
+          "cost": 0.020257999999999998,
           "bottleneck_raw": "memory"
         },
         "stage2": {
@@ -76,58 +68,51 @@
           "validation": {
             "bottleneck_correct": true,
             "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to poor cache reuse in the i-k-j loop order. This order results in frequent reloading of matrix B and inefficient use of cache for matrix C, leading to high memory traffic and limited performance by memory bandwidth."
+            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to low arithmetic intensity and cache-unfriendly access patterns. The strided access to matrix A and repeated access to matrix B in the inner loop are indeed limiting factors for performance, primarily constrained by memory bandwidth."
           },
           "analysis": {},
           "detailed_optimizations": [
             {
-              "target": "kernel_gemm()",
-              "technique": "Loop Tiling",
-              "code_changes": "Introduce loop tiling to improve cache reuse. Change the loop order to i-j-k and apply tiling on the i and j loops.",
-              "expected_speedup": "2x-3x",
+              "target": "kernel_trmm",
+              "technique": "Loop Tiling and Blocking",
+              "code_changes": "Introduce loop tiling for the i, j, and k loops to improve cache locality. This involves breaking the loops into smaller blocks that fit into cache.",
+              "expected_speedup": "1.5x to 2x",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_gemm()",
+              "target": "kernel_trmm",
               "technique": "Loop Unrolling",
-              "code_changes": "Unroll the innermost loop (j-loop) to reduce loop overhead and increase instruction-level parallelism.",
-              "expected_speedup": "1.2x-1.5x",
+              "code_changes": "Unroll the innermost loop (k-loop) to reduce loop overhead and increase instruction-level parallelism.",
+              "expected_speedup": "1.2x to 1.5x",
               "difficulty": "easy"
             },
             {
-              "target": "kernel_gemm()",
-              "technique": "SIMD Vectorization",
-              "code_changes": "Use compiler pragmas or intrinsics to vectorize the innermost loop operations.",
-              "expected_speedup": "2x-4x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "print_array()",
+              "target": "print_array",
               "technique": "Conditional Compilation",
-              "code_changes": "Use preprocessor directives to conditionally compile the print_array function only when needed.",
-              "expected_speedup": "Negligible in computation, but reduces unnecessary I/O overhead.",
+              "code_changes": "Use preprocessor directives to conditionally compile the print_array function only when needed, reducing unnecessary I/O operations during performance runs.",
+              "expected_speedup": "Negligible in computation, but reduces wall time significantly when I/O is not needed.",
               "difficulty": "easy"
             }
           ],
           "gpu_implementation": {
             "suitable": true,
-            "strategy": "Use a tiled approach with shared memory to maximize data reuse. Each thread block computes a tile of the output matrix C.",
-            "data_layout": "Store matrices in row-major order and use shared memory for tiles of A and B to reduce global memory accesses.",
+            "strategy": "Use a blocked approach similar to GEMM, leveraging shared memory for tiles of A and B to maximize data reuse and minimize global memory accesses.",
+            "data_layout": "Consider using a column-major layout for matrix A or transposing A to improve coalesced memory access patterns on the GPU.",
             "challenges": [
               "Managing shared memory usage efficiently",
               "Ensuring coalesced memory accesses"
             ],
-            "expected_speedup": "10x-50x depending on GPU architecture and problem size"
+            "expected_speedup": "5x to 10x"
           },
           "performance_analysis": {
-            "arithmetic_intensity": "2 * NI * NJ * NK / (NI * NJ + NI * NK + NK * NJ) FLOPs/byte",
-            "cache_behavior": "The current loop order results in poor cache reuse for matrices B and C. Tiling and reordering can significantly improve cache locality.",
+            "arithmetic_intensity": "0.125 FLOPs/byte",
+            "cache_behavior": "The current implementation has poor cache reuse due to strided access patterns in matrix A and repeated access to matrix B. Loop tiling can help improve cache hit rates.",
             "data_dependencies": [
-              "C[i][j] depends on previous C[i][j] values",
-              "A[i][k] and B[k][j] are independent across iterations"
+              "B[i][j] depends on B[k][j]",
+              "A[k][i] is read-only"
             ]
           },
-          "cost": 0.01206275,
+          "cost": 0.010654,
           "bottleneck_raw": "memory"
         },
         "classification": {
@@ -139,189 +124,81 @@
           "s2_matches_gt": false,
           "correction_type": "no-change"
         },
-        "total_cost": 0.03537975
+        "total_cost": 0.030912
       }
     },
-    "2mm": {
-      "program": "2mm",
+    "adi": {
+      "program": "adi",
       "config": "Ablation B (5.2→4o)",
       "s1_model": "gpt-5.2",
       "s2_model": "gpt-4o",
       "s1_bottleneck_raw": "memory",
       "s2_bottleneck_raw": "memory",
-      "s1_score": 69.16253791708796,
+      "s1_score": 67.87500000000001,
       "classification": {
         "s1_primary": "memory",
         "s2_primary": "memory",
-        "ground_truth": "compute",
+        "ground_truth": "memory",
         "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
         "correction_type": "no-change"
       },
-      "cost": 0.037948749999999996,
+      "cost": 0.0452235,
       "full_result": {
-        "code_name": "2mm",
-        "program_key": "2mm",
+        "code_name": "adi",
+        "program_key": "adi",
         "prompt_type": "zero_shot",
         "stage1": {
           "model": "gpt-5.2",
           "hotspots": [
             {
-              "location": "kernel_2mm: tmp computation loop nest (i=0..NI-1, j=0..NJ-1, k=0..NK-1) around lines ~86-95",
-              "estimated_time_percentage": "45-60%",
-              "reason": "Dense GEMM-like multiply-accumulate: tmp[i][j] += alpha*A[i][k]*B[k][j]. High operation count O(NI*NJ*NK) and poor spatial locality for B (accessing B[k][j] with k as inner loop causes large-stride/streaming through rows/columns depending on layout), leading to heavy memory traffic and limited cache reuse without blocking.",
+              "location": "kernel_adi(): time-step loop t=1..TSTEPS (overall kernel)",
+              "estimated_time_percentage": "95-99%",
+              "reason": "Dominates runtime due to O(TSTEPS*N^2) work with multiple full-grid sweeps and large memory traffic across u/v/p/q each time step.",
               "confidence": "high"
             },
             {
-              "location": "kernel_2mm: D update loop nest (i=0..NI-1, j=0..NL-1, k=0..NJ-1) around lines ~96-104",
-              "estimated_time_percentage": "40-55%",
-              "reason": "Second GEMM-like multiply-accumulate: D[i][j] += tmp[i][k]*C[k][j] plus D scaling. Operation count O(NI*NL*NJ). Similar locality issue for C (C[k][j] with k inner) and repeated loads/stores of D[i][j] if not kept in a register across k.",
-              "confidence": "high"
-            },
-            {
-              "location": "print_array (full D scan + fprintf) around lines ~52-67 (only if timing includes DCE/printing)",
-              "estimated_time_percentage": "0-90% (depends on whether printing is enabled/redirected and whether included in measured region)",
-              "reason": "I/O via fprintf in a doubly-nested loop is extremely slow compared to compute; however PolyBench typically excludes this from the timed kernel region. If enabled and measured, it dominates runtime and is communication/I/O-bound.",
-              "confidence": "medium"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "Both main kernels are matrix-multiply-like but written as naive triple loops without cache blocking. This yields low arithmetic intensity due to repeatedly streaming B and C with limited reuse in caches (especially for larger problem sizes), making performance primarily limited by memory bandwidth and cache misses rather than peak FLOPs. With effective blocking/BLAS, the bottleneck can shift toward compute."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The kernel consists of two large dense matrix multiplications (GEMM-like), which map extremely well to GPUs due to high parallelism and availability of highly optimized GEMM implementations. Naive GPU kernels without tiling would be bandwidth-limited, but using vendor libraries achieves near-peak performance.",
-            "recommended_approach": "Use cuBLAS/rocBLAS: compute tmp = alpha*A*B, then D = beta*D + tmp*C. Keep all matrices resident on device; use column-major or row-major interfaces consistently (or transpose flags). If custom kernels are required, implement tiled shared-memory GEMM for each multiply and fuse beta scaling into the epilogue of the second GEMM."
-          },
-          "cost": 0.026209749999999997,
-          "bottleneck_raw": "memory"
-        },
-        "stage2": {
-          "model": "gpt-4o",
-          "validation": {
-            "bottleneck_correct": true,
-            "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the naive implementation of matrix multiplications without cache blocking. This results in low arithmetic intensity and high memory bandwidth usage, which is typical for such patterns without optimization."
-          },
-          "analysis": {},
-          "detailed_optimizations": [
-            {
-              "target": "kernel_2mm: tmp computation loop nest",
-              "technique": "Cache blocking (tiling)",
-              "code_changes": "Introduce loop tiling for the i, j, and k loops to improve cache reuse. For example, use tile sizes that fit into L1 or L2 cache.",
-              "expected_speedup": "2x-3x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "kernel_2mm: D update loop nest",
-              "technique": "Cache blocking (tiling) and loop unrolling",
-              "code_changes": "Apply similar tiling as the tmp computation loop and consider unrolling the innermost loop to reduce loop overhead and increase instruction-level parallelism.",
-              "expected_speedup": "2x-3x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "print_array",
-              "technique": "Conditional compilation or asynchronous I/O",
-              "code_changes": "Use conditional compilation to exclude print_array from performance-critical builds or implement asynchronous I/O to overlap computation with output.",
-              "expected_speedup": "Varies (up to 90% if I/O is a bottleneck)",
-              "difficulty": "easy"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "Use cuBLAS or similar library for GEMM operations to leverage optimized GPU matrix multiplication routines.",
-            "data_layout": "Ensure matrices are stored in column-major order to match GPU memory access patterns, or use library-specific data layouts.",
-            "challenges": [
-              "Data transfer between host and device",
-              "Kernel launch overhead"
-            ],
-            "expected_speedup": "5x-20x depending on GPU architecture and problem size"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "Approximately 0.5 FLOPs/byte",
-            "cache_behavior": "Without blocking, the cache lines are not effectively reused, leading to frequent cache misses and high memory bandwidth usage.",
-            "data_dependencies": [
-              "tmp[i][j] depends on A[i][k] and B[k][j]",
-              "D[i][j] depends on tmp[i][k] and C[k][j]"
-            ]
-          },
-          "cost": 0.011739,
-          "bottleneck_raw": "memory"
-        },
-        "classification": {
-          "s1_primary": "memory",
-          "s2_primary": "memory",
-          "ground_truth": "compute",
-          "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
-          "correction_type": "no-change"
-        },
-        "total_cost": 0.037948749999999996
-      }
-    },
-    "3mm": {
-      "program": "3mm",
-      "config": "Ablation B (5.2→4o)",
-      "s1_model": "gpt-5.2",
-      "s2_model": "gpt-4o",
-      "s1_bottleneck_raw": "memory",
-      "s2_bottleneck_raw": "memory",
-      "s1_score": 68.01358148893361,
-      "classification": {
-        "s1_primary": "memory",
-        "s2_primary": "memory",
-        "ground_truth": "compute",
-        "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
-        "correction_type": "no-change"
-      },
-      "cost": 0.0384125,
-      "full_result": {
-        "code_name": "3mm",
-        "program_key": "3mm",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-5.2",
-          "hotspots": [
-            {
-              "location": "kernel_3mm: E := A*B triple loop (around lines 86-96)",
+              "location": "kernel_adi(): Column Sweep forward elimination loop: for (i=1..N-2) for (j=1..N-2) computing p[i][j], q[i][j]",
               "estimated_time_percentage": "30-40%",
-              "reason": "Dense matrix multiplication O(ni*nj*nk); inner k-loop performs a multiply-add and streams A row and B column with poor spatial locality for B (stride access), causing many cache misses and high memory traffic.",
+              "reason": "Inner loop performs several loads/stores per iteration (p,q,u) plus divisions; accesses u[j][i] with j as fastest-varying index but second dimension fixed (i), causing strided/non-contiguous memory access in row-major layout and poor cache utilization.",
               "confidence": "high"
             },
             {
-              "location": "kernel_3mm: F := C*D triple loop (around lines 98-108)",
-              "estimated_time_percentage": "25-35%",
-              "reason": "Dense matrix multiplication O(nj*nl*nm); similar access pattern issues (D accessed by column with stride), leading to cache/TLB pressure and limited reuse without blocking.",
+              "location": "kernel_adi(): Column Sweep back substitution loop: for (i=1..N-2) for (j=N-2..1) computing v[j][i]",
+              "estimated_time_percentage": "15-25%",
+              "reason": "Recurrence v[j][i] depends on v[j+1][i] (loop-carried dependency) preventing vectorization; also strided access to v due to column-wise traversal in row-major layout.",
               "confidence": "high"
             },
             {
-              "location": "kernel_3mm: G := E*F triple loop (around lines 110-120)",
-              "estimated_time_percentage": "25-35%",
-              "reason": "Dense matrix multiplication O(ni*nl*nj); again reads F by column (stride) and writes G; dominates runtime along with the other GEMM-like loops.",
+              "location": "kernel_adi(): Row Sweep forward elimination loop: for (i=1..N-2) for (j=1..N-2) computing p[i][j], q[i][j]",
+              "estimated_time_percentage": "20-30%",
+              "reason": "High memory traffic and divisions; better spatial locality than column sweep (j contiguous) but still bandwidth/latency heavy due to streaming p/q and reading v neighbors each iteration.",
               "confidence": "high"
             },
             {
-              "location": "print_array (around lines 52-70) when enabled for full output",
-              "estimated_time_percentage": "0-80% (depends on PolyBench dump settings / dataset size / I/O target)",
-              "reason": "Potentially prints NI*NL elements; I/O can dwarf compute if dumping is enabled to a slow target (stdout/file). In typical performance runs PolyBench disables/redirects dumps, making this negligible.",
+              "location": "kernel_adi(): Row Sweep back substitution loop: for (i=1..N-2) for (j=N-2..1) computing u[i][j]",
+              "estimated_time_percentage": "10-20%",
+              "reason": "Loop-carried dependency u[i][j] depends on u[i][j+1] limiting SIMD; memory streaming of p/q/u with moderate locality.",
+              "confidence": "high"
+            },
+            {
+              "location": "print_array(): nested loops printing u",
+              "estimated_time_percentage": "0-50% (depends on whether I/O is enabled in the run configuration)",
+              "reason": "Formatted I/O in a double loop is extremely slow relative to computation; in PolyBench timing typically excludes this, but end-to-end runtime can be dominated by printing for large N.",
               "confidence": "medium"
             }
           ],
           "bottleneck_type": {
             "primary": "memory",
-            "reasoning": "Although each inner iteration is a simple FMA-like operation, the naive i-j-k loop order causes strided accesses to the right-hand matrix (B, D, F) and limited cache reuse, making effective arithmetic intensity low and performance constrained by memory hierarchy (cache/TLB/memory bandwidth) rather than peak FLOPs. With proper blocking/packing it can become more compute-bound."
+            "reasoning": "The kernel streams large 2D arrays (u,v,p,q) with low arithmetic intensity (few flops per many bytes moved). Column sweeps traverse columns in row-major storage, causing strided accesses and poor cache line utilization, increasing effective bandwidth demand and latency. Additionally, back-substitution recurrences limit SIMD, making it harder to hide memory latency."
           },
           "gpu_suitability": {
             "suitable": true,
-            "reasoning": "The workload is three large dense matrix multiplications with high parallelism and regular computation. GPUs excel at GEMM when using optimized libraries and sufficient problem sizes; the main concern is host-device transfer overhead if data is moved frequently, but here data can remain on device for all three GEMMs.",
-            "recommended_approach": "Use cuBLAS/rocBLAS: allocate A,B,C,D,E,F,G on device, copy A,B,C,D once, run three GEMMs (E=A*B, F=C*D, G=E*F) back-to-back on the GPU, then copy back G only if needed. Use appropriate leading dimensions and consider using tensor cores (TF32/FP16/BF16) if acceptable for DATA_TYPE/accuracy. Overlap transfers with compute via streams if initialization remains on host."
+            "reasoning": "There is substantial parallelism across independent 1D tridiagonal solves (each i-line) in both sweeps, but each line has a sequential recurrence (Thomas algorithm) that limits intra-line parallelism. GPUs can still perform well by running many independent lines concurrently; performance depends on using a parallel tridiagonal solver or batching many Thomas solves efficiently. Memory access for column sweeps is problematic unless data is transposed or accessed through a layout that provides coalescing.",
+            "recommended_approach": "Batch the tridiagonal systems per sweep: for each time step, launch kernels that solve (N-2) independent systems of size (N-2). Use (1) data transposition so each system is contiguous/coalesced, or store both u and uT (and v/vT) on device. Use cuSPARSE gtsv2StridedBatch (or equivalent) for batched tridiagonal solves, or implement PCR/CR (parallel cyclic reduction) for more parallelism within each system. Fuse boundary setup with solve kernels, and keep all arrays resident on GPU across all tsteps to avoid PCIe transfers."
           },
-          "cost": 0.025264750000000002,
+          "cost": 0.0316435,
           "bottleneck_raw": "memory"
         },
         "stage2": {
@@ -329,367 +206,139 @@
           "validation": {
             "bottleneck_correct": true,
             "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to strided access patterns and limited cache reuse in the naive matrix multiplication implementation. The arithmetic intensity is low, and performance is constrained by memory bandwidth rather than computational throughput."
+            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to low arithmetic intensity and inefficient memory access patterns, particularly in the column sweeps. The strided access pattern in row-major storage leads to poor cache utilization, and the sequential nature of the tridiagonal solves limits SIMD parallelism."
           },
           "analysis": {},
           "detailed_optimizations": [
             {
-              "target": "kernel_3mm: E := A*B",
-              "technique": "Loop blocking and reordering",
-              "code_changes": "Implement loop tiling for the i, j, and k loops to improve cache reuse. Reorder loops to k-i-j to improve access patterns.",
-              "expected_speedup": "1.5x-2x",
+              "target": "Column Sweep forward elimination loop",
+              "technique": "Loop Tiling and Blocking",
+              "code_changes": "Introduce loop tiling to improve cache locality by processing blocks of data that fit into cache.",
+              "expected_speedup": "1.5x - 2x",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_3mm: F := C*D",
-              "technique": "Loop blocking and reordering",
-              "code_changes": "Similar to E := A*B, apply loop tiling and reorder loops to k-i-j.",
-              "expected_speedup": "1.5x-2x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "kernel_3mm: G := E*F",
-              "technique": "Loop blocking and reordering",
-              "code_changes": "Apply loop tiling and reorder loops to k-i-j to enhance cache performance.",
-              "expected_speedup": "1.5x-2x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "print_array",
-              "technique": "Conditional compilation",
-              "code_changes": "Use preprocessor directives to enable/disable printing based on a compile-time flag to avoid unnecessary I/O overhead.",
-              "expected_speedup": "Varies based on I/O settings",
-              "difficulty": "easy"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "Use cuBLAS or a similar optimized library for matrix multiplication. Each matrix multiplication can be offloaded to the GPU as a separate kernel.",
-            "data_layout": "Use column-major order to match GPU memory access patterns and optimize for coalesced memory access.",
-            "challenges": [
-              "Managing data transfer overhead between host and device",
-              "Ensuring sufficient problem size to fully utilize GPU resources"
-            ],
-            "expected_speedup": "5x-10x"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "0.5 FLOPs/byte",
-            "cache_behavior": "The current implementation suffers from poor cache reuse due to strided access patterns. Loop blocking can significantly improve cache line utilization.",
-            "data_dependencies": [
-              "E[i][j] depends on A[i][k] and B[k][j]",
-              "F[i][j] depends on C[i][k] and D[k][j]",
-              "G[i][j] depends on E[i][k] and F[k][j]"
-            ]
-          },
-          "cost": 0.01314775,
-          "bottleneck_raw": "memory"
-        },
-        "classification": {
-          "s1_primary": "memory",
-          "s2_primary": "memory",
-          "ground_truth": "compute",
-          "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
-          "correction_type": "no-change"
-        },
-        "total_cost": 0.0384125
-      }
-    },
-    "syrk": {
-      "program": "syrk",
-      "config": "Ablation B (5.2→4o)",
-      "s1_model": "gpt-5.2",
-      "s2_model": "gpt-4o",
-      "s1_bottleneck_raw": "memory",
-      "s2_bottleneck_raw": "memory",
-      "s1_score": 72.5203109327984,
-      "classification": {
-        "s1_primary": "memory",
-        "s2_primary": "memory",
-        "ground_truth": "compute",
-        "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
-        "correction_type": "no-change"
-      },
-      "cost": 0.03562825,
-      "full_result": {
-        "code_name": "syrk",
-        "program_key": "syrk",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-5.2",
-          "hotspots": [
-            {
-              "location": "kernel_syrk(): nested loops i-k-j (C[i][j] += alpha*A[i][k]*A[j][k]) around lines ~78-90",
-              "estimated_time_percentage": "90-98%",
-              "reason": "This is the O(N^2*M) rank-k update (SYRK) doing the vast majority of floating-point operations and repeatedly streaming A and updating C for the lower triangle.",
-              "confidence": "high"
-            },
-            {
-              "location": "kernel_syrk(): scaling loop i-j (C[i][j] *= beta) around lines ~75-77",
-              "estimated_time_percentage": "1-5%",
-              "reason": "Touches O(N^2/2) elements of C once; minor compared to the rank-k update but still a full memory sweep of the lower triangle.",
-              "confidence": "high"
-            },
-            {
-              "location": "print_array(): full C dump (I/O) around lines ~44-60",
-              "estimated_time_percentage": "0-50% (depends on whether POLYBENCH_DUMP is enabled and output target speed)",
-              "reason": "If dumping is enabled, formatted printing of O(N^2) values can dominate runtime due to slow I/O and conversion overhead; otherwise it is typically compiled out or redirected.",
-              "confidence": "medium"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "The main update loop has low arithmetic intensity in this naive ordering: for each (i,k) it streams A[j][k] over j and performs read-modify-write on C[i][j]. C updates cause significant memory traffic (loads/stores) and poor cache reuse without blocking; A[j][k] access is strided in row-major layout (varying j with fixed k), reducing spatial locality and effective bandwidth. With proper blocking it can become more compute-bound, but as written it is typically limited by memory hierarchy behavior."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "SYRK is a dense linear algebra kernel with high parallelism and regular memory access when properly blocked; GPUs perform very well using optimized GEMM/SYRK implementations. The naive CPU loop order is not ideal, but mapping to a GPU BLAS routine avoids manual tuning.",
-            "recommended_approach": "Use cuBLAS/rocBLAS SYRK (or GEMM: compute C_lower = alpha*A*A^T + beta*C) with A and C resident on device. Prefer calling cublasDsyrk/cublasSsyrk (or cublasGemmEx with appropriate transpose) and only transfer C back if needed. If writing a custom kernel, use 2D tiling: load A tiles into shared memory, accumulate C tile in registers, and write only the lower triangle."
-          },
-          "cost": 0.0250635,
-          "bottleneck_raw": "memory"
-        },
-        "stage2": {
-          "model": "gpt-4o",
-          "validation": {
-            "bottleneck_correct": true,
-            "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to low arithmetic intensity and poor cache reuse. The nested loop structure results in significant memory traffic, especially with the strided access pattern of A[j][k]."
-          },
-          "analysis": {},
-          "detailed_optimizations": [
-            {
-              "target": "kernel_syrk()",
-              "technique": "Loop Blocking/Tile",
-              "code_changes": "Introduce loop blocking to improve cache reuse. For example, use a block size B and iterate over blocks of i, j, and k.",
-              "expected_speedup": "1.5x-2.5x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "kernel_syrk()",
-              "technique": "Loop Unrolling",
-              "code_changes": "Unroll the innermost loop over j to reduce loop overhead and increase instruction-level parallelism.",
-              "expected_speedup": "1.1x-1.3x",
-              "difficulty": "easy"
-            },
-            {
-              "target": "kernel_syrk()",
-              "technique": "Data Layout Transformation",
-              "code_changes": "Transform the data layout of A to improve spatial locality, such as using a column-major order or a blocked layout.",
-              "expected_speedup": "1.2x-1.5x",
-              "difficulty": "medium"
-            }
-          ],
-          "gpu_implementation": {
-            "suitable": true,
-            "strategy": "Use CUDA or OpenCL to parallelize the outer loops over i and j, and leverage shared memory for block-level data reuse.",
-            "data_layout": "Use a tiled layout for A to optimize memory coalescing and shared memory usage.",
-            "challenges": [
-              "Efficiently managing shared memory",
-              "Avoiding bank conflicts in shared memory"
-            ],
-            "expected_speedup": "5x-10x"
-          },
-          "performance_analysis": {
-            "arithmetic_intensity": "2 * n * m / (n * n + n * m) FLOPs/byte",
-            "cache_behavior": "The current implementation has poor cache reuse due to strided access patterns. Blocking can significantly improve cache hit rates.",
-            "data_dependencies": [
-              "C[i][j] depends on previous C[i][j] values",
-              "A[i][k] and A[j][k] are independent across iterations"
-            ]
-          },
-          "cost": 0.01056475,
-          "bottleneck_raw": "memory"
-        },
-        "classification": {
-          "s1_primary": "memory",
-          "s2_primary": "memory",
-          "ground_truth": "compute",
-          "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
-          "correction_type": "no-change"
-        },
-        "total_cost": 0.03562825
-      }
-    },
-    "syr2k": {
-      "program": "syr2k",
-      "config": "Ablation B (5.2→4o)",
-      "s1_model": "gpt-5.2",
-      "s2_model": "gpt-4o",
-      "s1_bottleneck_raw": "memory",
-      "s2_bottleneck_raw": "memory",
-      "s1_score": 72.547583081571,
-      "classification": {
-        "s1_primary": "memory",
-        "s2_primary": "memory",
-        "ground_truth": "compute",
-        "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
-        "correction_type": "no-change"
-      },
-      "cost": 0.034349000000000005,
-      "full_result": {
-        "code_name": "syr2k",
-        "program_key": "syr2k",
-        "prompt_type": "zero_shot",
-        "stage1": {
-          "model": "gpt-5.2",
-          "hotspots": [
-            {
-              "location": "kernel_syr2k(): nested loops i-k-j (C update) around lines 86-96",
-              "estimated_time_percentage": "90-98%",
-              "reason": "This is the O(N^2*M) compute kernel performing the bulk of floating-point operations and repeatedly streaming A/B while updating C; dominates timed region.",
-              "confidence": "high"
-            },
-            {
-              "location": "kernel_syr2k(): loop i-j scaling C by beta around lines 84-85",
-              "estimated_time_percentage": "2-8%",
-              "reason": "O(N^2) pass over C; smaller than the main update but still touches a large matrix and can be bandwidth-limited.",
-              "confidence": "high"
-            },
-            {
-              "location": "print_array(): full C scan and formatted I/O around lines 52-66 (not timed by PolyBench timer but affects end-to-end runtime)",
-              "estimated_time_percentage": "0% (timed region), potentially dominant wall-time if enabled",
-              "reason": "Formatted fprintf in a double loop is extremely slow compared to computation; can dwarf kernel time in real runs even though excluded from the benchmark timer.",
-              "confidence": "high"
-            }
-          ],
-          "bottleneck_type": {
-            "primary": "memory",
-            "reasoning": "The main kernel has low-to-moderate arithmetic intensity due to streaming A[j][k], B[j][k] across j for each k and repeatedly reading/writing C[i][j]. Access to A/B for varying j is contiguous, but C updates incur read-modify-write traffic and limited reuse unless blocked; performance is typically limited by memory bandwidth and cache capacity rather than peak FLOPs, especially for large N,M."
-          },
-          "gpu_suitability": {
-            "suitable": true,
-            "reasoning": "The kernel is a dense linear-algebra operation (SYR2K-like) with high parallelism over (i,j) and regular memory access patterns. GPUs perform well when implemented via optimized BLAS (cuBLAS/rocBLAS) with proper blocking; naive kernels may become bandwidth-limited but still typically outperform CPUs for large sizes.",
-            "recommended_approach": "Use cuBLAS/rocBLAS syr2k (or two GEMMs) operating on full matrices and then keep only the lower triangle (or use symmetric storage if supported). Transfer A,B,C to device once, run the BLAS call(s), and copy back C. If writing a custom kernel, use 2D thread blocks updating C tiles in shared memory, iterate k in chunks, and apply triangular masking (j<=i) when writing results."
-          },
-          "cost": 0.023425500000000002,
-          "bottleneck_raw": "memory"
-        },
-        "stage2": {
-          "model": "gpt-4o",
-          "validation": {
-            "bottleneck_correct": true,
-            "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the low-to-moderate arithmetic intensity and the read-modify-write pattern on matrix C. The access patterns for matrices A and B are contiguous, but the updates to C are bandwidth-limited, especially for large matrices."
-          },
-          "analysis": {},
-          "detailed_optimizations": [
-            {
-              "target": "kernel_syr2k()",
-              "technique": "Loop Blocking/Tile",
-              "code_changes": "Introduce loop blocking for the i-j-k loops to improve cache reuse. For example, use a block size of B for i, j, and k loops.",
-              "expected_speedup": "1.5x-2x",
-              "difficulty": "medium"
-            },
-            {
-              "target": "kernel_syr2k()",
+              "target": "Column Sweep back substitution loop",
               "technique": "SIMD Vectorization",
-              "code_changes": "Use compiler pragmas or intrinsics to vectorize the innermost loop over j. Ensure data alignment for SIMD operations.",
-              "expected_speedup": "1.2x-1.5x",
+              "code_changes": "Use compiler pragmas or intrinsics to enable SIMD vectorization where possible, focusing on independent operations.",
+              "expected_speedup": "1.2x - 1.5x",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_syr2k()",
+              "target": "Row Sweep forward elimination loop",
+              "technique": "Data Layout Transformation",
+              "code_changes": "Transpose the matrix or use a structure of arrays to improve memory access patterns for better cache line utilization.",
+              "expected_speedup": "1.5x - 2x",
+              "difficulty": "hard"
+            },
+            {
+              "target": "Row Sweep back substitution loop",
               "technique": "Parallelization",
-              "code_changes": "Use OpenMP to parallelize the outer loop over i. Ensure proper synchronization and data sharing clauses.",
-              "expected_speedup": "2x-4x (depending on core count)",
+              "code_changes": "Use OpenMP to parallelize the outer loop over 'i' to exploit multi-core CPUs.",
+              "expected_speedup": "2x - 3x",
+              "difficulty": "easy"
+            },
+            {
+              "target": "print_array()",
+              "technique": "I/O Optimization",
+              "code_changes": "Buffer output and reduce the frequency of I/O operations to minimize overhead.",
+              "expected_speedup": "Varies based on I/O configuration",
               "difficulty": "easy"
             }
           ],
           "gpu_implementation": {
             "suitable": true,
-            "strategy": "Use cuBLAS for optimized SYR2K implementation or write a custom kernel with thread blocks mapped to tiles of the matrices.",
-            "data_layout": "Ensure matrices are stored in column-major order for optimal access by CUDA cores.",
+            "strategy": "Use a parallel tridiagonal solver for each line and batch multiple solves to maximize GPU occupancy.",
+            "data_layout": "Consider transposing data or using a structure of arrays to ensure coalesced memory accesses.",
             "challenges": [
-              "Managing memory bandwidth limitations",
-              "Ensuring coalesced memory accesses"
+              "Handling sequential dependencies within each tridiagonal solve",
+              "Ensuring coalesced memory access for column sweeps"
             ],
-            "expected_speedup": "5x-10x over CPU implementation"
+            "expected_speedup": "5x - 10x"
           },
           "performance_analysis": {
-            "arithmetic_intensity": "Approximately 0.5 FLOPs/byte",
-            "cache_behavior": "The current implementation has poor cache reuse for matrix C due to the read-modify-write pattern. Blocking can improve cache hits.",
+            "arithmetic_intensity": "0.1 FLOPs/byte",
+            "cache_behavior": "Poor cache line utilization due to strided access in column sweeps; potential cache thrashing in large data sets.",
             "data_dependencies": [
-              "C[i][j] depends on previous C[i][j] values",
-              "A[j][k] and B[i][k] are independent across iterations"
+              "Sequential dependency in tridiagonal solves",
+              "Inter-loop dependencies between forward and back substitution"
             ]
           },
-          "cost": 0.0109235,
+          "cost": 0.013579999999999998,
           "bottleneck_raw": "memory"
         },
         "classification": {
           "s1_primary": "memory",
           "s2_primary": "memory",
-          "ground_truth": "compute",
+          "ground_truth": "memory",
           "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
           "correction_type": "no-change"
         },
-        "total_cost": 0.034349000000000005
+        "total_cost": 0.0452235
       }
     },
-    "doitgen": {
-      "program": "doitgen",
+    "fdtd_2d": {
+      "program": "fdtd_2d",
       "config": "Ablation B (5.2→4o)",
       "s1_model": "gpt-5.2",
       "s2_model": "gpt-4o",
       "s1_bottleneck_raw": "memory",
       "s2_bottleneck_raw": "memory",
-      "s1_score": 72.65890481064484,
+      "s1_score": 63.01130653266331,
       "classification": {
         "s1_primary": "memory",
         "s2_primary": "memory",
-        "ground_truth": "compute",
+        "ground_truth": "memory",
         "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
         "correction_type": "no-change"
       },
-      "cost": 0.03601325,
+      "cost": 0.037848999999999994,
       "full_result": {
-        "code_name": "doitgen",
-        "program_key": "doitgen",
+        "code_name": "fdtd_2d",
+        "program_key": "fdtd_2d",
         "prompt_type": "zero_shot",
         "stage1": {
           "model": "gpt-5.2",
           "hotspots": [
             {
-              "location": "kernel_doitgen(): nested loops r/q/p/s (matrix-vector multiply per (r,q))",
-              "estimated_time_percentage": "90-98%",
-              "reason": "Dominant O(nr*nq*np*np) work: for each (r,q), computes sum[p] = Σ_s A[r][q][s]*C4[s][p] for all p. This is effectively a GEMV/GEMM-like kernel with high total FLOPs and repeated memory accesses to C4 and A.",
+              "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, ey update (i=1..NX-1, j=0..NY-1) around lines ~95-98",
+              "estimated_time_percentage": "25-35%",
+              "reason": "Large 2D stencil-like update over ey for every timestep; low arithmetic intensity (few flops per multiple memory loads/stores) and streaming access dominates runtime.",
               "confidence": "high"
             },
             {
-              "location": "kernel_doitgen(): loop writing back A[r][q][p] = sum[p]",
-              "estimated_time_percentage": "2-8%",
-              "reason": "Streams through sum and writes A; lower arithmetic intensity but still touches np elements per (r,q). Often limited by store bandwidth and cache behavior.",
-              "confidence": "medium"
+              "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, ex update (i=0..NX-1, j=1..NY-1) around lines ~99-102",
+              "estimated_time_percentage": "25-35%",
+              "reason": "Similar full-grid update with neighbor access in j dimension; bandwidth-heavy with limited reuse; typically comparable cost to ey update.",
+              "confidence": "high"
             },
             {
-              "location": "print_array(): triple loop with fprintf",
-              "estimated_time_percentage": "0-50% (depends on whether timing includes it / runtime environment)",
-              "reason": "Heavy I/O (fprintf per element) can dominate wall time if executed in a real run; PolyBench timing typically excludes it, but overall program runtime may be I/O-bound when printing is enabled.",
+              "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, hz update (i=0..NX-2, j=0..NY-2) around lines ~103-107",
+              "estimated_time_percentage": "30-45%",
+              "reason": "Reads multiple fields (hz, ex at j and j+1, ey at i and i+1) and writes hz; highest memory traffic per lattice point among the three updates, so often the dominant hotspot.",
+              "confidence": "high"
+            },
+            {
+              "location": "kernel_fdtd_2d(): boundary condition ey[0][j]=_fict_[t] (j=0..NY-1) around lines ~93-94",
+              "estimated_time_percentage": "1-5%",
+              "reason": "Only one row per timestep; small compared to full 2D sweeps, but can be noticeable for small NX or very small problem sizes.",
               "confidence": "medium"
             }
           ],
           "bottleneck_type": {
             "primary": "memory",
-            "reasoning": "The core kernel performs ~2*np*np FLOPs per (r,q) while reading A[r][q][s] (np elements) and repeatedly accessing C4[s][p] (np*np elements). With the current loop order (p outer, s inner), C4 is accessed with a large stride in memory (C4[s][p] with s varying), reducing spatial locality and vectorization efficiency, and increasing cache/TLB misses. Arithmetic intensity is moderate, but effective performance is typically limited by memory hierarchy behavior (cache misses/poor locality) rather than peak compute."
+            "reasoning": "Each inner iteration performs a small number of floating-point operations (a few adds/subs and one multiply) but requires multiple loads and at least one store to large arrays (ex/ey/hz). Working sets exceed cache for typical PolyBench sizes, so performance is limited by memory bandwidth and cache/memory traffic rather than peak FLOPs. No inter-process communication is present."
           },
           "gpu_suitability": {
             "suitable": true,
-            "reasoning": "The kernel is a dense linear-algebra operation equivalent to multiplying many independent vectors/matrices by a constant matrix C4. It has abundant parallelism across (r,q,p) and benefits from high memory bandwidth and fused multiply-add throughput on GPUs. Performance depends on arranging memory accesses so threads read C4 and A coalesced and reuse C4 via shared/constant memory or via GEMM.",
-            "recommended_approach": "Reshape A into a 2D matrix A2 of shape (nr*nq, np) and compute A2 = A2 * C4 using cuBLAS (GEMM). This maximizes reuse of C4 and uses highly tuned kernels. If writing a custom kernel, use s-outer/p-inner accumulation, tile C4 into shared memory, keep partial sums in registers, and parallelize over (row=(r,q), p) with coalesced loads/stores."
+            "reasoning": "The kernel consists of regular, dense 2D stencil-like updates with predictable memory access and massive data parallelism over grid points. It is primarily bandwidth-bound, which maps well to GPUs with high memory bandwidth, provided memory accesses are coalesced and kernel launches are organized to minimize overhead.",
+            "recommended_approach": "Implement three GPU kernels per timestep (ey update, ex update, hz update) using CUDA/HIP or OpenACC/OpenMP target. Use a 2D thread block (e.g., 16x16 or 32x8) with j as the fastest-varying index for coalescing. Consider fusing ex+ey reads into the hz kernel using shared memory tiling for ex/ey/hz neighborhoods to reduce global loads. For better performance, use asynchronous execution and keep data resident on device across all timesteps; only copy back at the end."
           },
-          "cost": 0.025166749999999998,
+          "cost": 0.024587499999999998,
           "bottleneck_raw": "memory"
         },
         "stage2": {
@@ -697,119 +346,260 @@
           "validation": {
             "bottleneck_correct": true,
             "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to poor spatial locality and inefficient memory access patterns, particularly with the C4 matrix. The nested loop structure results in non-coalesced memory accesses, leading to cache misses and reduced performance."
+            "reasoning": "The initial analysis correctly identifies the memory bottleneck. The operations in the kernel involve a small number of arithmetic operations compared to the number of memory accesses, leading to a low arithmetic intensity. This suggests that the performance is indeed limited by memory bandwidth rather than computational power."
           },
           "analysis": {},
           "detailed_optimizations": [
             {
-              "target": "kernel_doitgen",
-              "technique": "Loop interchange and blocking",
-              "code_changes": "Interchange the loops to have 's' as the outer loop and 'p' as the inner loop. Implement loop blocking to improve cache utilization.",
+              "target": "ey update",
+              "technique": "Loop unrolling and blocking",
+              "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+              "expected_speedup": "1.2x - 1.5x",
+              "difficulty": "medium"
+            },
+            {
+              "target": "ex update",
+              "technique": "Loop unrolling and blocking",
+              "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+              "expected_speedup": "1.2x - 1.5x",
+              "difficulty": "medium"
+            },
+            {
+              "target": "hz update",
+              "technique": "Loop unrolling and blocking",
+              "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+              "expected_speedup": "1.2x - 1.5x",
+              "difficulty": "medium"
+            },
+            {
+              "target": "Overall memory access",
+              "technique": "Prefetching",
+              "code_changes": "Use compiler directives or intrinsics to prefetch data into cache before it is needed.",
+              "expected_speedup": "1.1x - 1.3x",
+              "difficulty": "easy"
+            }
+          ],
+          "gpu_implementation": {
+            "suitable": true,
+            "strategy": "Use CUDA or OpenCL to parallelize the loops over 'i' and 'j'. Each thread computes one element of the arrays.",
+            "data_layout": "Use a structure of arrays (SoA) layout to ensure coalesced memory accesses.",
+            "challenges": [
+              "Ensuring memory coalescing",
+              "Managing shared memory to reduce global memory accesses"
+            ],
+            "expected_speedup": "5x - 10x"
+          },
+          "performance_analysis": {
+            "arithmetic_intensity": "0.25 FLOPs/byte",
+            "cache_behavior": "The working set size exceeds typical cache sizes, leading to frequent cache misses. Blocking and prefetching can help mitigate this.",
+            "data_dependencies": [
+              "ey[i][j] depends on hz[i][j] and hz[i-1][j]",
+              "ex[i][j] depends on hz[i][j] and hz[i][j-1]",
+              "hz[i][j] depends on ex[i][j+1], ex[i][j], ey[i+1][j], and ey[i][j]"
+            ]
+          },
+          "cost": 0.013261499999999999,
+          "bottleneck_raw": "memory"
+        },
+        "classification": {
+          "s1_primary": "memory",
+          "s2_primary": "memory",
+          "ground_truth": "memory",
+          "changed": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
+          "correction_type": "no-change"
+        },
+        "total_cost": 0.037848999999999994
+      }
+    },
+    "heat_3d": {
+      "program": "heat_3d",
+      "config": "Ablation B (5.2→4o)",
+      "s1_model": "gpt-5.2",
+      "s2_model": "gpt-4o",
+      "s1_bottleneck_raw": "memory",
+      "s2_bottleneck_raw": "memory",
+      "s1_score": 64.13855421686748,
+      "classification": {
+        "s1_primary": "memory",
+        "s2_primary": "memory",
+        "ground_truth": "memory",
+        "changed": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
+        "correction_type": "no-change"
+      },
+      "cost": 0.03829,
+      "full_result": {
+        "code_name": "heat_3d",
+        "program_key": "heat_3d",
+        "prompt_type": "zero_shot",
+        "stage1": {
+          "model": "gpt-5.2",
+          "hotspots": [
+            {
+              "location": "kernel_heat_3d(): time-step loop t=1..TSTEPS, stencil update A->B (inner i/j/k loops)",
+              "estimated_time_percentage": "45-55%",
+              "reason": "3D 7-point stencil-like update over (N-2)^3 points per timestep; high memory traffic (multiple neighbor loads + one store) with low arithmetic intensity; dominates runtime for typical PolyBench sizes when printing is excluded from timing",
+              "confidence": "high"
+            },
+            {
+              "location": "kernel_heat_3d(): time-step loop t=1..TSTEPS, stencil update B->A (inner i/j/k loops)",
+              "estimated_time_percentage": "45-55%",
+              "reason": "Second full sweep over the same 3D domain each timestep; similar memory access pattern and cost as the first sweep; effectively doubles memory bandwidth demand per timestep",
+              "confidence": "high"
+            },
+            {
+              "location": "print_array(): full 3D traversal with fprintf in triple loop",
+              "estimated_time_percentage": "0-90% (depends on whether output is enabled / measured)",
+              "reason": "I/O-heavy; fprintf inside the innermost loop is extremely slow and can dominate wall time, but it is outside the PolyBench timed region (kernel timing) in typical runs",
+              "confidence": "medium"
+            },
+            {
+              "location": "init_array(): triple loop initialization of A and B",
+              "estimated_time_percentage": "1-10%",
+              "reason": "Streams through two large 3D arrays once; bandwidth-limited but executed only once; usually small compared to TSTEPS sweeps",
+              "confidence": "medium"
+            }
+          ],
+          "bottleneck_type": {
+            "primary": "memory",
+            "reasoning": "Each lattice update performs relatively few FLOPs compared to the number of bytes moved (multiple neighbor reads plus a write). For large N, working sets exceed cache and performance is limited by sustained memory bandwidth and cache reuse (especially along i/j dimensions). Two full-array sweeps per timestep further amplify bandwidth pressure."
+          },
+          "gpu_suitability": {
+            "suitable": true,
+            "reasoning": "The kernel is a regular 3D stencil with high parallelism and predictable memory access. Although it is memory-bandwidth bound, GPUs provide very high bandwidth and can achieve strong speedups if memory accesses are coalesced and the domain is large enough to amortize launch overhead.",
+            "recommended_approach": "Use CUDA/HIP/OpenACC/OpenMP target offload. Map threads so k is the fastest-varying dimension for coalesced loads/stores. Use two 3D grids (A and B) and launch one kernel per sweep (or fuse with careful synchronization across timesteps). Consider using shared memory (or cache) tiling in j/k (and possibly i) to reuse neighbor planes, and use read-only cache for input. For multi-GPU, decompose along i (or j) with halo exchanges between timesteps."
+          },
+          "cost": 0.0251615,
+          "bottleneck_raw": "memory"
+        },
+        "stage2": {
+          "model": "gpt-4o",
+          "validation": {
+            "bottleneck_correct": true,
+            "corrected_bottleneck": "",
+            "reasoning": "The initial analysis correctly identifies the memory bottleneck. The kernel performs a 3D stencil computation, which involves multiple reads and a write per lattice point, leading to high memory bandwidth usage. The working set size exceeds cache capacity, causing frequent cache misses and limiting performance by memory bandwidth."
+          },
+          "analysis": {},
+          "detailed_optimizations": [
+            {
+              "target": "kernel_heat_3d",
+              "technique": "Loop Tiling",
+              "code_changes": "Apply loop tiling to the i, j, k loops to improve cache reuse. For example, introduce tile sizes Ti, Tj, Tk and iterate over tiles.",
               "expected_speedup": "1.5x - 2x",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_doitgen",
-              "technique": "Use of temporary buffers",
-              "code_changes": "Introduce temporary buffers to store intermediate results and reduce redundant memory accesses.",
+              "target": "kernel_heat_3d",
+              "technique": "Loop Unrolling",
+              "code_changes": "Unroll the innermost k loop by a factor of 2 or 4 to reduce loop overhead and increase instruction-level parallelism.",
               "expected_speedup": "1.2x - 1.5x",
               "difficulty": "easy"
+            },
+            {
+              "target": "kernel_heat_3d",
+              "technique": "Prefetching",
+              "code_changes": "Use compiler directives or intrinsics to prefetch data for the next iteration of the loop to hide memory latency.",
+              "expected_speedup": "1.1x - 1.3x",
+              "difficulty": "medium"
             },
             {
               "target": "print_array",
-              "technique": "Conditional compilation",
-              "code_changes": "Use preprocessor directives to exclude 'print_array' from timing measurements in performance-critical builds.",
-              "expected_speedup": "Varies based on environment",
+              "technique": "Conditional Compilation",
+              "code_changes": "Use preprocessor directives to conditionally compile the print_array function only when needed, reducing unnecessary overhead during performance measurement.",
+              "expected_speedup": "Varies based on usage",
               "difficulty": "easy"
             }
           ],
           "gpu_implementation": {
             "suitable": true,
-            "strategy": "Use CUDA to parallelize across (r, q, p) dimensions. Each thread block computes a portion of the output matrix A, with threads within a block computing elements of A[r][q][p].",
-            "data_layout": "Transform C4 to a column-major order or use shared memory to improve coalesced access patterns.",
+            "strategy": "Use a 3D grid of threads where each thread computes a single element of the output array. Ensure memory accesses are coalesced by aligning data accesses along the fastest-changing dimension.",
+            "data_layout": "Use a structure of arrays (SoA) layout to improve coalesced memory access patterns.",
             "challenges": [
-              "Managing shared memory usage",
-              "Ensuring coalesced memory accesses"
+              "Ensuring coalesced memory access to maximize bandwidth utilization.",
+              "Managing shared memory usage to avoid bank conflicts and optimize data reuse."
             ],
-            "expected_speedup": "5x - 10x"
+            "expected_speedup": "5x - 20x"
           },
           "performance_analysis": {
-            "arithmetic_intensity": "2*np*np / (np + np*np) = 2 / (1 + np)",
-            "cache_behavior": "The current loop order results in poor cache line utilization due to non-contiguous memory accesses, especially for the C4 matrix. Loop interchange and blocking can improve cache line hits.",
+            "arithmetic_intensity": "0.2 FLOPs/byte",
+            "cache_behavior": "The cache behavior is poor due to the large working set size and the need to access multiple neighboring elements for each update, leading to frequent cache misses.",
             "data_dependencies": [
-              "A[r][q][s] -> sum[p]",
-              "sum[p] -> A[r][q][p]"
+              "Each update depends on the values of its six neighbors in the previous timestep.",
+              "The computation of B[i][j][k] depends on A[i±1][j][k], A[i][j±1][k], A[i][j][k±1]."
             ]
           },
-          "cost": 0.0108465,
+          "cost": 0.0131285,
           "bottleneck_raw": "memory"
         },
         "classification": {
           "s1_primary": "memory",
           "s2_primary": "memory",
-          "ground_truth": "compute",
+          "ground_truth": "memory",
           "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
           "correction_type": "no-change"
         },
-        "total_cost": 0.03601325
+        "total_cost": 0.03829
       }
     },
-    "gramschmidt": {
-      "program": "gramschmidt",
+    "seidel_2d": {
+      "program": "seidel_2d",
       "config": "Ablation B (5.2→4o)",
       "s1_model": "gpt-5.2",
       "s2_model": "gpt-4o",
       "s1_bottleneck_raw": "memory",
       "s2_bottleneck_raw": "memory",
-      "s1_score": 51.774096385542165,
+      "s1_score": 67.50675675675676,
       "classification": {
         "s1_primary": "memory",
         "s2_primary": "memory",
-        "ground_truth": "compute",
+        "ground_truth": "memory",
         "changed": false,
-        "s1_matches_gt": false,
-        "s2_matches_gt": false,
+        "s1_matches_gt": true,
+        "s2_matches_gt": true,
         "correction_type": "no-change"
       },
-      "cost": 0.04009425,
+      "cost": 0.03311,
       "full_result": {
-        "code_name": "gramschmidt",
-        "program_key": "gramschmidt",
+        "code_name": "seidel_2d",
+        "program_key": "seidel_2d",
         "prompt_type": "zero_shot",
         "stage1": {
           "model": "gpt-5.2",
           "hotspots": [
             {
-              "location": "kernel_gramschmidt(): outer loop k with inner j/i updates (lines ~86-110)",
-              "estimated_time_percentage": "80-92%",
-              "reason": "Dominant O(m*n^2) work: for each k, for each j>k it performs two full-length (i=0..m-1) passes: (1) dot product R[k][j] += Q[i][k]*A[i][j] and (2) rank-1 update A[i][j] -= Q[i][k]*R[k][j]. This streams through large portions of A and Q repeatedly, causing high memory traffic and limited cache reuse.",
+              "location": "kernel_seidel_2d(): triple-nested stencil loops (t/i/j), lines ~63-71",
+              "estimated_time_percentage": "90-99%",
+              "reason": "Dominant O(tsteps*n^2) work; each inner iteration performs a 3x3 stencil update with multiple loads/stores and loop-carried dependencies (Gauss-Seidel in-place), executed for every time step.",
               "confidence": "high"
             },
             {
-              "location": "kernel_gramschmidt(): norm and normalization for each k (lines ~79-85)",
-              "estimated_time_percentage": "8-18%",
-              "reason": "O(m*n) work: computes nrm = sum_i A[i][k]^2, sqrt, then scales column into Q. Less total FLOPs than the j-loop but still touches full columns of A and Q; sqrt/div can add latency but overall smaller than the O(m*n^2) section.",
-              "confidence": "high"
-            },
-            {
-              "location": "print_array(): dumping R and Q (lines ~33-67) [only if not excluded from timing by harness]",
-              "estimated_time_percentage": "0-70% (depends on whether I/O is timed and output enabled)",
-              "reason": "Potentially massive formatted I/O over n^2 + m*n elements; can dominate wall time if included. In PolyBench, timing typically excludes this, but in real runs it can be the main cost.",
+              "location": "print_array(): full matrix dump with fprintf in nested loops, lines ~35-52",
+              "estimated_time_percentage": "0-90% (depends on whether POLYBENCH_DUMP_* is enabled and output target speed)",
+              "reason": "If dumping is enabled, per-element formatted I/O (fprintf) is extremely slow and can dominate runtime; otherwise it is compiled out or redirected and negligible.",
               "confidence": "medium"
+            },
+            {
+              "location": "init_array(): nested initialization loops, lines ~18-26",
+              "estimated_time_percentage": "1-5%",
+              "reason": "Single O(n^2) pass with simple arithmetic; typically small compared to O(tsteps*n^2) kernel unless tsteps is very small.",
+              "confidence": "high"
             }
           ],
           "bottleneck_type": {
             "primary": "memory",
-            "reasoning": "The main kernel is dominated by streaming accesses over A and Q with low temporal locality: each (k,j) pair reads A[:,j] and Q[:,k] and then writes A[:,j]. Arithmetic intensity is modest (a few FLOPs per multiple loads/stores), so performance is typically limited by memory bandwidth and cache behavior rather than peak compute. The sqrt/div are minor relative to the bandwidth-heavy O(m*n^2) updates."
+            "reasoning": "The stencil update has low arithmetic intensity (roughly 9 loads + 1 store for ~10 FLOPs per point) and is dominated by memory traffic and cache behavior. Additionally, the in-place Gauss-Seidel ordering introduces loop-carried dependencies that limit parallelism and reduce effective bandwidth utilization; performance is typically bounded by memory subsystem and cache reuse rather than peak compute."
           },
           "gpu_suitability": {
             "suitable": true,
-            "reasoning": "The dominant work per k is a dot-product panel (Q[:,k]^T * A[:,k+1:]) plus a rank-1 update (A[:,k+1:] -= Q[:,k]*Rrow). These map well to GPU kernels/BLAS (GEMV/GER) and can achieve high throughput. However, k is sequential, so the GPU will be launched n times; performance depends on batching/paneling to amortize launch overhead and on keeping A/Q resident on device.",
-            "recommended_approach": "Keep A, Q, R on GPU for the full kernel. For each k: (1) compute nrm via a reduction kernel (or cublasDnrm2 on A[:,k]); (2) scale to form Q[:,k] (cublasDcopy + cublasDscal or custom kernel); (3) compute R[k,k+1:] = Q[:,k]^T * A[:,k+1:] using cublasGEMV with an Apanel (or cublasGEMM treating Qcol as m×1 and Apanel as m×(n-k-1)); (4) update Apanel with cublasGER (rank-1 update). Use panel/blocking over j to increase GEMM usage (preferred) and reduce kernel launches; consider using cuBLAS GEMM for both steps by batching multiple k values only if algorithmic changes (e.g., blocked Gram-Schmidt) are acceptable."
+            "reasoning": "The computation is a regular 2D stencil with predictable memory access, which maps well to GPUs. However, the in-place Gauss-Seidel update has intra-time-step dependencies that reduce parallelism; a Jacobi (double-buffer) variant is much more GPU-friendly. If Gauss-Seidel semantics are required, GPU implementations need wavefront/colored schemes, which are more complex and may underutilize the GPU.",
+            "recommended_approach": "Prefer converting to Jacobi with two arrays and launch a 2D grid kernel per time step (or fuse multiple time steps with temporal blocking if feasible). Use shared memory tiling (halo) per thread block to reduce global memory traffic. Implement with CUDA/HIP or OpenACC/OpenMP target offload; add boundary handling and swap pointers each step. If Gauss-Seidel must be kept, use red-black (checkerboard) ordering (two kernels per time step) or diagonal wavefront kernels, accepting reduced efficiency."
           },
-          "cost": 0.028098,
+          "cost": 0.02267825,
           "bottleneck_raw": "memory"
         },
         "stage2": {
@@ -817,65 +607,63 @@
           "validation": {
             "bottleneck_correct": true,
             "corrected_bottleneck": "",
-            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to the low arithmetic intensity and high memory bandwidth requirements. The operations involve streaming accesses with low temporal locality, which are typical indicators of memory-bound performance."
+            "reasoning": "The initial analysis correctly identifies the memory bottleneck due to low arithmetic intensity and loop-carried dependencies in the Gauss-Seidel update. These factors limit parallelism and are typical in stencil computations, where memory bandwidth and cache behavior dominate performance."
           },
           "analysis": {},
           "detailed_optimizations": [
             {
-              "target": "kernel_gramschmidt() outer loop",
-              "technique": "Loop unrolling and blocking",
-              "code_changes": "Unroll the inner loops over 'i' and 'j' to improve data locality and reduce loop overhead. Apply blocking to the 'i' loop to enhance cache reuse.",
-              "expected_speedup": "1.2x - 1.5x",
+              "target": "kernel_seidel_2d",
+              "technique": "Loop Tiling",
+              "code_changes": "Introduce loop tiling to improve cache reuse. This involves breaking the i and j loops into smaller blocks that fit into cache.",
+              "expected_speedup": "1.5x to 2x",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_gramschmidt() norm calculation",
-              "technique": "Vectorization",
-              "code_changes": "Use SIMD instructions to vectorize the norm calculation loop over 'i'.",
-              "expected_speedup": "1.5x - 2x",
+              "target": "kernel_seidel_2d",
+              "technique": "Parallelization",
+              "code_changes": "Use OpenMP to parallelize the outer loop (t) and inner loops (i, j) where possible, considering dependencies.",
+              "expected_speedup": "2x to 4x on multi-core CPUs",
               "difficulty": "medium"
             },
             {
-              "target": "kernel_gramschmidt() normalization",
-              "technique": "Pre-computation and reuse",
-              "code_changes": "Pre-compute 1/R[k][k] and reuse it in the normalization loop to reduce division operations.",
-              "expected_speedup": "1.1x",
+              "target": "print_array",
+              "technique": "Conditional Compilation",
+              "code_changes": "Use preprocessor directives to completely remove print_array when not needed, reducing unnecessary I/O overhead.",
+              "expected_speedup": "Negligible in computation, but reduces I/O time significantly",
               "difficulty": "easy"
             }
           ],
           "gpu_implementation": {
             "suitable": true,
-            "strategy": "Use CUDA or OpenCL to parallelize the dot-product and rank-1 update operations. Each 'k' iteration can be a separate kernel launch.",
-            "data_layout": "Use a column-major layout for A and Q to improve coalesced memory access on the GPU.",
+            "strategy": "Use a Jacobi method or wavefront parallelism for Gauss-Seidel to handle dependencies. Implement using CUDA or OpenCL with a focus on maximizing occupancy and minimizing memory divergence.",
+            "data_layout": "Use a 2D grid of threads with each thread handling a tile of the matrix to improve coalesced memory access.",
             "challenges": [
-              "Kernel launch overhead due to sequential 'k' iterations",
-              "Ensuring data residency on the GPU to minimize data transfer overhead"
+              "Handling dependencies in Gauss-Seidel",
+              "Ensuring coalesced memory access"
             ],
-            "expected_speedup": "5x - 10x"
+            "expected_speedup": "5x to 10x compared to CPU implementation"
           },
           "performance_analysis": {
-            "arithmetic_intensity": "O(2m*n^2 / (m*n + m*n^2))",
-            "cache_behavior": "The cache behavior is suboptimal due to the streaming access pattern. Blocking and loop unrolling can help improve cache line utilization.",
+            "arithmetic_intensity": "0.1 FLOPs/byte",
+            "cache_behavior": "The current implementation has poor cache reuse due to the large working set and lack of temporal locality. Loop tiling can help improve this by increasing data locality.",
             "data_dependencies": [
-              "R[k][k] depends on A[i][k]",
-              "Q[i][k] depends on R[k][k]",
-              "R[k][j] depends on Q[i][k] and A[i][j]",
-              "A[i][j] depends on Q[i][k] and R[k][j]"
+              "Loop-carried dependencies in Gauss-Seidel update",
+              "Intra-time-step dependencies limit parallelism"
             ]
           },
-          "cost": 0.01199625,
+          "cost": 0.01043175,
           "bottleneck_raw": "memory"
         },
         "classification": {
           "s1_primary": "memory",
           "s2_primary": "memory",
-          "ground_truth": "compute",
+          "ground_truth": "memory",
           "changed": false,
-          "s1_matches_gt": false,
-          "s2_matches_gt": false,
+          "s1_matches_gt": true,
+          "s2_matches_gt": true,
           "correction_type": "no-change"
         },
-        "total_cost": 0.04009425
+        "total_cost": 0.03311
       }
     }
   }

@@ -55,19 +55,31 @@ class LLMClient:
             max_tokens: 最大输出 token 数
             timeout: 请求超时时间（秒）
         """
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "API Key not found. Set OPENAI_API_KEY environment variable "
-                "or pass api_key parameter."
-            )
+        # DeepSeek (via Volcengine Ark) is OpenAI-compatible: only base_url + key differ.
+        # Routed by model name so the rest of the pipeline is unchanged.
+        if model.startswith("deepseek"):
+            self.api_key = api_key or os.getenv("ARK_API_KEY")
+            base_url = "https://ark.cn-beijing.volces.com/api/v3"
+            if not self.api_key:
+                raise ValueError(
+                    "API Key not found. Set ARK_API_KEY environment variable "
+                    "for DeepSeek (Volcengine Ark)."
+                )
+        else:
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+            base_url = None
+            if not self.api_key:
+                raise ValueError(
+                    "API Key not found. Set OPENAI_API_KEY environment variable "
+                    "or pass api_key parameter."
+                )
         
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.timeout = timeout
         
-        self.client = OpenAI(api_key=self.api_key, timeout=timeout)
+        self.client = OpenAI(api_key=self.api_key, base_url=base_url, timeout=timeout)
         
         logger.info(f"LLM Client initialized with model: {model}")
     

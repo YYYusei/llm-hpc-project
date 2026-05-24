@@ -1,0 +1,152 @@
+{
+  "program": "adi",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 67.87500000000001,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.0452235,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_adi(): time-step loop t=1..TSTEPS (overall kernel)",
+          "estimated_time_percentage": "95-99%",
+          "reason": "Dominates runtime due to O(TSTEPS*N^2) work with multiple full-grid sweeps and large memory traffic across u/v/p/q each time step.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Column Sweep forward elimination loop: for (i=1..N-2) for (j=1..N-2) computing p[i][j], q[i][j]",
+          "estimated_time_percentage": "30-40%",
+          "reason": "Inner loop performs several loads/stores per iteration (p,q,u) plus divisions; accesses u[j][i] with j as fastest-varying index but second dimension fixed (i), causing strided/non-contiguous memory access in row-major layout and poor cache utilization.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Column Sweep back substitution loop: for (i=1..N-2) for (j=N-2..1) computing v[j][i]",
+          "estimated_time_percentage": "15-25%",
+          "reason": "Recurrence v[j][i] depends on v[j+1][i] (loop-carried dependency) preventing vectorization; also strided access to v due to column-wise traversal in row-major layout.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Row Sweep forward elimination loop: for (i=1..N-2) for (j=1..N-2) computing p[i][j], q[i][j]",
+          "estimated_time_percentage": "20-30%",
+          "reason": "High memory traffic and divisions; better spatial locality than column sweep (j contiguous) but still bandwidth/latency heavy due to streaming p/q and reading v neighbors each iteration.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Row Sweep back substitution loop: for (i=1..N-2) for (j=N-2..1) computing u[i][j]",
+          "estimated_time_percentage": "10-20%",
+          "reason": "Loop-carried dependency u[i][j] depends on u[i][j+1] limiting SIMD; memory streaming of p/q/u with moderate locality.",
+          "confidence": "high"
+        },
+        {
+          "location": "print_array(): nested loops printing u",
+          "estimated_time_percentage": "0-50% (depends on whether I/O is enabled in the run configuration)",
+          "reason": "Formatted I/O in a double loop is extremely slow relative to computation; in PolyBench timing typically excludes this, but end-to-end runtime can be dominated by printing for large N.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel streams large 2D arrays (u,v,p,q) with low arithmetic intensity (few flops per many bytes moved). Column sweeps traverse columns in row-major storage, causing strided accesses and poor cache line utilization, increasing effective bandwidth demand and latency. Additionally, back-substitution recurrences limit SIMD, making it harder to hide memory latency."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "There is substantial parallelism across independent 1D tridiagonal solves (each i-line) in both sweeps, but each line has a sequential recurrence (Thomas algorithm) that limits intra-line parallelism. GPUs can still perform well by running many independent lines concurrently; performance depends on using a parallel tridiagonal solver or batching many Thomas solves efficiently. Memory access for column sweeps is problematic unless data is transposed or accessed through a layout that provides coalescing.",
+        "recommended_approach": "Batch the tridiagonal systems per sweep: for each time step, launch kernels that solve (N-2) independent systems of size (N-2). Use (1) data transposition so each system is contiguous/coalesced, or store both u and uT (and v/vT) on device. Use cuSPARSE gtsv2StridedBatch (or equivalent) for batched tridiagonal solves, or implement PCR/CR (parallel cyclic reduction) for more parallelism within each system. Fuse boundary setup with solve kernels, and keep all arrays resident on GPU across all tsteps to avoid PCIe transfers."
+      },
+      "cost": 0.0316435,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck due to low arithmetic intensity and inefficient memory access patterns, particularly in the column sweeps. The strided access pattern in row-major storage leads to poor cache utilization, and the sequential nature of the tridiagonal solves limits SIMD parallelism."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep forward elimination loop",
+          "technique": "Loop Tiling and Blocking",
+          "code_changes": "Introduce loop tiling to improve cache locality by processing blocks of data that fit into cache.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Column Sweep back substitution loop",
+          "technique": "SIMD Vectorization",
+          "code_changes": "Use compiler pragmas or intrinsics to enable SIMD vectorization where possible, focusing on independent operations.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Row Sweep forward elimination loop",
+          "technique": "Data Layout Transformation",
+          "code_changes": "Transpose the matrix or use a structure of arrays to improve memory access patterns for better cache line utilization.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "Row Sweep back substitution loop",
+          "technique": "Parallelization",
+          "code_changes": "Use OpenMP to parallelize the outer loop over 'i' to exploit multi-core CPUs.",
+          "expected_speedup": "2x - 3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "print_array()",
+          "technique": "I/O Optimization",
+          "code_changes": "Buffer output and reduce the frequency of I/O operations to minimize overhead.",
+          "expected_speedup": "Varies based on I/O configuration",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use a parallel tridiagonal solver for each line and batch multiple solves to maximize GPU occupancy.",
+        "data_layout": "Consider transposing data or using a structure of arrays to ensure coalesced memory accesses.",
+        "challenges": [
+          "Handling sequential dependencies within each tridiagonal solve",
+          "Ensuring coalesced memory access for column sweeps"
+        ],
+        "expected_speedup": "5x - 10x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.1 FLOPs/byte",
+        "cache_behavior": "Poor cache line utilization due to strided access in column sweeps; potential cache thrashing in large data sets.",
+        "data_dependencies": [
+          "Sequential dependency in tridiagonal solves",
+          "Inter-loop dependencies between forward and back substitution"
+        ]
+      },
+      "cost": 0.013579999999999998,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.0452235
+  }
+}

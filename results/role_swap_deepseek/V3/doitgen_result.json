@@ -1,0 +1,107 @@
+{
+  "program": "doitgen",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 68.15890481064484,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03018925,
+  "full_result": {
+    "code_name": "doitgen",
+    "program_key": "doitgen",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_doitgen (lines 54-70)",
+          "estimated_time_percentage": "90%",
+          "reason": "This is the main computational kernel where the majority of the computation occurs, involving nested loops over the problem dimensions.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel involves multiple nested loops with indirect memory accesses, particularly in the innermost loop where elements of arrays A and C4 are accessed. This pattern suggests that the performance is likely limited by memory bandwidth and cache utilization."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation involves regular data access patterns and independent operations across iterations, which are well-suited for parallel execution on a GPU.",
+        "recommended_approach": "Port the kernel to CUDA or OpenCL, using GPU threads to handle different iterations of the outer loops, and optimize memory access patterns to utilize shared memory effectively."
+      },
+      "cost": 0.0080465,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory",
+        "reasoning": "1. 内存访问模式：内层循环 (s) 中，A[r][q][s] 是连续访问，但 C4[s][p] 是跨行访问（stride 为 NP），导致缓存效率低下。2. 算术强度低：每个浮点操作需要 2 次内存访问（A 和 C4），算术强度约为 0.5 FLOPs/byte。3. 数据重用不足：C4 矩阵在 r 和 q 循环中被重复访问，但每次只使用一行，导致缓存未命中率高。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "kernel_doitgen",
+          "technique": "循环分块 (tiling)",
+          "code_changes": "对 C4 矩阵的 p 维度进行分块，提高缓存利用率。\n\n// 假设分块大小为 TILE_P\nfor (r = 0; r < _PB_NR; r++)\n  for (q = 0; q < _PB_NQ; q++)\n    for (p_outer = 0; p_outer < _PB_NP; p_outer += TILE_P) {\n      int p_end = min(p_outer + TILE_P, _PB_NP);\n      for (p = p_outer; p < p_end; p++)\n        sum[p] = SCALAR_VAL(0.0);\n      for (s = 0; s < _PB_NP; s++) {\n        DATA_TYPE a_val = A[r][q][s];\n        for (p = p_outer; p < p_end; p++)\n          sum[p] += a_val * C4[s][p];\n      }\n      for (p = p_outer; p < p_end; p++)\n        A[r][q][p] = sum[p];\n    }",
+          "expected_speedup": "1.5-2x (取决于缓存大小和 TILE_P 选择)",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_doitgen",
+          "technique": "循环交换 (loop interchange)",
+          "code_changes": "将 s 循环移到最外层，使 C4 矩阵按行访问连续。\n\nfor (r = 0; r < _PB_NR; r++)\n  for (q = 0; q < _PB_NQ; q++) {\n    for (p = 0; p < _PB_NP; p++)\n      sum[p] = SCALAR_VAL(0.0);\n    for (s = 0; s < _PB_NP; s++) {\n      DATA_TYPE a_val = A[r][q][s];\n      for (p = 0; p < _PB_NP; p++)\n        sum[p] += a_val * C4[s][p];\n    }\n    for (p = 0; p < _PB_NP; p++)\n      A[r][q][p] = sum[p];\n  }",
+          "expected_speedup": "1.2-1.5x (改善 C4 的访问局部性)",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_doitgen",
+          "technique": "预取 (prefetching)",
+          "code_changes": "在计算当前迭代时预取下一次迭代需要的数据。\n\n// 在 s 循环内添加预取指令\nfor (s = 0; s < _PB_NP; s++) {\n  __builtin_prefetch(&C4[s+1][0], 0, 1); // 预取下一行 C4\n  DATA_TYPE a_val = A[r][q][s];\n  for (p = 0; p < _PB_NP; p++)\n    sum[p] += a_val * C4[s][p];\n}",
+          "expected_speedup": "1.1-1.2x (隐藏内存延迟)",
+          "difficulty": "medium"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1. 将 (r,q) 对映射到 GPU 线程块，每个线程块处理一个 (r,q) 对。2. 每个线程块内，使用 NP 个线程并行计算 sum 数组。3. 使用共享内存缓存 C4 矩阵的行，减少全局内存访问。",
+        "data_layout": "1. 保持 A 为三维数组 (nr, nq, np)。2. 转置 C4 矩阵为 (np, np) 的列主序，使合并访问。3. 使用纹理内存存储 C4（如果支持），利用缓存。",
+        "challenges": [
+          "1. 需要足够的并行度：如果 NP 较小，可能需要将多个 (r,q) 对合并到一个线程块。2. 共享内存大小限制：C4 矩阵大小为 NP×NP，可能超过共享内存容量。3. 负载均衡：所有 (r,q) 对计算量相同，负载均衡良好。"
+        ],
+        "expected_speedup": "10-50x (相对于优化后的 CPU 版本，取决于 GPU 内存带宽和 NP 大小)"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.5 FLOPs/byte (每个浮点乘加需要 2 次内存读取，无写入)",
+        "cache_behavior": "1. A 的访问：每个 (r,q) 对访问连续的 NP 个元素，空间局部性好。2. C4 的访问：原始代码中按列访问，缓存行利用率低（每个缓存行只使用一个元素）。3. sum 数组：大小 NP，通常能放入 L1 缓存。",
+        "data_dependencies": [
+          "无循环携带依赖：所有迭代都是独立的。",
+          "sum 数组在 p 循环中有反依赖（先清零后使用），但可通过私有化消除。"
+        ]
+      },
+      "cost": 0.02214275,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03018925
+  }
+}

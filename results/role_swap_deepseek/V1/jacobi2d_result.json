@@ -1,0 +1,130 @@
+{
+  "program": "jacobi2d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 82.65909090909092,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.029337000000000002,
+  "full_result": {
+    "code_name": "jacobi2d",
+    "program_key": "jacobi2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "jacobi_kernel() forward sweep loop at line 54",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop performs the main computation of the Jacobi method, iterating over the grid and updating values, which is memory-bound due to high memory traffic.",
+          "confidence": "high"
+        },
+        {
+          "location": "jacobi_kernel() backward sweep loop at line 66",
+          "estimated_time_percentage": "45%",
+          "reason": "This loop mirrors the forward sweep, performing similar memory-bound operations with high memory traffic.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code is memory-bound due to the low arithmetic intensity of the Jacobi stencil operation, which involves 5 loads and 1 store per grid point, resulting in high memory traffic compared to the number of floating-point operations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The Jacobi method is highly suitable for GPU execution due to its regular memory access patterns and lack of data dependencies within each iteration, allowing for efficient parallelization.",
+        "recommended_approach": "Port the jacobi_kernel function to GPU using CUDA or OpenCL, leveraging the GPU's parallel processing capabilities to handle the independent grid point updates in parallel."
+      },
+      "cost": 0.009905,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "memory",
+        "reasoning": "该程序是典型的内存带宽受限应用。每个网格点需要5次加载和1次存储操作（共6次内存访问，48字节），但只执行5次浮点运算（4次加法+1次乘法）。算术强度仅为5 FLOPs / 48 bytes ≈ 0.10 FLOPs/byte，远低于现代CPU的浮点运算能力。对于N=4096，工作集大小为2×4096×4096×8 bytes ≈ 256 MB，远超CPU缓存容量，导致大量DRAM访问。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "jacobi_kernel() forward sweep loop",
+          "technique": "循环分块（Cache Blocking）",
+          "code_changes": "将外层循环分解为分块循环，使每个分块能放入CPU缓存。例如：将i循环分解为i_block和i_inner，j循环分解为j_block和j_inner，分块大小根据L2/L3缓存大小调整（如128×128）。",
+          "expected_speedup": "1.5-2.5倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel() backward sweep loop",
+          "technique": "循环融合（Loop Fusion）",
+          "code_changes": "将前向和后向扫描融合为单个循环，减少数据在缓存中的进出次数。但需要注意：这需要额外的临时数组来避免读写冲突，或者使用红黑排序（Red-Black Ordering）。",
+          "expected_speedup": "1.2-1.5倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "jacobi_kernel() 内存访问模式",
+          "technique": "数据布局优化（Array of Structures to Structure of Arrays）",
+          "code_changes": "将二维数组A和B转换为结构体数组，使同一网格点的数据在内存中连续存储，提高缓存局部性。例如：struct GridPoint {double a; double b;}; 然后按行主序存储。",
+          "expected_speedup": "1.1-1.3倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "jacobi_kernel() 计算强度",
+          "technique": "向量化（SIMD）优化",
+          "code_changes": "使用编译器指令（如#pragma omp simd）或内联汇编，利用AVX-512指令集同时处理8个双精度浮点数。需要确保内存对齐（使用posix_memalign分配对齐内存）。",
+          "expected_speedup": "2-4倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "整体并行化",
+          "technique": "OpenMP多线程并行",
+          "code_changes": "在i循环前添加#pragma omp parallel for collapse(2) schedule(static)，利用多核CPU并行计算。注意避免false sharing（使用适当的块大小）。",
+          "expected_speedup": "核心数倍（如8-32倍）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "每个线程处理一个网格点，使用二维线程块（如16×16或32×32）覆盖整个网格。采用ping-pong缓冲策略：每次迭代在设备内存中的两个数组之间交换读写。",
+        "data_layout": "使用CUDA的cudaMallocPitch分配二维数组，确保内存对齐和合并访问（coalesced access）。考虑使用纹理内存或只读数据缓存（__ldg指令）来优化对输入数组的只读访问。",
+        "challenges": [
+          "边界处理：需要处理网格边界条件，可通过扩大线程块覆盖边界或使用条件判断",
+          "寄存器压力：每个线程需要加载5个邻居值，可能寄存器不足，可通过调整线程块大小优化",
+          "内存带宽限制：即使是GPU，0.10 FLOPs/byte的算术强度也可能受限于HBM带宽",
+          "CPU-GPU数据传输：如果数据需要频繁在CPU和GPU间传输，会成为瓶颈"
+        ],
+        "expected_speedup": "10-50倍（相对于单核CPU），具体取决于GPU型号和内存带宽"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.10 FLOPs/byte (5 FLOPs / 48 bytes)",
+        "cache_behavior": "缓存行为较差。对于N=4096，每次迭代需要访问256MB数据，远超典型CPU缓存（L3缓存通常为10-50MB）。导致严重的缓存缺失，大量DRAM访问。内存访问模式是规则的跨步访问（stride-N），但N值较大时导致缓存行利用率低。",
+        "data_dependencies": [
+          "无循环携带依赖（loop-carried dependency）",
+          "无写后读（RAW）依赖在同一迭代内",
+          "跨迭代依赖：前向扫描的输出是后向扫描的输入，但这是跨迭代的依赖，不影响单次迭代内的并行性"
+        ]
+      },
+      "cost": 0.019432,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.029337000000000002
+  }
+}

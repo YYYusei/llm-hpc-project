@@ -413,6 +413,135 @@ EXTENDED_DEFINITIONS = {
         function_keywords=["kernel_gramschmidt", "init_array"],
         structure_keywords=["gramschmidt", "QR", "orthogonal", "orthonormal", "projection", "Q", "R"],
     ),
+
+    # ============ 第二批扩展 (2026-05, 16→21, 维持平衡) ============
+    # trmm = compute (BLAS-3 三角矩阵乘); adi/fdtd-2d/heat-3d/seidel-2d = memory (stencil)
+    # 全部 VTune hotspots 实测(见回填表),与原程序同一流程。
+
+    # -------- TRMM (PolyBench, EXTRALARGE) --------
+    # VTune: kernel_trmm 99.9%
+    "trmm": BenchmarkDefinition(
+        name="trmm",
+        full_name="TRMM - Triangular Matrix Multiply (PolyBench Suite)",
+        language="c",
+        domain="linear_algebra",
+        hotspot_files=["trmm.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_trmm",
+                location_patterns=[r"kernel_trmm", r"trmm", r"triangular", r"B\[i\]\[j\]"],
+                time_percentage=99.9,  # VTune measured
+                bottleneck_type="compute",  # BLAS-3 triangular matmul, O(N^3)/O(N^2), FLOP-bound
+                loop_keywords=["i loop", "j loop", "k loop", "triangular update"],
+                memory_patterns=["row-major", "triangular access", "high data reuse"]
+            ),
+        ],
+        gpu_suitable=True,
+        gpu_notes="Triangular matrix multiply (BLAS-3). Tile-parallelisable, compute-bound, "
+                  "near-peak GPU throughput achievable.",
+        function_keywords=["kernel_trmm", "init_array"],
+        structure_keywords=["trmm", "triangular", "matrix multiply", "BLAS", "alpha"],
+    ),
+
+    # -------- ADI (PolyBench, LARGE) --------
+    # VTune: kernel_adi 100%
+    "adi": BenchmarkDefinition(
+        name="adi",
+        full_name="ADI - Alternating Direction Implicit Solver (PolyBench Suite)",
+        language="c",
+        domain="stencil",
+        hotspot_files=["adi.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_adi",
+                location_patterns=[r"kernel_adi", r"adi", r"column sweep", r"row sweep"],
+                time_percentage=100.0,  # VTune measured
+                bottleneck_type="memory",  # ADI stencil sweeps, low AI, bandwidth-bound
+                loop_keywords=["t loop", "i loop", "j loop", "forward sweep", "backward sweep"],
+                memory_patterns=["row + column sweeps", "strided access", "low data reuse"]
+            ),
+        ],
+        gpu_suitable=False,
+        gpu_notes="ADI alternating sweeps have row- and column-direction dependencies; "
+                  "memory-bound stencil with limited reuse. Partial GPU suitability.",
+        function_keywords=["kernel_adi", "init_array"],
+        structure_keywords=["adi", "alternating direction", "implicit", "sweep", "stencil"],
+    ),
+
+    # -------- FDTD-2D (PolyBench, LARGE) --------
+    # VTune: kernel_fdtd_2d 99.5%
+    "fdtd_2d": BenchmarkDefinition(
+        name="fdtd_2d",
+        full_name="FDTD-2D - Finite-Difference Time-Domain (PolyBench Suite)",
+        language="c",
+        domain="stencil",
+        hotspot_files=["fdtd-2d.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_fdtd_2d",
+                location_patterns=[r"kernel_fdtd_2d", r"fdtd", r"ex", r"ey", r"hz"],
+                time_percentage=99.5,  # VTune measured
+                bottleneck_type="memory",  # EM field stencil updates, low AI, bandwidth-bound
+                loop_keywords=["t loop", "i loop", "j loop", "field update"],
+                memory_patterns=["multiple field arrays", "stencil access", "low data reuse"]
+            ),
+        ],
+        gpu_suitable=False,
+        gpu_notes="FDTD electromagnetic stencil: updates ex/ey/hz fields with neighbour access. "
+                  "Memory-bound, low arithmetic intensity. Partial GPU suitability.",
+        function_keywords=["kernel_fdtd_2d", "init_array"],
+        structure_keywords=["fdtd", "finite difference", "time domain", "stencil", "field"],
+    ),
+
+    # -------- HEAT-3D (PolyBench, LARGE) --------
+    # VTune: kernel_heat_3d 99.6%
+    "heat_3d": BenchmarkDefinition(
+        name="heat_3d",
+        full_name="Heat-3D - 3D Heat Equation Stencil (PolyBench Suite)",
+        language="c",
+        domain="stencil",
+        hotspot_files=["heat-3d.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_heat_3d",
+                location_patterns=[r"kernel_heat_3d", r"heat", r"7-point", r"A\[i\]\[j\]\[k\]"],
+                time_percentage=99.6,  # VTune measured
+                bottleneck_type="memory",  # 3D 7-point stencil, low AI, bandwidth-bound
+                loop_keywords=["t loop", "i loop", "j loop", "k loop", "7-point stencil"],
+                memory_patterns=["3D grid", "7-point neighbour access", "low data reuse"]
+            ),
+        ],
+        gpu_suitable=False,
+        gpu_notes="3D 7-point heat stencil: each cell reads 6 neighbours, very low reuse. "
+                  "Memory-bandwidth-bound. Partial GPU suitability.",
+        function_keywords=["kernel_heat_3d", "init_array"],
+        structure_keywords=["heat", "3d", "stencil", "7-point", "diffusion"],
+    ),
+
+    # -------- SEIDEL-2D (PolyBench, LARGE) --------
+    # VTune: kernel_seidel_2d 99.9%
+    "seidel_2d": BenchmarkDefinition(
+        name="seidel_2d",
+        full_name="Seidel-2D - 2D Gauss-Seidel Stencil (PolyBench Suite)",
+        language="c",
+        domain="stencil",
+        hotspot_files=["seidel-2d.c"],
+        hotspots=[
+            HotspotDefinition(
+                name="kernel_seidel_2d",
+                location_patterns=[r"kernel_seidel_2d", r"seidel", r"9-point", r"A\[i\]\[j\]"],
+                time_percentage=99.9,  # VTune measured
+                bottleneck_type="memory",  # Gauss-Seidel 9-point stencil with in-place update
+                loop_keywords=["t loop", "i loop", "j loop", "9-point stencil", "in-place"],
+                memory_patterns=["9-point neighbour access", "in-place update dependency", "low data reuse"]
+            ),
+        ],
+        gpu_suitable=False,
+        gpu_notes="Gauss-Seidel 2D: in-place 9-point stencil with sequential dependency "
+                  "(each update uses already-updated neighbours). Memory-bound + dependency.",
+        function_keywords=["kernel_seidel_2d", "init_array"],
+        structure_keywords=["seidel", "gauss-seidel", "stencil", "9-point", "in-place"],
+    ),
 }
 
 

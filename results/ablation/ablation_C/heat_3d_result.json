@@ -1,0 +1,149 @@
+{
+  "program": "heat_3d",
+  "config": "Ablation C (4o→5.4)",
+  "s1_model": "gpt-4o",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 61.52710843373493,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.05192075,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d, lines 54-78",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with nested loops iterating over the 3D arrays, which is the most computationally intensive part of the code.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 3D arrays with non-contiguous memory access patterns, leading to poor cache utilization and high memory bandwidth usage."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular, data-parallel computations over large datasets, which are well-suited for GPU acceleration.",
+        "recommended_approach": "Port the kernel_heat_3d function to CUDA or OpenCL, using GPU threads to handle different parts of the 3D arrays in parallel."
+      },
+      "cost": 0.008195250000000001,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步判断基本正确：该核函数是典型 3D 7-point stencil，主要瓶颈是内存层次而非纯计算吞吐。每个网格点更新需要读取 6 个邻居和 1 个中心点，并写回 1 个结果；虽然 k 维是连续访问，但 i/j 方向邻居跨大步长访问，导致工作集远大于 L1/L2 时对缓存复用有限。时间步采用 A->B->A 双缓冲，避免了同一步写后读冲突，因此不存在严重的循环携带写后读阻塞；但每个时间步都要完整扫描 3D 体数据两次，内存流量很大。需要补充的是：该实现并非“严重非连续访问”，因为 A[i][j][k±1] 和内层 k 循环是连续的，属于‘部分连续、跨平面访问代价高’的 stencil 模式。因此更准确的表述应为：瓶颈是带宽+缓存容量/复用受限，而不是随机访存。若编译器未充分向量化，次级瓶颈还可能包括 SIMD 利用不足。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d 主循环整体",
+          "technique": "时间步双循环改为指针交换，消除第二个 stencil 计算块中的冗余结构性开销并简化优化空间",
+          "code_changes": "将每个 t 内的两段 A->B、B->A 改为单段 stencil + 指针交换。示意：DATA_TYPE (*src)[N][N]=A; DATA_TYPE (*dst)[N][N]=B; for(t=0;t<tsteps;t++){ stencil(src,dst); swap(src,dst);} 若 tsteps 为奇数，最后根据需要拷回或调整输出指针。这样可把核心计算抽成单一函数，便于编译器内联、向量化和 OpenMP/GPU 映射。",
+          "expected_speedup": "1.05x-1.15x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "内层 k 循环",
+          "technique": "SIMD 向量化 + restrict + 对齐提示",
+          "code_changes": "将数组参数改为扁平指针或显式 restrict 指针，例如 void kernel(..., DATA_TYPE * __restrict__ A, DATA_TYPE * __restrict__ B)。使用 idx = (i*n + j)*n + k 线性索引。对内层循环添加 #pragma omp simd aligned(A,B:64) 或编译器特定 pragma；确保分配 64B 对齐。可重写表达式减少重复加载中心值：center=A[idx]; dst[idx]=center + c*(A[idx+1]+A[idx-1]+A[idx+n]+A[idx-n]+A[idx+n*n]+A[idx-n*n]-6*center);",
+          "expected_speedup": "1.2x-1.8x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "缓存复用不足的 3D stencil",
+          "technique": "空间分块/缓存阻塞（j-k 或 i-j-k tiling）",
+          "code_changes": "对 i/j/k 做块化，优先保持 k 为最内层连续维。示意：for(ii=1;ii<n-1;ii+=Ti) for(jj=1;jj<n-1;jj+=Tj) for(kk=1;kk<n-1;kk+=Tk) for(i=ii;i<min(ii+Ti,n-1);i++) for(j=jj;j<min(jj+Tj,n-1);j++) for(k=kk;k<min(kk+Tk,n-1);k++) ...。经验上 Tk 取较大值以利用连续访问，Ti/Tj 依据 L2/L3 容量调优。若 n 很大，可采用 slab/block 使 3 个 i 平面和若干 j 行驻留缓存。",
+          "expected_speedup": "1.2x-2.0x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "重复地址计算与中心点重复使用",
+          "technique": "线性化索引 + 平面指针缓存 + 标量暂存",
+          "code_changes": "在 i/j 循环内预先建立指针：DATA_TYPE* a_im1=&src[((i-1)*n + j)*n]; DATA_TYPE* a_i=&src[(i*n + j)*n]; DATA_TYPE* a_ip1=&src[((i+1)*n + j)*n]; 并对 j±1 平面建立基址。内层 k 中使用 a_i[k]、a_jm1[k] 等，减少多维下标乘法和别名分析负担。将 center、north、south 等加载到局部变量，避免编译器保守重复取数。",
+          "expected_speedup": "1.1x-1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "多核 CPU 扩展",
+          "technique": "OpenMP 并行化外层 i/j 循环，配合 collapse 和静态调度",
+          "code_changes": "在 stencil 主循环前添加 #pragma omp parallel for collapse(2) schedule(static) private(i,j,k)。推荐并行 i/j，保持 k 连续。若 NUMA 机器上运行，初始化阶段也采用相同并行划分以实现 first-touch。示意：#pragma omp parallel for collapse(2) schedule(static) for(i=1;i<n-1;i++) for(j=1;j<n-1;j++) for(k=1;k<n-1;k++) ...",
+          "expected_speedup": "8x-30x（相对单线程，取决于核数与带宽）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "NUMA/内存带宽",
+          "technique": "并行初始化 + 大页 + 线程绑定",
+          "code_changes": "将 init_array 也用 OpenMP 按最终计算相同方式并行；运行时设置 OMP_PROC_BIND=close 或 spread，OMP_PLACES=cores；在 Linux 上可尝试 transparent huge pages 或显式 huge pages。对于双路/多路系统，确保 first-touch 正确，避免远端内存访问。",
+          "expected_speedup": "1.1x-1.4x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "时间维复用",
+          "technique": "时间块化/temporal blocking/wavefront",
+          "code_changes": "采用 diamond tiling、wavefront 或 cache-oblivious temporal blocking，在一个空间块内推进多个时间步，减少同一数据被反复从内存加载。实现上需重构循环边界和依赖顺序，例如按 tile 对角线推进 t-i-j-k 子域。该优化对 stencil 很有效，但代码复杂度高。",
+          "expected_speedup": "1.5x-3.0x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "编译器生成质量",
+          "technique": "针对 stencil 的编译选项与多版本调优",
+          "code_changes": "使用 -O3 -march=native -ffast-math（若允许数值松弛） -fopenmp -funroll-loops，并检查向量化报告（如 -fopt-info-vec 或 -qopt-report）。可尝试 ICC/ICX/Clang/GCC 多编译器比较。若使用 Polyhedral 工具，可尝试 Pluto/Polly 自动 tiling 与并行化。",
+          "expected_speedup": "1.1x-1.5x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "采用 3D 网格并行，每个线程负责一个内部网格点更新；每个时间步执行一次 A->B kernel，然后交换指针。线程块建议让 x 维映射到连续的 k 维以保证全局内存合并访问，例如 blockDim=(32,4,2) 或 (16,8,2)。进一步优化可在共享内存中缓存一个 tile 及其 halo，减少对 j/k 邻居的重复全局加载；对 i 方向可通过 z 维线程或寄存器滑窗处理相邻平面。若追求更高性能，可采用 kernel fusion 的时间块化或多步 stencil，但需处理同步与共享内存容量限制。",
+        "data_layout": "建议使用 1D 线性数组，按 row-major 展开，令 k 为最快变化维：idx=(i*n + j)*n + k。这样线程束沿 k 方向访问时可实现合并读写。可考虑将只读输入通过只读缓存/texture cache 路径访问（依架构而定）。若使用共享内存 tile，tile 的最快维也应对应 k，并适当 padding 避免 bank conflict。",
+        "challenges": [
+          "算术强度低，GPU 也容易受显存带宽限制，需要依赖高带宽和共享内存复用",
+          "3D stencil 需要 halo，线程块边界会引入额外加载与控制分支",
+          "共享内存容量有限，tile 过大将降低 occupancy，过小则复用不足",
+          "时间步之间存在全局同步需求，通常需要每个时间步一个 kernel launch；多步融合实现复杂",
+          "边界处理可能导致 warp 分歧，通常通过单独边界 kernel 或仅发射内部区域线程缓解",
+          "若 n 不足够大，PCIe/启动开销会削弱收益；需尽量减少主机-设备数据传输，仅在开始/结束拷贝"
+        ],
+        "expected_speedup": "相对单线程 CPU 约 20x-100x；相对优化后的多核 CPU 约 2x-10x，具体取决于问题规模、GPU 显存带宽、是否使用共享内存/时间块化以及 CPU 基线优化程度"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.20-0.30 FLOPs/byte（朴素实现，双精度）。单次更新约 13 FLOPs：6 次邻居加法 + 1 次乘以 6 + 1 次减法 + 1 次乘以 0.125 + 1 次与 center 相加，外加可能的常量折叠差异。内存流量下界若理想缓存复用成立，可近似为 1 次写 + 约 2-4 次有效缓存线搬运折算；保守按 7 读 + 1 写 = 64B 计，则 AI≈13/64≈0.20。若考虑写分配和缓存失效，实际有效 AI 可能更低，因此明显偏 memory-bound。",
+        "cache_behavior": "k 为最内层，A[i][j][k-1], A[i][j][k], A[i][j][k+1] 具有良好空间局部性；j±1 邻居访问跨一个长度为 n 的 stride，i±1 邻居访问跨一个 n*n 的 stride。对固定 (i,j) 扫描 k 时，当前平面、前后 j 行、前后 i 平面可形成一定流式复用，但当 n 较大时，多个活跃平面难以完全驻留低层缓存，导致容量失效。写 B 是顺序流写，通常较友好，但若发生 write-allocate 会引入额外读流量。两个完整 stencil pass 每个时间步都扫描整个体数据，L3/内存带宽压力显著。若不做 blocking，缓存主要承担短程 k 向复用和有限的 j/i 平面复用。",
+        "data_dependencies": [
+          "空间依赖：每个时间步内，B[i][j][k] 依赖 A 的 6 个邻居和中心点；下一半步 A[i][j][k] 依赖 B 的 6 个邻居和中心点",
+          "时间依赖：t+1 时刻依赖 t 时刻结果，因此不同时间步不能完全独立并行，除非采用 wavefront/temporal blocking",
+          "同一时间步内无输出相关：A->B 或 B->A 为双缓冲，单个网格点更新彼此独立，适合空间并行",
+          "边界依赖：边界点未更新，内部点计算需保留 halo/ghost 区域语义"
+        ]
+      },
+      "cost": 0.0437255,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.05192075
+  }
+}

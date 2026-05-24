@@ -174,6 +174,11 @@ GROUND_TRUTH = {
     'syr2k':       'compute',
     'doitgen':     'compute',
     'gramschmidt': 'compute',
+    'trmm':      'compute',
+    'adi':       'memory',
+    'fdtd_2d':   'memory',
+    'heat_3d':   'memory',
+    'seidel_2d': 'memory',
 }
 
 

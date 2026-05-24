@@ -1,0 +1,135 @@
+{
+  "program": "gramschmidt",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 52.52710843373494,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "compute",
+    "changed": false,
+    "s1_matches_gt": false,
+    "s2_matches_gt": false,
+    "correction_type": "no-change"
+  },
+  "cost": 0.033225500000000005,
+  "full_result": {
+    "code_name": "gramschmidt",
+    "program_key": "gramschmidt",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_gramschmidt, line 66",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational kernel with multiple nested loops, which are likely to dominate the execution time.",
+          "confidence": "high"
+        },
+        {
+          "location": "inner loop of kernel_gramschmidt, line 73",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs a reduction operation to compute the norm, which is computationally intensive.",
+          "confidence": "high"
+        },
+        {
+          "location": "inner loop of kernel_gramschmidt, line 78",
+          "estimated_time_percentage": "30%",
+          "reason": "This loop updates the Q matrix, involving division operations which are costly.",
+          "confidence": "medium"
+        },
+        {
+          "location": "nested loops of kernel_gramschmidt, lines 81-86",
+          "estimated_time_percentage": "20%",
+          "reason": "These loops perform matrix updates, which involve multiple memory accesses and arithmetic operations.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The algorithm involves frequent memory accesses for matrix operations, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The algorithm involves a high degree of parallelism in matrix operations, which is well-suited for GPU acceleration.",
+        "recommended_approach": "Port the computational kernel to CUDA or OpenCL, focusing on parallelizing the innermost loops and optimizing memory access patterns for coalesced reads and writes."
+      },
+      "cost": 0.01043175,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "memory",
+        "reasoning": "该算法执行经典的Gram-Schmidt正交化，主要性能瓶颈在于内存访问模式。分析显示：1) 内层循环（第73、78行）访问A矩阵的列向量，导致内存访问不连续（列优先访问行优先存储的矩阵）；2) 第81-86行的嵌套循环中，每次迭代需要访问Q的列向量和A的列向量，同样存在跨步访问问题；3) 算法复杂度为O(m*n²)，但内存访问次数为O(m*n²)，导致算术强度较低。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "内存访问模式优化",
+          "technique": "循环分块（Loop Tiling）",
+          "code_changes": "对k和j循环进行分块，将数据块大小适配到CPU缓存。例如：\nint Bk = 32; // k维度的分块大小\nint Bj = 32; // j维度的分块大小\nfor (kk = 0; kk < n; kk += Bk) {\n  for (jj = kk; jj < n; jj += Bj) {\n    for (k = kk; k < min(kk+Bk, n); k++) {\n      // 计算nrm和Q[:,k]\n      for (j = max(k+1, jj); j < min(jj+Bj, n); j++) {\n        // 计算R[k][j]和更新A[:,j]\n      }\n    }\n  }\n}",
+          "expected_speedup": "1.5-3倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "数据布局优化",
+          "technique": "矩阵转置",
+          "code_changes": "在计算前将A矩阵转置为列优先存储，或使用结构体数组（AoS）转换为数组结构体（SoA）布局：\n// 原始：DATA_TYPE A[M][N]\n// 改为：DATA_TYPE A[N][M] (列优先)\n// 修改所有访问为A[k][i]而不是A[i][k]",
+          "expected_speedup": "2-4倍",
+          "difficulty": "hard"
+        },
+        {
+          "target": "计算强度优化",
+          "technique": "循环融合和向量化",
+          "code_changes": "1) 将第81-82行的两个循环融合为一个循环，减少内存访问次数；\n2) 使用SIMD指令（如AVX2/AVX-512）进行向量化：\n#pragma omp simd reduction(+:R_kj)\nfor (i = 0; i < m; i++) {\n  R_kj = Q[i][k] * A[i][j];\n  A[i][j] = A[i][j] - Q[i][k] * R_kj;\n}\n3) 使用编译器指令：#pragma vector aligned",
+          "expected_speedup": "1.5-2.5倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "并行化优化",
+          "technique": "OpenMP并行化",
+          "code_changes": "1) 外层k循环不能并行（存在依赖），但内层j循环可以并行化：\n#pragma omp parallel for private(i)\nfor (j = k + 1; j < n; j++) {\n  // 计算R[k][j]和更新A[:,j]\n}\n2) 使用OpenMP任务并行化不同的j迭代",
+          "expected_speedup": "2-8倍（取决于核心数）",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1) 外层k循环由CPU控制（顺序执行）；\n2) 内层循环（i循环）由GPU并行化：\n   - 计算nrm：使用归约核函数\n   - 计算Q[:,k]：使用element-wise核函数\n   - 计算R[k][j]和更新A[:,j]：对每个j启动一个核函数，每个核函数处理一列\n3) 使用CUDA流实现异步执行，重叠不同j的计算",
+        "data_layout": "1) 使用列优先存储（A[N][M]）以支持合并内存访问；\n2) 将A、Q矩阵存储在GPU全局内存中；\n3) 对于频繁访问的数据（如Q[:,k]），使用共享内存或常量内存；\n4) 考虑使用纹理内存存储只读数据（如Q矩阵）",
+        "challenges": [
+          "数据依赖：k循环的顺序性限制了并行度，需要CPU-GPU协同计算",
+          "内存传输开销：需要在每次k迭代时在CPU和GPU间同步数据",
+          "负载平衡：不同j迭代的计算量相同，但需要处理依赖关系",
+          "归约操作：计算nrm和R[k][j]需要高效的归约算法"
+        ],
+        "expected_speedup": "10-50倍（相比优化后的CPU版本），具体取决于m和n的大小以及GPU型号"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.5-1.0 FLOPs/byte",
+        "cache_behavior": "1) 列访问模式导致缓存利用率低，每次访问A[i][k]可能跨多个缓存行；\n2) 工作集大小：对于m×n矩阵，每次迭代访问O(m)个元素，当m较大时可能超过L1/L2缓存容量；\n3) 缓存冲突：A、Q、R矩阵可能相互竞争缓存空间；\n4) 预取效果差：不连续的访问模式使硬件预取器难以预测。",
+        "data_dependencies": [
+          "循环携带依赖：k循环存在真依赖（A矩阵在每次迭代中被更新）",
+          "反依赖：Q[i][k]在计算R[k][j]和更新A[i][j]时被读取",
+          "输出依赖：A[i][j]在循环中被重复写入"
+        ]
+      },
+      "cost": 0.02279375,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "compute",
+      "changed": false,
+      "s1_matches_gt": false,
+      "s2_matches_gt": false,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.033225500000000005
+  }
+}

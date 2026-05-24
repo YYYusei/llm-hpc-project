@@ -1,0 +1,169 @@
+{
+  "program": "fdtd_2d",
+  "config": "Ablation D (5.4→5.4)",
+  "s1_model": "gpt-5.4",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 63.38819095477387,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.07637175,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.4",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d(), hz update loop: for (i = 0; i < _PB_NX - 1; i++) for (j = 0; j < _PB_NY - 1; j++) hz[i][j] = ...",
+          "estimated_time_percentage": "35-45%",
+          "reason": "This loop performs the most arithmetic per grid point and reads from both ex and ey plus hz, then writes hz. It has high memory traffic with stencil-like neighbor accesses and runs for every time step.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(), ey update loop: for (i = 1; i < _PB_NX; i++) for (j = 0; j < _PB_NY; j++) ey[i][j] = ...",
+          "estimated_time_percentage": "25-35%",
+          "reason": "This loop touches two hz rows and updates ey for the full domain each time step. Arithmetic intensity is low, so runtime is dominated by streaming loads/stores.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(), ex update loop: for (i = 0; i < _PB_NX; i++) for (j = 1; j < _PB_NY; j++) ex[i][j] = ...",
+          "estimated_time_percentage": "20-30%",
+          "reason": "This loop updates ex using neighboring hz values along the contiguous j dimension. It is a full-domain sweep each time step with low flop/byte ratio, making it another major hotspot.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(), boundary loop: for (j = 0; j < _PB_NY; j++) ey[0][j] = _fict_[t]",
+          "estimated_time_percentage": "1-5%",
+          "reason": "This is only a single-row update per time step, so it is much smaller than the full-grid loops, though still executed every iteration.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel consists of simple stencil-style updates with very low arithmetic intensity: each grid-point update performs only a few floating-point operations but requires multiple array loads and a store. Accesses are mostly regular and contiguous in j, so performance will typically be limited by memory bandwidth/cache reuse rather than raw compute. There is no inter-process communication in this code."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The computation is a regular 2D stencil with high data parallelism across the spatial domain at each time step. Each sweep has simple nearest-neighbor dependencies and no global reductions, making it well suited to GPU execution. The main challenge is that the algorithm is memory-bandwidth-bound, so gains depend on achieving coalesced accesses and minimizing global memory traffic.",
+        "recommended_approach": "Map each of the three spatial sweeps in a time step to separate GPU kernels or use a fused/tiled kernel sequence. Use a 2D thread-block layout over the grid, keep j as the fastest-varying dimension for coalesced accesses, and stage tiles of ex, ey, and hz in shared memory where profitable. For higher performance, explore temporal blocking on GPU or kernel fusion to reduce global memory traffic between ex/ey updates and the hz update."
+      },
+      "cost": 0.0248115,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步判断基本正确：该 FDTD 2D 内核属于典型低算术强度、规则访存的 stencil/update 类计算，主瓶颈通常是内存带宽与缓存层次的数据供给能力，而不是浮点计算吞吐。三个主循环每个网格点仅执行少量加减乘操作，但需要读取多个数组元素并写回一个结果。以双精度估算，ey/ex 更新约为 3 FLOPs 对应 24B 显式流量（2 load + 1 store，不计写分配时），hz 更新约为 6 FLOPs 对应 40B 显式流量（4 load + 1 load old hz + 1 store）。算术强度明显偏低。进一步细化后可认为：瓶颈不是单纯“DRAM 带宽”一种，而是“以内存层次为主导”，其中包含 L1/L2 带宽、写分配流量、TLB/cache 容量与预取效率。由于 j 为内层，C 行主序下访问连续，空间局部性较好；但时间步之间存在全局同步语义，限制了跨 t 的深度融合。总体上 memory-bound 判断成立。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "hz update loop",
+          "technique": "SIMD 向量化 + restrict/对齐提示 + 标量替换减少地址计算",
+          "code_changes": "将二维数组参数改为连续一维指针或显式行指针，并添加 restrict；对内层 j 循环使用 #pragma omp simd aligned(ex,ey,hz:64)；将常量 0.7 提前为局部常量；对每行建立指针缓存。例如：for (i=0;i<nx-1;i++){ DATA_TYPE* __restrict exi=&ex[i][0]; DATA_TYPE* __restrict eyi=&ey[i][0]; DATA_TYPE* __restrict eyi1=&ey[i+1][0]; DATA_TYPE* __restrict hzi=&hz[i][0]; #pragma omp simd for (j=0;j<ny-1;j++) hzi[j] -= c07*((exi[j+1]-exi[j]) + (eyi1[j]-eyi[j])); }。若允许，使用编译选项 -O3 -march=native -ffast-math（需确认数值容忍度）。",
+          "expected_speedup": "1.15x-1.6x（单核）；若原始代码已被编译器良好向量化，则更接近 1.1x-1.25x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "ey update loop",
+          "technique": "并行化外层 i + SIMD 内层 j + 消除边界循环开销",
+          "code_changes": "将边界赋值与主体更新分离保留，但对主体使用 OpenMP：#pragma omp parallel for schedule(static) for (i=1;i<nx;i++){ DATA_TYPE* __restrict eyi=&ey[i][0]; DATA_TYPE* __restrict hzi=&hz[i][0]; DATA_TYPE* __restrict hzim1=&hz[i-1][0]; #pragma omp simd aligned(ey,hz:64) for (j=0;j<ny;j++) eyi[j] -= c05*(hzi[j]-hzim1[j]); }。同时将 ey[0][j]=_fict_[t] 也向量化：#pragma omp simd for (j=0;j<ny;j++) ey0[j]=fict_t;",
+          "expected_speedup": "单核 1.1x-1.4x；多核相对整个 kernel 可达 3x-12x（取决于核心数与内存带宽）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "ex update loop",
+          "technique": "利用 j 方向连续访问进行强向量化，必要时做轻量展开",
+          "code_changes": "对每个 i 行缓存 ex/hz 行指针：for (i=0;i<nx;i++){ DATA_TYPE* __restrict exi=&ex[i][0]; DATA_TYPE* __restrict hzi=&hz[i][0]; #pragma omp simd aligned(ex,hz:64) for (j=1;j<ny;j++) exi[j] -= c05*(hzi[j]-hzi[j-1]); }。可尝试手工展开 2 或 4 路以帮助旧编译器：for (j=1;j<ny-3;j+=4) {...}，但优先依赖编译器自动向量化。",
+          "expected_speedup": "1.1x-1.5x（单核）",
+          "difficulty": "easy"
+        },
+        {
+          "target": "all three update loops",
+          "technique": "OpenMP 多核并行",
+          "code_changes": "时间步 t 保持串行；在每个空间循环上并行。推荐形式：for(t=0;t<tmax;t++){ #pragma omp parallel { #pragma omp for simd schedule(static) for(j=0;j<ny;j++) ey[0][j]=_fict_[t]; #pragma omp for schedule(static) for(i=1;i<nx;i++) ... #pragma omp for schedule(static) for(i=0;i<nx;i++) ... #pragma omp for schedule(static) for(i=0;i<nx-1;i++) ... } }。更优做法是在 t 外创建一次并行域，减少线程反复创建销毁：#pragma omp parallel { for(t=0;t<tmax;t++){ #pragma omp for ... ; #pragma omp for ... ; #pragma omp for ... ; #pragma omp for ... ; } }。",
+          "expected_speedup": "相对单线程 4x-20x；受内存带宽限制，通常不会线性扩展到全部核心",
+          "difficulty": "easy"
+        },
+        {
+          "target": "all loops / memory subsystem",
+          "technique": "数组对齐、扁平化存储、避免 PolyBench 宏阻碍优化",
+          "code_changes": "将 POLYBENCH_2D 宏数组替换为手工分配的 1D 连续数组，例如 pos=i*ny+j；使用 posix_memalign/aligned_alloc(64, nx*ny*sizeof(DATA_TYPE))；函数签名改为 DATA_TYPE* __restrict ex, * __restrict ey, * __restrict hz；访问改为 ex[idx(i,j)]。这样更利于编译器别名分析、自动向量化和预取。",
+          "expected_speedup": "1.05x-1.25x 单独收益；与 SIMD/OpenMP 叠加收益更明显",
+          "difficulty": "medium"
+        },
+        {
+          "target": "cache reuse across loops",
+          "technique": "空间分块/strip-mining（按 j 或二维 tile）",
+          "code_changes": "对每个时间步，将三个主体循环按 j 分块，例如 JB=128~512：for (jb=0;jb<ny;jb+=JB){ jend=min(ny,jb+JB); 更新 ey 的 j in [jb,jend); 更新 ex 的 j in [max(1,jb),jend); 更新 hz 的 j in [jb,min(ny-1,jend)); }。若进一步做二维 tile，则需分别处理边界 halo。目标是让 ex/ey/hz 的活跃工作集更好驻留在 L1/L2，尤其在 ny 很大时减少缓存/TLB 压力。",
+          "expected_speedup": "1.05x-1.3x，问题规模较大时更有效；若硬件预取已很好，收益可能有限",
+          "difficulty": "medium"
+        },
+        {
+          "target": "time-step execution order",
+          "technique": "时间分块/波前时空阻塞（temporal blocking）",
+          "code_changes": "采用 diamond/wavefront skewing 形式，在满足依赖的前提下对 t-i-j 迭代空间做合法变换，使多个时间步在 tile 内完成，减少数组反复从高层缓存/内存读取。需要重构循环边界并显式处理 ey 边界条件 ey[0][j]=_fict_[t]。这类优化通常借助 Pluto/PoCC 或手工 skewing 实现。",
+          "expected_speedup": "1.2x-2.5x（大规模、缓存受限平台上潜力较大）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "store traffic",
+          "technique": "非临时存储/写分配优化（仅在特定平台验证后启用）",
+          "code_changes": "若数组更新后短期内不会被立即重用，可尝试对某些流式写使用 streaming store；但本内核中 ex/ey 在同一时间步后续 hz 更新会立即读取，因此 ex/ey 不适合非临时写。对于 hz 也会在下一时间步被读取，通常仍不建议。更现实的改动是确保编译器生成高效 store，并通过 blocking 提高写后读命中率。",
+          "expected_speedup": "0x-1.1x，平台相关且风险较高",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "采用每个时间步 3 个主 kernel + 1 个边界 kernel 的方案最直接稳妥：Kernel1 写 ey 第 0 行；Kernel2 更新 ey(i>=1)；Kernel3 更新 ex(j>=1)；Kernel4 更新 hz(i<nx-1,j<ny-1)。每个线程负责一个网格点，二维 thread block（如 32x8、16x16）映射到 (j,i)。由于时间步之间存在全局依赖，通常在 host 端或使用单个 persistent kernel 在 device 端循环 t，并在每个阶段使用 grid-wide synchronization（若平台支持 cooperative groups）。进一步优化可将 ex/ey/hz 更新融合为 tile 内共享内存流水，但需严格处理阶段顺序与 halo。",
+        "data_layout": "建议使用扁平化 1D 连续数组，按行主序存储 idx=i*ny+j，使 j 对应线程 x 维，保证 warp 内连续地址访问实现 coalescing。可将 ex/ey/hz 分别独立存储为 SoA（当前已等价于 SoA），不要改成 AoS。若使用 pitched allocation，需确保 pitch 对齐且索引正确。边界数组 _fict_ 很小，可放常量内存或直接在每步读取一个标量传入 kernel。",
+        "challenges": [
+          "时间步之间存在严格顺序依赖，无法简单把 t 维完全并行展开",
+          "内核低算术强度，GPU 上也容易受全局内存带宽限制",
+          "若每个时间步发射多个 kernel，kernel launch 开销在小规模问题上可能显著",
+          "hz 更新需要 ex/ey 的本时间步新值，限制了跨阶段融合自由度",
+          "共享内存 tiling 需要处理 ex/ey/hz 多数组及边界 halo，增加寄存器和共享内存压力",
+          "若 nx/ny 较小，GPU 占用率不足，PCIe 传输与启动开销可能抵消收益"
+        ],
+        "expected_speedup": "相对单线程 CPU 常见可达 10x-50x；相对优化后的多核 CPU 通常约 2x-8x。大规模网格、数据常驻 GPU、采用高带宽显存时更接近上限；小规模问题可能仅 1.5x-5x。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "按双精度粗估：ey 更新每点约 3 FLOPs / 24B = 0.125 FLOPs/byte；ex 更新每点约 3 FLOPs / 24B = 0.125 FLOPs/byte；hz 更新每点约 6 FLOPs / 48B = 0.125 FLOPs/byte（若按显式 load/store 且不计写分配则约 6/40 = 0.15）。整个时间步综合约 12 FLOPs / 96B ≈ 0.125 FLOPs/byte，属于明显低算术强度。若考虑缓存命中后实际 DRAM 字节数，表观 AI 会略升，但内核本质仍偏带宽受限。",
+        "cache_behavior": "1) j 为内层循环，ex[i][j]、ey[i][j]、hz[i][j] 在行主序下连续访问，L1/L2 预取友好，SIMD 适配性好。2) ey 更新同时读取 hz[i][j] 与 hz[i-1][j]，相邻两行存在良好空间局部性；ex 更新读取同一行相邻元素 hz[i][j], hz[i][j-1]，局部性更好。3) hz 更新需要 ex 当前行相邻元素和 ey 当前/下一行元素，工作集略大，是最重热点。4) 三个循环顺序使得 ey/ex 的新值会被后续 hz 循环消费，存在一定短期重用；若 ny 很大，前两个循环写入的数据在进入 hz 循环前可能部分从 L1 逐出，但通常仍可在 L2/L3 保留。5) 由于每次更新都写回整个数组，写分配和缓存容量压力不可忽视。6) 边界循环 ey[0][j]=_fict_[t] 完全流式，成本低，不是主要瓶颈。",
+        "data_dependencies": [
+          "时间依赖：t 步的 ex/ey/hz 依赖于 t-1 步的场值，因此时间维不能直接完全并行",
+          "ey 更新依赖旧 hz[i][j] 与旧 hz[i-1][j]，同一时间步内可在 i,j 空间并行",
+          "ex 更新依赖旧 hz[i][j] 与旧 hz[i][j-1]，同一时间步内可在 i,j 空间并行",
+          "hz 更新依赖本时间步已更新后的 ex[i][j], ex[i][j+1], ey[i][j], ey[i+1][j]，因此必须位于 ex/ey 更新之后",
+          "边界赋值 ey[0][j]=_fict_[t] 必须先于本时间步 hz 更新，因为 hz 使用 ey[0][j] 或 ey[i][j] 邻域值",
+          "空间点之间在单个循环内部无写后写冲突，每个网格点独立写自身位置，适合数据并行"
+        ]
+      },
+      "cost": 0.05156025,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.07637175
+  }
+}

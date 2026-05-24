@@ -1,0 +1,133 @@
+{
+  "program": "heat_3d",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 64.13855421686748,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03829,
+  "full_result": {
+    "code_name": "heat_3d",
+    "program_key": "heat_3d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_heat_3d(): time-step loop t=1..TSTEPS, stencil update A->B (inner i/j/k loops)",
+          "estimated_time_percentage": "45-55%",
+          "reason": "3D 7-point stencil-like update over (N-2)^3 points per timestep; high memory traffic (multiple neighbor loads + one store) with low arithmetic intensity; dominates runtime for typical PolyBench sizes when printing is excluded from timing",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_heat_3d(): time-step loop t=1..TSTEPS, stencil update B->A (inner i/j/k loops)",
+          "estimated_time_percentage": "45-55%",
+          "reason": "Second full sweep over the same 3D domain each timestep; similar memory access pattern and cost as the first sweep; effectively doubles memory bandwidth demand per timestep",
+          "confidence": "high"
+        },
+        {
+          "location": "print_array(): full 3D traversal with fprintf in triple loop",
+          "estimated_time_percentage": "0-90% (depends on whether output is enabled / measured)",
+          "reason": "I/O-heavy; fprintf inside the innermost loop is extremely slow and can dominate wall time, but it is outside the PolyBench timed region (kernel timing) in typical runs",
+          "confidence": "medium"
+        },
+        {
+          "location": "init_array(): triple loop initialization of A and B",
+          "estimated_time_percentage": "1-10%",
+          "reason": "Streams through two large 3D arrays once; bandwidth-limited but executed only once; usually small compared to TSTEPS sweeps",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "Each lattice update performs relatively few FLOPs compared to the number of bytes moved (multiple neighbor reads plus a write). For large N, working sets exceed cache and performance is limited by sustained memory bandwidth and cache reuse (especially along i/j dimensions). Two full-array sweeps per timestep further amplify bandwidth pressure."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel is a regular 3D stencil with high parallelism and predictable memory access. Although it is memory-bandwidth bound, GPUs provide very high bandwidth and can achieve strong speedups if memory accesses are coalesced and the domain is large enough to amortize launch overhead.",
+        "recommended_approach": "Use CUDA/HIP/OpenACC/OpenMP target offload. Map threads so k is the fastest-varying dimension for coalesced loads/stores. Use two 3D grids (A and B) and launch one kernel per sweep (or fuse with careful synchronization across timesteps). Consider using shared memory (or cache) tiling in j/k (and possibly i) to reuse neighbor planes, and use read-only cache for input. For multi-GPU, decompose along i (or j) with halo exchanges between timesteps."
+      },
+      "cost": 0.0251615,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck. The kernel performs a 3D stencil computation, which involves multiple reads and a write per lattice point, leading to high memory bandwidth usage. The working set size exceeds cache capacity, causing frequent cache misses and limiting performance by memory bandwidth."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Loop Tiling",
+          "code_changes": "Apply loop tiling to the i, j, k loops to improve cache reuse. For example, introduce tile sizes Ti, Tj, Tk and iterate over tiles.",
+          "expected_speedup": "1.5x - 2x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Loop Unrolling",
+          "code_changes": "Unroll the innermost k loop by a factor of 2 or 4 to reduce loop overhead and increase instruction-level parallelism.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "kernel_heat_3d",
+          "technique": "Prefetching",
+          "code_changes": "Use compiler directives or intrinsics to prefetch data for the next iteration of the loop to hide memory latency.",
+          "expected_speedup": "1.1x - 1.3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "print_array",
+          "technique": "Conditional Compilation",
+          "code_changes": "Use preprocessor directives to conditionally compile the print_array function only when needed, reducing unnecessary overhead during performance measurement.",
+          "expected_speedup": "Varies based on usage",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use a 3D grid of threads where each thread computes a single element of the output array. Ensure memory accesses are coalesced by aligning data accesses along the fastest-changing dimension.",
+        "data_layout": "Use a structure of arrays (SoA) layout to improve coalesced memory access patterns.",
+        "challenges": [
+          "Ensuring coalesced memory access to maximize bandwidth utilization.",
+          "Managing shared memory usage to avoid bank conflicts and optimize data reuse."
+        ],
+        "expected_speedup": "5x - 20x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.2 FLOPs/byte",
+        "cache_behavior": "The cache behavior is poor due to the large working set size and the need to access multiple neighboring elements for each update, leading to frequent cache misses.",
+        "data_dependencies": [
+          "Each update depends on the values of its six neighbors in the previous timestep.",
+          "The computation of B[i][j][k] depends on A[i±1][j][k], A[i][j±1][k], A[i][j][k±1]."
+        ]
+      },
+      "cost": 0.0131285,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03829
+  }
+}

@@ -1,0 +1,114 @@
+{
+  "program": "adi",
+  "config": "Role-Swap V3 Biased agreement",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 60.74999999999999,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03205125,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_adi, Column Sweep loop, line 66",
+          "estimated_time_percentage": "40%",
+          "reason": "This loop performs multiple nested iterations over the array, leading to significant computational workload.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi, Row Sweep loop, line 80",
+          "estimated_time_percentage": "40%",
+          "reason": "Similar to the Column Sweep, this loop also involves nested iterations and array accesses, contributing heavily to execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays, which can lead to cache misses and memory bandwidth limitations, indicating a memory-bound bottleneck."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The code involves regular data access patterns and independent operations within loops, making it suitable for parallel execution on a GPU.",
+        "recommended_approach": "Use CUDA or OpenCL to parallelize the loops, focusing on distributing the work across multiple threads and optimizing memory access patterns."
+      },
+      "cost": 0.00925925,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "agree_with_initial": true,
+        "primary_bottleneck": "memory",
+        "reasoning": "代码中涉及对大型二维数组的频繁访问，存在以下内存瓶颈：1) 列扫描循环中访问u[j][i±1]导致跨行访问，破坏了空间局部性；2) 行扫描循环中访问v[i±1][j]导致跨列访问；3) p和q数组的访问模式为p[i][j-1]，存在跨步访问；4) 每个时间步需要多次遍历整个数组，导致高内存带宽需求。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep loop (line 66)",
+          "technique": "循环分块和数组转置",
+          "code_changes": "1) 在列扫描前对u数组进行转置，使u[j][i]变为u[i][j]；2) 对循环进行分块处理：\n// 转置u数组\n#pragma omp parallel for collapse(2)\nfor (int i=0; i<n; i++)\n  for (int j=0; j<n; j++)\n    u_trans[i][j] = u[j][i];\n// 分块列扫描\nint block_size = 64; // 根据缓存大小调整\nfor (int ii=1; ii<n-1; ii+=block_size) {\n  int i_end = min(ii+block_size, n-1);\n  for (int i=ii; i<i_end; i++) {\n    // 原列扫描代码，使用转置后的u_trans\n  }\n}",
+          "expected_speedup": "2-3倍",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Row Sweep loop (line 80)",
+          "technique": "循环交换和数据预取",
+          "code_changes": "1) 将内层循环展开4次以减少分支开销；2) 添加预取指令：\nfor (i=1; i<_PB_N-1; i++) {\n  u[i][0] = SCALAR_VAL(1.0);\n  p[i][0] = SCALAR_VAL(0.0);\n  q[i][0] = u[i][0];\n  // 预取下一行数据\n  __builtin_prefetch(&v[i+1][0], 0, 3);\n  // 循环展开\n  for (j=1; j<_PB_N-1; j+=4) {\n    // 展开4次迭代\n    p[i][j] = -f / (d*p[i][j-1]+e);\n    q[i][j] = (-a*v[i-1][j]+(SCALAR_VAL(1.0)+SCALAR_VAL(2.0)*a)*v[i][j] - c*v[i+1][j]-d*q[i][j-1])/(d*p[i][j-1]+e);\n    // 重复3次...\n  }\n  // 处理剩余迭代...\n}",
+          "expected_speedup": "1.5-2倍",
+          "difficulty": "easy"
+        },
+        {
+          "target": "整体算法",
+          "technique": "数据布局优化和缓存阻塞",
+          "code_changes": "1) 将p,q数组改为结构体数组以提高局部性；2) 使用SoA布局：\ntypedef struct { DATA_TYPE p, q; } pq_t;\npq_t POLYBENCH_2D(pq, N, N, n, n);\n// 修改访问为pq[i][j].p和pq[i][j].q\n// 添加缓存阻塞策略\nint tile_size = 32;\nfor (int t=1; t<=_PB_TSTEPS; t++) {\n  for (int ti=1; ti<n-1; ti+=tile_size) {\n    for (int tj=1; tj<n-1; tj+=tile_size) {\n      // 处理tile内的计算\n    }\n  }\n}",
+          "expected_speedup": "1.2-1.5倍",
+          "difficulty": "hard"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1) 每个时间步分为两个内核：列扫描内核和行扫描内核；2) 列扫描内核：每个线程块处理一列，线程处理一列中的多个元素；3) 行扫描内核：每个线程块处理一行；4) 使用共享内存存储临时数据以减少全局内存访问",
+        "data_layout": "使用行优先存储，对于列扫描内核，通过共享内存转置或使用纹理内存优化访问模式",
+        "challenges": [
+          "1) 列扫描中的递归依赖(p[i][j]依赖p[i][j-1])需要并行前缀扫描算法；2) 内存访问模式不连续；3) 需要频繁的内核启动和数据传输开销；4) 需要仔细处理边界条件"
+        ],
+        "expected_speedup": "10-50倍（相对于优化后的CPU版本）"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.5 FLOPs/byte",
+        "cache_behavior": "1) 列扫描中u[j][i±1]访问导致缓存行利用率低（每缓存行仅使用1-2个元素）；2) p[i][j-1]访问模式具有时间局部性但空间局部性差；3) 工作集大小约4×N²个元素，当N较大时超出缓存容量",
+        "data_dependencies": [
+          "列扫描内层循环存在反依赖：p[i][j]依赖p[i][j-1]；q[i][j]依赖q[i][j-1]和u[j][i±1]",
+          "行扫描类似依赖模式",
+          "时间步之间存在流依赖：v依赖前一时间步的u，u依赖前一时间步的v"
+        ]
+      },
+      "cost": 0.022792,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03205125
+  }
+}

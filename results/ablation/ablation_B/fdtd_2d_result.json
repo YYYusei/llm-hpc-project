@@ -1,0 +1,134 @@
+{
+  "program": "fdtd_2d",
+  "config": "Ablation B (5.2→4o)",
+  "s1_model": "gpt-5.2",
+  "s2_model": "gpt-4o",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 63.01130653266331,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.037848999999999994,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.2",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, ey update (i=1..NX-1, j=0..NY-1) around lines ~95-98",
+          "estimated_time_percentage": "25-35%",
+          "reason": "Large 2D stencil-like update over ey for every timestep; low arithmetic intensity (few flops per multiple memory loads/stores) and streaming access dominates runtime.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, ex update (i=0..NX-1, j=1..NY-1) around lines ~99-102",
+          "estimated_time_percentage": "25-35%",
+          "reason": "Similar full-grid update with neighbor access in j dimension; bandwidth-heavy with limited reuse; typically comparable cost to ey update.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(): time loop t=0..TMAX-1, hz update (i=0..NX-2, j=0..NY-2) around lines ~103-107",
+          "estimated_time_percentage": "30-45%",
+          "reason": "Reads multiple fields (hz, ex at j and j+1, ey at i and i+1) and writes hz; highest memory traffic per lattice point among the three updates, so often the dominant hotspot.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_fdtd_2d(): boundary condition ey[0][j]=_fict_[t] (j=0..NY-1) around lines ~93-94",
+          "estimated_time_percentage": "1-5%",
+          "reason": "Only one row per timestep; small compared to full 2D sweeps, but can be noticeable for small NX or very small problem sizes.",
+          "confidence": "medium"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "Each inner iteration performs a small number of floating-point operations (a few adds/subs and one multiply) but requires multiple loads and at least one store to large arrays (ex/ey/hz). Working sets exceed cache for typical PolyBench sizes, so performance is limited by memory bandwidth and cache/memory traffic rather than peak FLOPs. No inter-process communication is present."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The kernel consists of regular, dense 2D stencil-like updates with predictable memory access and massive data parallelism over grid points. It is primarily bandwidth-bound, which maps well to GPUs with high memory bandwidth, provided memory accesses are coalesced and kernel launches are organized to minimize overhead.",
+        "recommended_approach": "Implement three GPU kernels per timestep (ey update, ex update, hz update) using CUDA/HIP or OpenACC/OpenMP target. Use a 2D thread block (e.g., 16x16 or 32x8) with j as the fastest-varying index for coalescing. Consider fusing ex+ey reads into the hz kernel using shared memory tiling for ex/ey/hz neighborhoods to reduce global loads. For better performance, use asynchronous execution and keep data resident on device across all timesteps; only copy back at the end."
+      },
+      "cost": 0.024587499999999998,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-4o",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "The initial analysis correctly identifies the memory bottleneck. The operations in the kernel involve a small number of arithmetic operations compared to the number of memory accesses, leading to a low arithmetic intensity. This suggests that the performance is indeed limited by memory bandwidth rather than computational power."
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "ey update",
+          "technique": "Loop unrolling and blocking",
+          "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "ex update",
+          "technique": "Loop unrolling and blocking",
+          "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "hz update",
+          "technique": "Loop unrolling and blocking",
+          "code_changes": "Unroll the inner loop for 'j' and apply blocking to improve cache reuse.",
+          "expected_speedup": "1.2x - 1.5x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Overall memory access",
+          "technique": "Prefetching",
+          "code_changes": "Use compiler directives or intrinsics to prefetch data into cache before it is needed.",
+          "expected_speedup": "1.1x - 1.3x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "Use CUDA or OpenCL to parallelize the loops over 'i' and 'j'. Each thread computes one element of the arrays.",
+        "data_layout": "Use a structure of arrays (SoA) layout to ensure coalesced memory accesses.",
+        "challenges": [
+          "Ensuring memory coalescing",
+          "Managing shared memory to reduce global memory accesses"
+        ],
+        "expected_speedup": "5x - 10x"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "0.25 FLOPs/byte",
+        "cache_behavior": "The working set size exceeds typical cache sizes, leading to frequent cache misses. Blocking and prefetching can help mitigate this.",
+        "data_dependencies": [
+          "ey[i][j] depends on hz[i][j] and hz[i-1][j]",
+          "ex[i][j] depends on hz[i][j] and hz[i][j-1]",
+          "hz[i][j] depends on ex[i][j+1], ex[i][j], ey[i+1][j], and ey[i][j]"
+        ]
+      },
+      "cost": 0.013261499999999999,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.037848999999999994
+  }
+}

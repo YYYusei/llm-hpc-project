@@ -1,0 +1,177 @@
+{
+  "program": "adi",
+  "config": "Ablation D (5.4→5.4)",
+  "s1_model": "gpt-5.4",
+  "s2_model": "gpt-5.4",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 63.375,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.08225175,
+  "full_result": {
+    "code_name": "adi",
+    "program_key": "adi",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-5.4",
+      "hotspots": [
+        {
+          "location": "kernel_adi(): Column Sweep forward elimination loop, for (t) -> for (i=1..N-2) -> for (j=1..N-2)",
+          "estimated_time_percentage": "35%",
+          "reason": "This is one of the two dominant O(T*N^2) phases. Each iteration performs multiple floating-point operations including divisions and accesses u, p, and q. The recurrence on p[i][j-1] and q[i][j-1] prevents straightforward SIMD vectorization across j, and the access pattern u[j][i-1], u[j][i], u[j][i+1] traverses a column of a row-major array, causing poor spatial locality and likely cache/TLB inefficiency.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Column Sweep backward substitution loop, for (t) -> for (i=1..N-2) -> for (j=N-2..1)",
+          "estimated_time_percentage": "15%",
+          "reason": "This phase is also O(T*N^2) and has a loop-carried dependency through v[j+1][i], limiting vectorization and parallelism along j. It writes v by column in row-major storage, which is stride-N and cache-unfriendly.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Row Sweep forward elimination loop, for (t) -> for (i=1..N-2) -> for (j=1..N-2)",
+          "estimated_time_percentage": "35%",
+          "reason": "This is the second dominant O(T*N^2) phase. It performs similar Thomas-algorithm style recurrence with divisions and loop-carried dependencies on p[i][j-1] and q[i][j-1]. Memory access is more cache-friendly than the column sweep because v[i][j] is traversed row-wise, but the recurrence still limits SIMD efficiency.",
+          "confidence": "high"
+        },
+        {
+          "location": "kernel_adi(): Row Sweep backward substitution loop, for (t) -> for (i=1..N-2) -> for (j=N-2..1)",
+          "estimated_time_percentage": "15%",
+          "reason": "This phase updates u with a backward recurrence u[i][j] depending on u[i][j+1], so it is inherently sequential along j. Although row-wise access is contiguous, the dependency chain limits instruction-level and data-level parallelism.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The kernel is dominated by repeated sweeps over large 2D arrays u, v, p, and q across O(T*N^2) work. The column sweep is especially costly because it accesses row-major arrays with stride-N patterns, reducing cache-line utilization and increasing memory latency pressure. Although there are floating-point divisions and recurrences that add compute cost, the poor locality and limited vectorization make memory behavior the primary bottleneck overall. There is no inter-process communication in this code."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem has substantial parallelism across independent rows/columns and time steps are regular, but the current Thomas-solver recurrences along j limit straightforward GPU efficiency. A naive port would underutilize the GPU because each tridiagonal line is sequential. However, with a parallel tridiagonal algorithm and layout changes to improve coalescing, the kernel can map well to GPUs.",
+        "recommended_approach": "Port each row/column tridiagonal solve to batched parallel tridiagonal kernels using cyclic reduction, parallel cyclic reduction, or vendor libraries for batched tridiagonal systems. Keep data in layouts that make accesses coalesced for each sweep, potentially using transposed buffers between row and column phases. Launch one thread block per line or a batched solver across many lines, and fuse simple boundary assignments into the kernels."
+      },
+      "cost": 0.026939499999999998,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "gpt-5.4",
+      "validation": {
+        "bottleneck_correct": true,
+        "corrected_bottleneck": "",
+        "reasoning": "初步判断基本正确，但需要更精确表述为：该核函数是“以内存访问效率受限为主、夹杂递推依赖导致 ILP/SIMD 受限”的混合瓶颈，其中主瓶颈仍是 memory/locality。原因如下：1) Column sweep 中对 u[j][i-1], u[j][i], u[j][i+1] 和 v[j][i] 的访问在 C 的行主序下是跨行 stride-N 访问，缓存行利用率差，TLB/预取器效果弱；2) p[i][j], q[i][j] 在前向消去中是连续访问，row sweep 也较友好，但 column sweep 占总时间约 50%，足以主导整体 locality；3) 每个 j 迭代存在 p[i][j-1]、q[i][j-1] 的递推依赖，回代阶段存在 v[j+1][i] / u[i][j+1] 依赖，因此难以充分向量化，导致即使 FLOPs 不高，核心也不能完全靠计算吞吐隐藏访存延迟；4) 除法较贵，但其数量与访存数量同阶，且在现代 CPU 上若数据局部性差、并行度不足，整体仍更接近带宽/延迟受限而非纯 compute-bound。故“memory-bound”判断成立，但应强调 column sweep 的跨步访问和 Thomas 递推共同限制性能。"
+      },
+      "analysis": {},
+      "detailed_optimizations": [
+        {
+          "target": "Column Sweep forward elimination loop",
+          "technique": "数据布局变换 + 显式转置/双布局存储，消除 stride-N 访问",
+          "code_changes": "将列扫中的主输入从直接访问 u[j][i] 改为访问转置数组 ut[i][j]（使原列访问变为连续行访问）。做法一：维护 u 和 ut 两份布局，每个时间步在 row sweep 结束后同步转置；列扫写 v 时同时写 vt 的连续布局。示意：新增数组 ut, vt；初始化后构造 ut[j][i]=u[i][j]。列扫中将 q[i][j] = (-d*ut[i-1][j] + (1+2*d)*ut[i][j] - f*ut[i+1][j] - a*q_prev) * inv_denom；回代写 vt[i][j]，最后必要时转回 v[j][i] 或直接让 row sweep 消费 vt。更优做法是全程双布局：row sweep 使用原布局 u/v，column sweep 使用转置布局 ut/vt，两个 sweep 之间只做角色交换和一次批量转置/融合更新。",
+          "expected_speedup": "1.4x-2.2x（单独针对 column sweep）；整体约 1.2x-1.8x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "Column Sweep forward elimination loop",
+          "technique": "消除 p/q 大数组写回，改为按行临时缓冲或标量递推",
+          "code_changes": "当前前向消去把 p[i][j], q[i][j] 全量写入二维数组，导致额外内存流量。可将外层 i 的一条线改为使用一维临时数组 p_line[n], q_line[n]，甚至将前向阶段中的 p_prev/q_prev 保持在寄存器，仅在回代需要时保存整条线到连续缓冲。示意：for (i) { p_line[0]=0; q_line[0]=1; for (j=1; j<n-1; ++j) { denom = a*p_line[j-1]+b; inv = 1.0/denom; p_line[j] = -c*inv; q_line[j] = rhs*inv; } for (j=n-2; j>=1; --j) v_col[j] = p_line[j]*v_col[j+1]+q_line[j]; }。同时将 p,q 从 N*N 改为 2*(N) scratch，减少容量和缓存污染。",
+          "expected_speedup": "1.15x-1.5x；若原问题规模较大、缓存压力明显，整体可达 1.2x-1.6x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Column Sweep backward substitution loop",
+          "technique": "连续缓冲回代 + 写合并",
+          "code_changes": "不要直接写 v[j][i]（stride-N），而是先写入连续的一维缓冲 v_line[j] 或转置布局 vt[i][j]，回代结束后若必须保留原布局，再做一次顺序散写/转置。示意：v_line[n-1]=1; for (j=n-2; j>=1; --j) v_line[j]=p_line[j]*v_line[j+1]+q_line[j]; 然后 memcpy 到 vt[i][1:n-1]。这样回代阶段读 p_line/q_line 和写 v_line 都是连续的。",
+          "expected_speedup": "1.1x-1.4（针对该热点）；整体约 1.05x-1.15x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Row Sweep forward elimination loop",
+          "technique": "标量替换、公共子表达式消除、除法倒数化",
+          "code_changes": "将重复表达式 hoist 到循环外，并减少每次迭代重复加载。示意：const DATA_TYPE alpha = (DATA_TYPE)1.0 + (DATA_TYPE)2.0*a; for (i=1; i<n-1; ++i) { DATA_TYPE p_prev=0.0, q_prev=1.0; p_line[0]=0.0; q_line[0]=1.0; for (j=1; j<n-1; ++j) { DATA_TYPE denom = d*p_prev + e; DATA_TYPE inv = 1.0 / denom; DATA_TYPE rhs = -a*v[i-1][j] + alpha*v[i][j] - c*v[i+1][j] - d*q_prev; DATA_TYPE p_cur = -f * inv; DATA_TYPE q_cur = rhs * inv; p_line[j]=p_cur; q_line[j]=q_cur; p_prev=p_cur; q_prev=q_cur; } }。若允许轻微数值变化，可用编译器选项启用 reciprocal approximation/FMA。",
+          "expected_speedup": "1.1x-1.3x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "Row Sweep backward substitution loop",
+          "technique": "使用一维 scratch 提升缓存命中并减少 p/q 二维数组访问",
+          "code_changes": "与 column sweep 相同，将 p/q 改为 p_line/q_line。回代：u[i][n-1]=1; for (j=n-2; j>=1; --j) u[i][j]=p_line[j]*u[i][j+1]+q_line[j]; 这样 row sweep 全部在连续内存上运行，避免 p[i][j], q[i][j] 的大工作集。",
+          "expected_speedup": "1.1x-1.25x",
+          "difficulty": "easy"
+        },
+        {
+          "target": "All sweeps",
+          "technique": "OpenMP 按独立线并行",
+          "code_changes": "每个 sweep 中不同 i 之间独立，可直接并行外层 i。示意：#pragma omp parallel for schedule(static) private(j, p_line, q_line) for (i=1; i<n-1; ++i) { ... }。注意 p_line/q_line 必须线程私有；若使用双布局 ut/vt，也需避免多个线程写同一 cache line，可按行对齐或 padding。",
+          "expected_speedup": "CPU 多核上 4x-16x（取决于核数与内存带宽）；单核优化后再并行通常更稳健",
+          "difficulty": "easy"
+        },
+        {
+          "target": "All sweeps",
+          "technique": "SIMD 友好化有限，但可通过批处理多条线实现跨线向量化",
+          "code_changes": "单条 Thomas 递推沿 j 有 loop-carried dependence，难以直接 SIMD；可把多个 i 一起处理，形成 structure-of-arrays 风格的 batched lines。示意：一次处理 i,i+1,...,i+W-1 多条独立线，维护向量寄存器 p_prev_vec/q_prev_vec，对同一 j 执行向量化更新。要求数据布局改为转置友好或使用 gather 成本可接受。CPU 上可结合 AVX2/AVX-512 实现 batched Thomas。",
+          "expected_speedup": "1.2x-2.0x（在布局优化后更可能接近上限）",
+          "difficulty": "hard"
+        },
+        {
+          "target": "All sweeps",
+          "technique": "缓存块化/时间块化（wavefront 或 sweep fusion 的有限形式）",
+          "code_changes": "标准 ADI 时间步存在 t 级依赖，不能简单跨 t 完全融合，但可对空间维做块化，尤其在维护双布局时按 tile 转置和处理，减少大数组往返。示意：按 i-block 处理若干条线，局部完成 column sweep 到 vt，再在可行时对对应 tile 做 row sweep。若保持算法语义严格不变，需谨慎处理 sweep 间全局依赖边界。",
+          "expected_speedup": "1.05x-1.2x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "Compiler/code generation",
+          "technique": "restrict、对齐、常量传播、快速数学选项",
+          "code_changes": "将函数签名中的数组指针改为 restrict 语义（若宏允许），并确保 64B 对齐；使用 -O3 -march=native -ffast-math（若允许数值松弛） -fopenmp；对常量 a,b,c,d,e,f, alpha, beta 做 const 限定。可加 #pragma omp simd 仅在跨线 batched 版本上使用。",
+          "expected_speedup": "1.05x-1.2x",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "适合，但不应直接照搬 Thomas 串行递推。推荐采用“批量三对角求解 + 双阶段 sweep”的方案：1) 将每个 row/column 视为一条独立三对角线；2) 对每个 sweep 使用 parallel cyclic reduction (PCR)、recursive doubling、CR+PCR hybrid，或调用 cuSPARSE gtsv2StridedBatch / rocSPARSE batched tridiagonal solver；3) Column sweep 与 Row sweep 分别作为两个 kernel/solver 阶段，中间通过转置布局或双布局避免非合并访问；4) 若问题规模中等，可每个 thread block 处理一条或多条线，将系数和 RHS 放入 shared memory；若规模较大，采用 batched library solver 更稳妥。",
+        "data_layout": "建议维护原布局和转置布局两份：u/ut, v/vt。Row sweep 使用行主序连续访问；Column sweep 直接在转置布局上执行，使原列问题变成行问题，从而保证全局内存 coalescing。p/q 不建议保留为全局 N*N 数组，而应在 GPU 上作为每条线的临时工作区（global scratch 或 shared memory）。若使用 batched solver，采用 strided-batch 布局：每条线连续存储，batch 间固定 stride。",
+        "challenges": [
+          "Thomas 算法沿单条线串行，线程级并行度不足；需改用 PCR/CR/Hybrid 或 batched vendor solver",
+          "Column sweep 在原始布局下访问不合并；需转置或双布局",
+          "每个时间步包含两个阶段且存在全局同步点，kernel launch 开销在小规模问题上可能显著",
+          "PCR 相比 Thomas 会增加 FLOPs 和临时存储，需在并行度与额外计算之间权衡",
+          "双精度下除法和寄存器压力较高，可能限制 occupancy",
+          "若 N 较小，GPU 可能因批量不足而利用率不高；需跨多个时间步/多个实例批处理才更划算",
+          "转置本身有代价，需要与 sweep 融合或采用双布局减少额外搬运"
+        ],
+        "expected_speedup": "相对单线程 CPU：8x-40x；相对优化后的多核 CPU：1.5x-8x。若直接 naive port（不改算法、不改布局），收益可能很低甚至退化；采用 batched tridiagonal solver + 双布局后更可能接近上限。"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约 0.20-0.45 FLOPs/byte（原始实现）；若将 p/q 改为一维 scratch 并采用转置友好布局，可提升到约 0.35-0.70 FLOPs/byte。估算依据：前向消去每个网格点约 10-14 FLOPs（含若干 mul/add 和 1 次除法按 1 FLOP 口径计；若按硬件代价折算则更高），同时涉及读取邻域 3 个主场值、读取前一递推值、写 p/q，约 40-72B；回代每点约 2 FLOPs，读 p/q 和下一点、写当前点，约 24-32B。整体 AI 偏低，符合 memory/locality 主导特征。",
+        "cache_behavior": "1) Row sweep：对 v[i-1][j], v[i][j], v[i+1][j] 和 u[i][j] 的访问沿 j 连续，空间局部性较好，硬件预取有效；2) Column sweep：对 u[j][i-1], u[j][i], u[j][i+1] 和 v[j][i] 的访问沿 j 为 stride-N，单次只用到缓存行中的极少元素，缓存行利用率低；3) p/q 当前实现虽然访问连续，但作为 N*N 数组会产生大量写分配和容量占用，污染 LLC；4) 回代阶段逆序访问仍是线性/规则的，对 row sweep 影响不大，但对 column sweep 仍受 stride-N 限制；5) 若 N 较大，column sweep 还会增加 TLB miss 风险，因为跨页步进频繁；6) 双布局或显式转置可显著改善 column sweep 的 L1/L2/LLC 命中率和预取效果。",
+        "data_dependencies": [
+          "前向消去递推：p[i][j] 依赖 p[i][j-1]，q[i][j] 依赖 q[i][j-1]，因此单条线沿 j 串行",
+          "回代递推：v[j][i] 依赖 v[j+1][i]；u[i][j] 依赖 u[i][j+1]，因此单条线逆向串行",
+          "同一 sweep 内不同 i 的线彼此独立，可并行",
+          "时间步 t 之间存在全局依赖：t+1 依赖 t 的 u 输出，不能直接跨 t 并行",
+          "Column sweep 生成 v，Row sweep 消费 v 并更新 u，两个 sweep 之间存在阶段依赖",
+          "边界条件 u[i][0], u[i][n-1], v[0][i], v[n-1][i] 为固定值，可视为已知输入，不构成复杂同步"
+        ]
+      },
+      "cost": 0.05531225,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.08225175
+  }
+}

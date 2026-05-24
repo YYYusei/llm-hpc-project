@@ -1,0 +1,118 @@
+{
+  "program": "fdtd_2d",
+  "config": "Role-Swap V1 Neutral",
+  "s1_model": "gpt-4o",
+  "s2_model": "deepseek-v3-2-251201",
+  "s1_bottleneck_raw": "memory",
+  "s2_bottleneck_raw": "memory",
+  "s1_score": 61.533919597989936,
+  "classification": {
+    "s1_primary": "memory",
+    "s2_primary": "memory",
+    "ground_truth": "memory",
+    "changed": false,
+    "s1_matches_gt": true,
+    "s2_matches_gt": true,
+    "correction_type": "no-change"
+  },
+  "cost": 0.03221575,
+  "full_result": {
+    "code_name": "fdtd_2d",
+    "program_key": "fdtd_2d",
+    "prompt_type": "zero_shot",
+    "stage1": {
+      "model": "gpt-4o",
+      "hotspots": [
+        {
+          "location": "kernel_fdtd_2d (lines 66-94)",
+          "estimated_time_percentage": "90%",
+          "reason": "This function contains the main computational loops that are executed for each time step, making it the primary consumer of execution time.",
+          "confidence": "high"
+        }
+      ],
+      "bottleneck_type": {
+        "primary": "memory",
+        "reasoning": "The code involves frequent access to large 2D arrays (ex, ey, hz) with non-contiguous memory access patterns, which can lead to cache misses and memory bandwidth limitations."
+      },
+      "gpu_suitability": {
+        "suitable": true,
+        "reasoning": "The problem involves regular data access patterns and independent operations across large data sets, which are well-suited for GPU parallelization.",
+        "recommended_approach": "Port the main computational loops to GPU using CUDA or OpenCL, focusing on maximizing occupancy and minimizing memory transfer overhead."
+      },
+      "cost": 0.00888125,
+      "bottleneck_raw": "memory"
+    },
+    "stage2": {
+      "model": "deepseek-v3-2-251201",
+      "validation": {},
+      "analysis": {
+        "primary_bottleneck": "memory",
+        "reasoning": "该程序存在严重的内存带宽瓶颈。主要问题包括：1) 对大型2D数组(ex, ey, hz)的频繁访问，每次迭代需要读取3-4个数组元素；2) 内存访问模式不连续，在嵌套循环中，内层循环访问同一列的不同行，导致缓存行利用率低；3) 数据重用性差，每个数组元素在时间维度上被多次访问但空间局部性差；4) 循环结构导致多次遍历相同数组，增加了内存带宽压力。"
+      },
+      "detailed_optimizations": [
+        {
+          "target": "内存访问模式优化",
+          "technique": "循环分块(Tiling)",
+          "code_changes": "对三个主要计算循环应用循环分块，将大数组分割成适合缓存的小块。\n// 分块后的ey更新循环\nint tile_size = 32; // 根据L1缓存大小调整\nfor (i = 1; i < _PB_NX; i += tile_size) {\n  for (j = 0; j < _PB_NY; j += tile_size) {\n    int i_end = min(i + tile_size, _PB_NX);\n    int j_end = min(j + tile_size, _PB_NY);\n    for (int ii = i; ii < i_end; ii++) {\n      for (int jj = j; jj < j_end; jj++) {\n        ey[ii][jj] = ey[ii][jj] - SCALAR_VAL(0.5)*(hz[ii][jj]-hz[ii-1][jj]);\n      }\n    }\n  }\n}",
+          "expected_speedup": "1.5-3x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "数据布局优化",
+          "technique": "数组转置/SoA布局",
+          "code_changes": "将数组从AoS布局改为SoA布局，提高内存访问连续性。\n// 原布局: DATA_TYPE ex[NX][NY];\n// 新布局: DATA_TYPE* ex = malloc(NX*NY*sizeof(DATA_TYPE));\n// 访问方式: ex[i*NY + j] 改为 ex[j*NX + i] (转置)\n// 或者使用结构数组: struct Field { DATA_TYPE ex, ey, hz; } fields[NX*NY];",
+          "expected_speedup": "1.2-2x",
+          "difficulty": "hard"
+        },
+        {
+          "target": "循环融合",
+          "technique": "合并相关计算循环",
+          "code_changes": "将三个主要计算循环融合，减少对同一数组的多次遍历。\n// 融合ey和ex更新循环\nfor (i = 1; i < _PB_NX; i++) {\n  for (j = 1; j < _PB_NY; j++) {\n    ey[i][j] = ey[i][j] - SCALAR_VAL(0.5)*(hz[i][j]-hz[i-1][j]);\n    ex[i][j] = ex[i][j] - SCALAR_VAL(0.5)*(hz[i][j]-hz[i][j-1]);\n  }\n}\n// 边界条件需要单独处理",
+          "expected_speedup": "1.3-1.8x",
+          "difficulty": "medium"
+        },
+        {
+          "target": "向量化优化",
+          "technique": "SIMD指令和编译器提示",
+          "code_changes": "添加编译指导语句和内存对齐。\n#pragma omp simd\nfor (j = 0; j < _PB_NY; j++) {\n  ey[0][j] = _fict_[t];\n}\n// 使用restrict关键字\nvoid kernel_fdtd_2d(..., DATA_TYPE** restrict ex, ...)\n// 确保数组内存对齐到64字节边界",
+          "expected_speedup": "1.2-2x (取决于硬件)",
+          "difficulty": "easy"
+        }
+      ],
+      "gpu_implementation": {
+        "suitable": true,
+        "strategy": "1) 时间步循环在CPU端，空间网格在GPU端并行；2) 每个线程块处理一个2D分块；3) 使用双缓冲技术避免时间步之间的同步问题；4) 采用2D线程网格布局映射到空间网格。",
+        "data_layout": "1) 使用SoA布局：将ex, ey, hz分别存储在连续内存中；2) 使用纹理内存或只读缓存存储_fict_数组；3) 考虑使用共享内存进行分块计算；4) 确保内存对齐到128字节。",
+        "challenges": [
+          "时间步之间的数据依赖需要同步",
+          "边界条件处理需要特殊处理",
+          "GPU内存带宽可能成为新瓶颈",
+          "需要优化内存合并访问"
+        ],
+        "expected_speedup": "10-50x (相对于优化后的CPU版本)，取决于GPU型号和问题规模"
+      },
+      "performance_analysis": {
+        "arithmetic_intensity": "约0.5-1.0 FLOPs/byte",
+        "cache_behavior": "1) 缓存行利用率低：内层循环访问同一列，导致每次缓存行加载只使用一个元素；2) 容量缺失严重：数组大小通常远大于缓存容量；3) 冲突缺失：由于步长访问模式可能导致缓存组冲突；4) 时间局部性差：每个元素在时间步之间被重用，但空间局部性差。",
+        "data_dependencies": [
+          "流依赖：ey[i][j]依赖于hz[i][j]和hz[i-1][j]",
+          "流依赖：ex[i][j]依赖于hz[i][j]和hz[i][j-1]",
+          "反依赖：hz[i][j]依赖于ex[i][j+1], ex[i][j], ey[i+1][j], ey[i][j]",
+          "跨迭代依赖：时间步t+1依赖于时间步t的结果"
+        ]
+      },
+      "cost": 0.0233345,
+      "bottleneck_raw": "memory"
+    },
+    "classification": {
+      "s1_primary": "memory",
+      "s2_primary": "memory",
+      "ground_truth": "memory",
+      "changed": false,
+      "s1_matches_gt": true,
+      "s2_matches_gt": true,
+      "correction_type": "no-change"
+    },
+    "total_cost": 0.03221575
+  }
+}
