@@ -1,0 +1,3581 @@
+==========================================================================================
+REPORT: results/cuda_2mm_pipeline/2mm_pipeline_report.json
+kernel=2mm  timestamp=2026-05-25T19:12:21.005358  total_cost=0.0818545
+
+--- DIRECT ---
+  strategy: None
+  result: {'cpu_ms': 2658.006, 'gpu_ms': 28.8048, 'speedup': 92.28, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: None
+  result: {'cpu_ms': 2086.321, 'gpu_ms': 2423.8865, 'speedup': 0.86, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of tmp[i][j] in the first loop nest is independent for each (i, j) pair.",
+    "The computation of D[i][j] in the second loop nest depends on the values of tmp[i][k] for all k, but each (i, j) pair is independent."
+  ],
+  "parallelization_challenges": [
+    "Efficiently managing memory access patterns to maximize coalesced memory accesses.",
+    "Ensuring that the temporary storage (tmp) does not become a bottleneck due to limited shared memory on the GPU.",
+    "Balancing the workload across GPU threads to avoid underutilization."
+  ],
+  "recommended_strategy": "Use a two-step kernel launch approach. First, parallelize the computation of tmp[i][j] using a grid of threads where each thread computes one element of tmp. Use shared memory to cache portions of A and B to reduce global memory accesses. Second, parallelize the computation of D[i][j] using another grid of threads, where each thread computes one element of D. Again, use shared memory to cache portions of tmp and C to optimize memory access patterns.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "compute-bound (for realistic sizes), with memory-traffic sensitivity if tmp is materialized in global memory",
+    "data_dependencies": [
+      "Stage 1 (tmp = alpha*A*B): each tmp[i][j] is independent across (i,j); reduction over k.",
+      "Stage 2 (D = tmp*C + beta*D): each D[i][j] is independent across (i,j); reduction over k (k spans nj).",
+      "Inter-stage dependency: Stage 2 requires tmp (or an equivalent representation) produced by Stage 1. If tmp is explicitly stored, Stage 2 depends on global-memory tmp; if fused, Stage 2 depends on partial products computed on-the-fly."
+    ],
+    "what_was_wrong_or_incomplete": [
+      "Calling it purely memory-bound is generally incorrect: both loops are GEMM-like with high arithmetic intensity; on GPUs they are typically compute-bound when tiled well.",
+      "The recommended 'one thread computes one element' is not a good GPU GEMM strategy for doubles: it underutilizes data reuse and increases global loads; you want block tiling + register/shared-memory reuse.",
+      "Shared memory cannot realistically hold large tiles of tmp for the whole problem; tmp is ni*nj and will not fit. You either (a) write tmp to global and run a second GEMM, or (b) fuse with blocking so only a small tmp-tile lives in registers/shared memory at a time.",
+      "Dependency analysis missed that the main performance risk is writing/reading tmp from global memory (extra full matrix traffic) and that fusion can remove it."
+    ],
+    "parallelization_challenges": [
+      "Achieving GEMM-class tiling (coalesced loads, reuse of A/B/C) for double precision.",
+      "Avoiding the global-memory round-trip of tmp (write tmp, then read tmp) if bandwidth/footprint is large.",
+      "Choosing tile sizes that fit shared memory/register limits and maintain occupancy.",
+      "Handling beta scaling of D efficiently (fuse into epilogue)."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Prefer a fused blocked 2-stage GEMM (streaming tmp tiles) when tmp traffic is a concern; otherwise use two cuBLAS GEMMs (fastest/lowest effort).",
+    "description": [
+      "Baseline (recommended for production):",
+      "  1) tmp = alpha * A * B using cublasDgemm.",
+      "  2) D = tmp * C + beta * D using cublasDgemm.",
+      "This leverages highly tuned kernels and is usually optimal unless tmp is too large to store or you must reduce memory traffic.",
+      "",
+      "Concrete custom-kernel option (single fused kernel):",
+      "  Compute D tile-by-tile. For each output tile D[i0:i0+TM, j0:j0+TN], iterate over k2 in [0,nj) in blocks (KB2).",
+      "  For each k2-block, first compute a small tmp_tile = alpha * A_tile( TM x nk ) * B_tile( nk x KB2 ) for the current i-tile and k2-block (this is a GEMM microkernel).",
+      "  Then immediately accumulate D_tile += tmp_tile (TM x KB2) * C_tile(KB2 x TN).",
+      "  tmp_tile never goes to global memory; it lives in registers (or shared memory) for the duration of the k2-block.",
+      "  Finally apply beta scaling in the epilogue: D_tile = beta*D_tile_original + accumulated."
+    ],
+    "kernel_design": {
+      "grid_mapping": {
+        "block_maps_to": "one output tile of D of size TM x TN",
+        "grid_dim": "dim3(grid_x = ceil(nl/TN), grid_y = ceil(ni/TM))",
+        "block_dim": "2D threadblock; e.g., 256 threads arranged to cover the TMxTN tile via per-thread multiple outputs"
+      },
+      "tiling_parameters_example_fp64": {
+        "TM": 64,
+        "TN": 64,
+        "KB2": 16,
+        "K1": 16,
+        "notes": "TM/TN/KB2/K1 must be tuned for the target GPU; fp64 typically uses smaller tiles than fp32 due to register pressure."
+      },
+      "memory_plan": {
+        "shared_memory_buffers": [
+          "Asub: TM x K1 tile of A (double)",
+          "Bsub: K1 x KB2 tile of B (double)",
+          "Csub: KB2 x TN tile of C (double)"
+        ],
+        "register_buffers": [
+          "Dacc: per-thread fragment of D tile (accumulators)",
+          "Ttmp: per-thread fragment of tmp_tile for current KB2 slice (optional; can be kept as intermediate accumulators)"
+        ],
+        "coalescing": [
+          "Load A/B/C tiles cooperatively with vectorized loads where possible.",
+          "Store D tile coalesced; apply beta in the final store (read D once)."
+        ]
+      },
+      "compute_schedule": [
+        "For each block (i0,j0): initialize Dacc = 0.",
+        "For k2 = 0..nj-1 step KB2:",
+        "  1) Compute tmp_tile(TM x KB2):",
+        "     tmp_tile = 0",
+        "     For k1 = 0..nk-1 step K1:",
+        "       load Asub(TM x K1) and Bsub(K1 x KB2) into shared",
+        "       synchronize",
+        "       tmp_tile += Asub * Bsub (micro-tiled; accumulate in registers)",
+        "  2) Multiply-accumulate into Dacc:",
+        "     load Csub(KB2 x TN) into shared",
+        "     synchronize",
+        "     Dacc += (alpha * tmp_tile) * Csub",
+        "After all k2 blocks: write D = beta*D + Dacc (single global read of D, single write)."
+      ],
+      "synchronization": [
+        "__syncthreads() after each shared-memory tile load (A/B and C).",
+        "No inter-block synchronization needed."
+      ],
+      "numerical_notes": [
+        "Order of operations differs from the two-pass CPU code; results may differ slightly due to FP associativity.",
+        "If strict reproducibility is required, prefer two separate GEMMs."
+      ]
+    }
+  },
+  "expected_speedup": "If replacing naive GPU kernels: often 10x-100x vs CPU single-thread, and several-x vs naive 'one thread per element'. Versus two cuBLAS GEMMs, a fused kernel may be faster only when tmp global-memory traffic is a dominant cost (problem-size dependent); otherwise cuBLAS is typically best.",
+  "implementation_notes": [
+    "Fastest practical path: call cuBLAS dgemm twice (tmp = alpha*A*B, then D = tmp*C + beta*D). This already uses optimal tiling and avoids reinventing GEMM.",
+    "If memory footprint or bandwidth of tmp is problematic, implement the fused blocked kernel described (stream tmp tiles).",
+    "Use column-major (cuBLAS default) or adjust leading dimensions/transposes accordingly; ensure contiguous access for the fastest-moving dimension.",
+    "Tune TM/TN/KB2/K1 for the specific GPU (SM count, shared memory size, fp64 throughput). Start with 64x64 output tiles and KB2=16 for fp64, then profile.",
+    "Use restrict-qualified pointers and align allocations; consider using LDG/read-only cache for A/B/C if beneficial.",
+    "Fuse beta scaling into the epilogue to avoid a separate kernel or extra pass over D.",
+    "If ni/nl are not multiples of tile sizes, add boundary checks on loads/stores (predication)."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_2mm_pipeline/2mm_direct.cu]:
+LLM Generated code (kernels + host launcher mm2_gpu) ============
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+
+#ifndef TILE_M
+#define TILE_M 16
+#endif
+#ifndef TILE_N
+#define TILE_N 16
+#endif
+#ifndef TILE_K
+#define TILE_K 16
+#endif
+
+static inline void cudaCheck(cudaError_t e, const char* msg) {
+  if (e != cudaSuccess) {
+    std::fprintf(stderr, "CUDA error (%s): %s\n", msg, cudaGetErrorString(e));
+    std::abort();
+  }
+}
+
+// tmp(ni x nj) = alpha * A(ni x nk) * B(nk x nj)
+__global__ void k_tmp_gemm(int ni, int nj, int nk,
+                           double alpha,
+                           const double* __restrict__ A,
+                           const double* __restrict__ B,
+                           double* __restrict__ tmp) {
+  // 2D tile over (i,j)
+  int row = blockIdx.y * TILE_M + threadIdx.y; // i
+  int col = blockIdx.x * TILE_N + threadIdx.x; // j
+
+  __shared__ double As[TILE_M][TILE_K];
+  __shared__ double Bs[TILE_K][TILE_N];
+
+  double acc = 0.0;
+
+  // Loop over K tiles
+  for (int kt = 0; kt < nk; kt += TILE_K) {
+    // Load A tile: As[ty][tx] corresponds to A[row][kt + tx]
+    int a_col = kt + threadIdx.x;
+    if (row < ni && a_col < nk) {
+      As[threadIdx.y][threadIdx.x] = A[row * nk + a_col];
+    } else {
+      As[threadIdx.y][threadIdx.x] = 0.0;
+    }
+
+    // Load B tile: Bs[ty][tx] corresponds to B[kt + ty][col]
+    int b_row = kt + threadIdx.y;
+    if (b_row < nk && col < nj) {
+      Bs[threadIdx.y][threadIdx.x] = B[b_row * nj + col];
+    } else {
+      Bs[threadIdx.y][threadIdx.x] = 0.0;
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int k = 0; k < TILE_K; ++k) {
+      acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    }
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nj) {
+    tmp[row * nj + col] = alpha * acc;
+  }
+}
+
+// D(ni x nl) = tmp(ni x nj) * C(nj x nl) + beta * D
+__global__ void k_D_gemm(int ni, int nj, int nl,
+                         double beta,
+                         const double* __restrict__ tmp,
+                         const double* __restrict__ C,
+                         double* __restrict__ D) {
+  int row = blockIdx.y * TILE_M + threadIdx.y; // i
+  int col = blockIdx.x * TILE_N + threadIdx.x; // j over nl
+
+  __shared__ double Ts[TILE_M][TILE_K]; // tmp tile (M x K)
+  __shared__ double Cs[TILE_K][TILE_N]; // C tile   (K x N)
+
+  double acc = 0.0;
+
+  for (int kt = 0; kt < nj; kt += TILE_K) {
+    // Load tmp tile: Ts[ty][tx] = tmp[row][kt + tx]
+    int t_col = kt + threadIdx.x;
+    if (row < ni && t_col < nj) {
+      Ts[threadIdx.y][threadIdx.x] = tmp[row * nj + t_col];
+    } else {
+      Ts[threadIdx.y][threadIdx.x] = 0.0;
+    }
+
+    // Load C tile: Cs[ty][tx] = C[kt + ty][col]
+    int c_row = kt + threadIdx.y;
+    if (c_row < nj && col < nl) {
+      Cs[threadIdx.y][threadIdx.x] = C[c_row * nl + col];
+    } else {
+      Cs[threadIdx.y][threadIdx.x] = 0.0;
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int k = 0; k < TILE_K; ++k) {
+      acc += Ts[threadIdx.y][k] * Cs[k][threadIdx.x];
+    }
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nl) {
+    double d = D[row * nl + col];
+    D[row * nl + col] = acc + beta * d;
+  }
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D) {
+  // Allocate tmp on device
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  cudaCheck(cudaMalloc((void**)&tmp, tmp_bytes), "cudaMalloc(tmp)");
+
+  // Launch tmp = alpha*A*B
+  dim3 block1(TILE_N, TILE_M, 1);
+  dim3 grid1((nj + TILE_N - 1) / TILE_N,
+             (ni + TILE_M - 1) / TILE_M,
+             1);
+  k_tmp_gemm<<<grid1, block1>>>(ni, nj, nk, alpha, A, B, tmp);
+  cudaCheck(cudaGetLastError(), "k_tmp_gemm launch");
+
+  // Launch D = tmp*C + beta*D
+  dim3 block2(TILE_N, TILE_M, 1);
+  dim3 grid2((nl + TILE_N - 1) / TILE_N,
+             (ni + TILE_M - 1) / TILE_M,
+             1);
+  k_D_gemm<<<grid2, block2>>>(ni, nj, nl, beta, tmp, C, D);
+  cudaCheck(cudaGetLastError(), "k_D_gemm launch");
+
+  // Ensure completion before freeing tmp
+  cudaCheck(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+
+  cudaCheck(cudaFree(tmp), "cudaFree(tmp)");
+}
+
+// ============
+
+  >>> GENERATED CUDA (full) [results/cuda_2mm_pipeline/2mm_full.cu]:
+LLM Generated code (kernels + host launcher mm2_gpu) ============
+#include <cuda_runtime.h>
+#include <cstdio>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                 \
+  cudaError_t err__ = (call);                                  \
+  if (err__ != cudaSuccess) {                                  \
+    fprintf(stderr, "CUDA error %s:%d: %s\n",                  \
+            __FILE__, __LINE__, cudaGetErrorString(err__));    \
+  }                                                            \
+} while (0)
+#endif
+
+// Fused blocked 2-stage GEMM:
+// D = alpha*A*B*C + beta*D
+// Row-major matrices:
+// A: ni x nk, B: nk x nj, C: nj x nl, D: ni x nl
+//
+// Strategy implemented:
+// - One threadblock computes one TM x TN tile of D.
+// - Iterate k2 over nj in blocks of KB2.
+//   For each k2-block:
+//     1) Compute tmp_tile(TM x KB2) = sum_{k1} A(TM x K1) * B(K1 x KB2)
+//     2) Accumulate Dacc(TM x TN) += alpha * tmp_tile(TM x KB2) * C(KB2 x TN)
+// - Epilogue: D = beta*D + Dacc
+//
+// tmp_tile never stored to global memory.
+
+template<int TM, int TN, int KB2, int K1>
+__global__ void mm2_fused_kernel(int ni, int nj, int nk, int nl,
+                                 double alpha, double beta,
+                                 const double* __restrict__ A,
+                                 const double* __restrict__ B,
+                                 const double* __restrict__ C,
+                                 double* __restrict__ D)
+{
+  // Block maps to one output tile D[i0:i0+TM, j0:j0+TN]
+  const int i0 = blockIdx.y * TM;
+  const int j0 = blockIdx.x * TN;
+
+  // 2D threadblock: 16x16 = 256 threads
+  const int tx = threadIdx.x; // [0,15]
+  const int ty = threadIdx.y; // [0,15]
+  const int tid = ty * blockDim.x + tx;
+
+  // Each thread computes a 4x4 micro-tile of Dacc within the TMxTN tile.
+  // With TM=TN=64 and blockDim=16x16, each thread covers:
+  // rows: ty*4 + {0..3}, cols: tx*4 + {0..3}
+  constexpr int RM = TM / 16; // 4
+  constexpr int RN = TN / 16; // 4
+
+  const int rBase = ty * RM;
+  const int cBase = tx * RN;
+
+  double Dacc[RM][RN];
+#pragma unroll
+  for (int rr = 0; rr < RM; ++rr)
+#pragma unroll
+    for (int cc = 0; cc < RN; ++cc)
+      Dacc[rr][cc] = 0.0;
+
+  extern __shared__ double shmem[];
+  double* Asub = shmem;                              // TM*K1
+  double* Bsub = Asub + TM * K1;                     // K1*KB2
+  double* Csub = Bsub + K1 * KB2;                    // KB2*TN
+
+  // Loop over k2 blocks (nj dimension) in chunks of KB2
+  for (int k2 = 0; k2 < nj; k2 += KB2) {
+
+    // Per-thread tmp fragment for current KB2 slice:
+    // tmpFrag[rr][kb] corresponds to tmp_tile(i0+rBase+rr, k2+kb)
+    double tmpFrag[RM][KB2];
+#pragma unroll
+    for (int rr = 0; rr < RM; ++rr)
+#pragma unroll
+      for (int kb = 0; kb < KB2; ++kb)
+        tmpFrag[rr][kb] = 0.0;
+
+    // Compute tmp_tile(TM x KB2) via k1 blocking over nk
+    for (int k1 = 0; k1 < nk; k1 += K1) {
+
+      // Cooperative load Asub (TM x K1)
+      for (int idx = tid; idx < TM * K1; idx += blockDim.x * blockDim.y) {
+        int r = idx / K1;
+        int c = idx - r * K1;
+        int gr = i0 + r;
+        int gc = k1 + c;
+        Asub[idx] = (gr < ni && gc < nk) ? A[gr * nk + gc] : 0.0;
+      }
+
+      // Cooperative load Bsub (K1 x KB2)
+      for (int idx = tid; idx < K1 * KB2; idx += blockDim.x * blockDim.y) {
+        int r = idx / KB2;
+        int c = idx - r * KB2;
+        int gr = k1 + r;
+        int gc = k2 + c;
+        Bsub[idx] = (gr < nk && gc < nj) ? B[gr * nj + gc] : 0.0;
+      }
+
+      __syncthreads();
+
+      // Micro-kernel: accumulate tmpFrag += Asub(rows) * Bsub
+#pragma unroll
+      for (int kk = 0; kk < K1; ++kk) {
+        double aReg[RM];
+#pragma unroll
+        for (int rr = 0; rr < RM; ++rr) {
+          int r = rBase + rr;
+          aReg[rr] = Asub[r * K1 + kk];
+        }
+
+#pragma unroll
+        for (int kb = 0; kb < KB2; ++kb) {
+          double b = Bsub[kk * KB2 + kb];
+#pragma unroll
+          for (int rr = 0; rr < RM; ++rr) {
+            tmpFrag[rr][kb] += aReg[rr] * b;
+          }
+        }
+      }
+
+      __syncthreads();
+    } // end k1 loop
+
+    // Load Csub (KB2 x TN) for this k2 block
+    for (int idx = tid; idx < KB2 * TN; idx += blockDim.x * blockDim.y) {
+      int r = idx / TN;
+      int c = idx - r * TN;
+      int gr = k2 + r;
+      int gc = j0 + c;
+      Csub[idx] = (gr < nj && gc < nl) ? C[gr * nl + gc] : 0.0;
+    }
+
+    __syncthreads();
+
+    // Accumulate Dacc += alpha * tmpFrag * Csub
+#pragma unroll
+    for (int kb = 0; kb < KB2; ++kb) {
+      double cReg[RN];
+#pragma unroll
+      for (int cc = 0; cc < RN; ++cc) {
+        int c = cBase + cc;
+        cReg[cc] = Csub[kb * TN + c];
+      }
+
+#pragma unroll
+      for (int rr = 0; rr < RM; ++rr) {
+        double t = alpha * tmpFrag[rr][kb];
+#pragma unroll
+        for (int cc = 0; cc < RN; ++cc) {
+          Dacc[rr][cc] += t * cReg[cc];
+        }
+      }
+    }
+
+    __syncthreads();
+  } // end k2 loop
+
+  // Epilogue: D = beta*D + Dacc
+#pragma unroll
+  for (int rr = 0; rr < RM; ++rr) {
+    int gr = i0 + rBase + rr;
+    if (gr >= ni) continue;
+#pragma unroll
+    for (int cc = 0; cc < RN; ++cc) {
+      int gc = j0 + cBase + cc;
+      if (gc >= nl) continue;
+      double d0 = D[gr * nl + gc];
+      D[gr * nl + gc] = beta * d0 + Dacc[rr][cc];
+    }
+  }
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D)
+{
+  // Allocate tmp as required by the interface (not materialized by fused kernel).
+  // This follows the requirement to allocate/free tmp inside mm2_gpu.
+  double* tmp = nullptr;
+  size_t tmpBytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc(&tmp, tmpBytes));
+
+  // Launch fused kernel (tmp not used/stored).
+  constexpr int TM  = 64;
+  constexpr int TN  = 64;
+  constexpr int KB2 = 16;
+  constexpr int K1  = 16;
+
+  dim3 block(16, 16, 1);
+  dim3 grid((nl + TN - 1) / TN, (ni + TM - 1) / TM, 1);
+
+  size_t shmemBytes = (TM * K1 + K1 * KB2 + KB2 * TN) * sizeof(double);
+
+  mm2_fused_kernel<TM, TN, KB2, K1><<<grid, block, shmemBytes>>>(
+      ni, nj, nk, nl, alpha, beta, A, B, C, D);
+
+  CUDA_CHECK(cudaGetLastError());
+
+  CUDA_CHECK(cudaFree(tmp));
+}
+
+// ============
+
+==========================================================================================
+REPORT: results/cuda_2mm_pipeline/run1/2mm_pipeline_report.json
+kernel=2mm  timestamp=2026-05-25T19:58:47.461314  total_cost=0.075187
+
+--- DIRECT ---
+  strategy: 2kernels
+  result: {'cpu_ms': 2314.081, 'gpu_ms': 26.441, 'speedup': 87.52, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: fused+shared-mem+1kernels
+  result: {'cpu_ms': 2366.86, 'gpu_ms': 2622.7378, 'speedup': 0.9, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of tmp[i][j] in the first loop nest depends on the values of A[i][k] and B[k][j].",
+    "The computation of D[i][j] in the second loop nest depends on the values of tmp[i][k] and C[k][j].",
+    "There is a read-after-write dependency between the two loop nests: the second loop nest reads from tmp, which is written in the first loop nest."
+  ],
+  "parallelization_challenges": [
+    "Ensuring coalesced memory access patterns for efficient memory bandwidth utilization.",
+    "Managing shared memory usage to store intermediate results like tmp[i][j] to reduce global memory accesses.",
+    "Handling the dependency between the two loop nests, as the second loop nest depends on the completion of the first."
+  ],
+  "recommended_strategy": "Use a two-phase kernel launch strategy. In the first kernel, parallelize the computation of tmp[i][j] using a 2D grid of threads, where each thread computes one element of tmp. Use shared memory to store portions of A and B to improve memory access patterns. In the second kernel, parallelize the computation of D[i][j] using another 2D grid of threads, where each thread computes one element of D. Again, use shared memory to store portions of tmp and C to optimize memory accesses. Ensure synchronization between the two kernel launches.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "compute-bound (if implemented with tiled GEMM); memory-bound only for naive/non-tiled kernels or if tmp is materialized to global memory",
+    "data_dependencies": [
+      "Within GEMM1: tmp[i][j] = alpha * sum_k A[i][k]*B[k][j]. Each (i,j) is independent; reduction over k is local to that output element/tile.",
+      "Within GEMM2: D[i][j] = beta*D[i][j] + sum_k tmp[i][k]*C[k][j]. Each (i,j) is independent; reduction over k is local.",
+      "Between GEMM1 and GEMM2: true RAW dependency via tmp. However, tmp does not need to be globally materialized; it can be produced and consumed in a fused/tiled pipeline."
+    ],
+    "what_was_incomplete_or_wrong": [
+      "Calling it memory-bound is not generally correct: GEMM is typically compute-bound on GPUs when tiled (high arithmetic intensity). It becomes memory-bound mainly if you do a naive one-thread-per-output without effective tiling/reuse, or if tmp is written to and reread from global memory.",
+      "The suggested two-kernel approach is correct functionally but can be suboptimal because it forces tmp to global memory (large extra traffic).",
+      "Shared memory is useful, but the key is register/shared tiling and reuse across k; also consider fusing the two GEMMs to avoid tmp global traffic."
+    ],
+    "key_cost_driver": "Whether tmp is stored in global memory. Materializing tmp adds ~2*ni*nj global memory traffic (write+read) plus cache pollution; fusing can remove that at the cost of more on-chip storage and more complex scheduling."
+  },
+  "gpu_strategy": {
+    "approach": "Prefer a fused blocked kernel that computes D tiles directly without writing tmp to global memory (streaming over nj). Fall back to two-kernel GEMM (cuBLAS) if fusion is too complex or dimensions are large/irregular.",
+    "description": "Compute D in tiles (BMxBN). For each D-tile, iterate over k2 in [0,nj) in chunks BK2. For each chunk, compute a small tmp-tile fragment = alpha*(A_tile * B_tile) for the corresponding i-range and k2-range, keep it in registers, then immediately multiply by C_tile (k2-range x j-range) and accumulate into D registers. Finally write D = beta*D + accum. This removes global tmp and turns the whole operation into a pipelined GEMM(GEMM) with on-chip intermediates.",
+    "kernel_design": {
+      "grid_mapping": {
+        "gridDim.x": "ceil(nl / BN)  (tiles over D columns)",
+        "gridDim.y": "ceil(ni / BM)  (tiles over D rows)",
+        "block": "2D threadblock (e.g., 256 threads) cooperating on one BMxBN tile of D"
+      },
+      "recommended_tile_sizes_fp64": {
+        "BM": 64,
+        "BN": 64,
+        "BK1": 16,
+        "BK2": 16,
+        "notes": "FP64 uses more registers; start with 64x64 tiles and 16-depth K tiles. Adjust based on occupancy/register pressure."
+      },
+      "memory_usage": {
+        "shared_memory": [
+          "A_sh[BM][BK1] for A tile (i x k1)",
+          "B_sh[BK1][BK2] for B tile (k1 x k2) for current k1,k2 chunk",
+          "C_sh[BK2][BN] for C tile (k2 x j)"
+        ],
+        "registers": [
+          "tmp_reg[TM][TK2] per thread (small fragment of tmp for its i-subtile and k2-subtile)",
+          "acc_reg[TM][TN] per thread (accumulator for D subtile)"
+        ],
+        "global_memory": [
+          "Read A, B, C; read+write D. No global tmp."
+        ]
+      },
+      "computation_structure": [
+        "Each block computes one D tile: rows i0..i0+BM-1, cols j0..j0+BN-1.",
+        "Initialize acc_reg = 0.",
+        "For k2 = 0..nj-1 step BK2:",
+        "  1) Load C_sh[k2:k2+BK2, j0:j0+BN] (coalesced).",
+        "  2) Compute tmp fragment for this k2-chunk by looping k1 = 0..nk-1 step BK1:",
+        "     - Load A_sh[i0:i0+BM, k1:k1+BK1] (coalesced along k1).",
+        "     - Load B_sh[k1:k1+BK1, k2:k2+BK2] (coalesced along k2).",
+        "     - tmp_reg += alpha * (A_sh * B_sh)  (a small GEMM producing BMxBK2 fragment, distributed across threads).",
+        "  3) acc_reg += tmp_reg * C_sh  (GEMM: (BMxBK2)*(BK2xBN) -> BMxBN).",
+        "After k2 loop: write D = beta*D + acc_reg (read D once, scale, add, store)."
+      ],
+      "synchronization": [
+        "__syncthreads() after each shared-memory tile load (A_sh/B_sh/C_sh) before compute that uses it.",
+        "No global synchronization needed; single kernel."
+      ],
+      "coalescing_and_layout": [
+        "Assumes row-major as in C: A[i][k] contiguous in k, B[k][j] contiguous in j, C[k][j] contiguous in j, D[i][j] contiguous in j.",
+        "Map threads so global loads of B and C are along their contiguous (second) dimension for coalescing.",
+        "Use vectorized loads (double2) when BN/BK2 multiples allow and alignment is guaranteed."
+      ],
+      "alternative_if_not_fusing": {
+        "two_kernel": [
+          "Kernel1: tmp = alpha*A*B using a standard tiled GEMM kernel (or cublasDgemm).",
+          "Kernel2: D = beta*D + tmp*C using tiled GEMM (or cublasDgemm with beta)."
+        ],
+        "note": "This is simpler and often very fast with cuBLAS, but pays the global tmp write+read."
+      }
+    }
+  },
+  "expected_speedup": "Versus a naive GPU implementation (one thread per output, no tiling), 10x–50x is typical. Versus a good two-kernel cuBLAS approach, fusion may give ~1.1x–1.5x by eliminating tmp global traffic (best when ni*nj is large and memory bandwidth is a limiter). If compute is dominant (large nk and nj), cuBLAS two-GEMM may already be near peak and fusion gains may be modest.",
+  "implementation_notes": [
+    "If you can use libraries: the highest-confidence solution is two cuBLAS DGEMMs: tmp = alpha*A*B (beta=0), then D = tmp*C + beta*D. This is usually near-optimal on NVIDIA GPUs.",
+    "Fusion is worthwhile when tmp is large and memory traffic is a concern, but it is significantly more complex and may reduce occupancy due to register pressure in FP64.",
+    "Start with conservative per-thread micro-tiles (e.g., each thread computes TMxTN = 4x4 outputs) to balance registers and ILP.",
+    "Use cp.async / pipelined shared-memory loads on Ampere+ to overlap global memory with compute (double-buffer A/B/C tiles).",
+    "Handle edge tiles with bounds checks or masked loads/stores.",
+    "Consider using Tensor Cores only if you can tolerate reduced precision (not applicable for strict FP64).",
+    "If dimensions are small, kernel launch overhead dominates; prefer cuBLASLt heuristics or fuse only for sufficiently large problems."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_2mm_pipeline/run1/2mm_direct.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+
+#define CUDA_CHECK(call)                                                     \
+  do {                                                                       \
+    cudaError_t err__ = (call);                                              \
+    if (err__ != cudaSuccess) {                                              \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,          \
+              cudaGetErrorString(err__));                                    \
+      std::abort();                                                          \
+    }                                                                        \
+  } while (0)
+
+static __global__ void k_tmp_alpha_AB(int ni, int nj, int nk,
+                                      double alpha,
+                                      const double* __restrict__ A,
+                                      const double* __restrict__ B,
+                                      double* __restrict__ tmp) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= ni || j >= nj) return;
+
+  double sum = 0.0;
+  const int a_row = i * nk;
+  for (int k = 0; k < nk; ++k) {
+    sum += A[a_row + k] * B[k * nj + j];
+  }
+  tmp[i * nj + j] = alpha * sum;
+}
+
+static __global__ void k_D_tmpC_plus_betaD(int ni, int nj, int nl,
+                                          double beta,
+                                          const double* __restrict__ tmp,
+                                          const double* __restrict__ C,
+                                          double* __restrict__ D) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // column in D (0..nl-1)
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // row in D (0..ni-1)
+  if (i >= ni || j >= nl) return;
+
+  double sum = 0.0;
+  const int tmp_row = i * nj;
+  for (int k = 0; k < nj; ++k) {
+    sum += tmp[tmp_row + k] * C[k * nl + j];
+  }
+  const int idx = i * nl + j;
+  D[idx] = sum + beta * D[idx];
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D) {
+  // Allocate device scratch: tmp (ni*nj)
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc((void**)&tmp, tmp_bytes));
+
+  // Launch 1: tmp = alpha * A * B
+  dim3 block1(16, 16);
+  dim3 grid1((nj + block1.x - 1) / block1.x,
+             (ni + block1.y - 1) / block1.y);
+  k_tmp_alpha_AB<<<grid1, block1>>>(ni, nj, nk, alpha, A, B, tmp);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Launch 2: D = tmp * C + beta * D
+  dim3 block2(16, 16);
+  dim3 grid2((nl + block2.x - 1) / block2.x,
+             (ni + block2.y - 1) / block2.y);
+  k_D_tmpC_plus_betaD<<<grid2, block2>>>(ni, nj, nl, beta, tmp, C, D);
+  CUDA_CHECK(cudaGetLastError());
+
+  CUDA_CHECK(cudaFree(tmp));
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_2mm_pipeline/run1/2mm_full.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                     \
+  cudaError_t _e = (call);                                        \
+  if (_e != cudaSuccess) {                                        \
+    fprintf(stderr, "CUDA error %s:%d: %s\n",                     \
+            __FILE__, __LINE__, cudaGetErrorString(_e));          \
+  }                                                               \
+} while (0)
+#endif
+
+// Strategy-faithful fused blocked kernel: computes D tile directly without global tmp.
+// Row-major: A[ni][nk], B[nk][nj], C[nj][nl], D[ni][nl].
+template<int BM, int BN, int BK1, int BK2>
+__global__ void mm2_fused_kernel(int ni, int nj, int nk, int nl,
+                                 double alpha, double beta,
+                                 const double* __restrict__ A,
+                                 const double* __restrict__ B,
+                                 const double* __restrict__ C,
+                                 double* __restrict__ D)
+{
+  // Tile origin for this block in D
+  const int i0 = blockIdx.y * BM;
+  const int j0 = blockIdx.x * BN;
+
+  // 2D threadblock mapping onto BMxBN tile
+  // Use 16x16 threads (256 threads) by default with BM=BN=64 => each thread computes 4x4 outputs.
+  const int tx = threadIdx.x; // [0..15]
+  const int ty = threadIdx.y; // [0..15]
+
+  constexpr int TM = BM / 16; // 4
+  constexpr int TN = BN / 16; // 4
+
+  const int iBase = i0 + ty * TM;
+  const int jBase = j0 + tx * TN;
+
+  // Shared memory tiles as specified by strategy
+  __shared__ double A_sh[BM][BK1];   // (i x k1)
+  __shared__ double B_sh[BK1][BK2];  // (k1 x k2)
+  __shared__ double C_sh[BK2][BN];   // (k2 x j)
+
+  // Accumulator for D subtile (TM x TN)
+  double acc[TM][TN];
+#pragma unroll
+  for (int ii = 0; ii < TM; ++ii)
+#pragma unroll
+    for (int jj = 0; jj < TN; ++jj)
+      acc[ii][jj] = 0.0;
+
+  // Loop over k2 in chunks BK2 (streaming over nj)
+  for (int k2 = 0; k2 < nj; k2 += BK2) {
+
+    // Load C_sh[k2:k2+BK2, j0:j0+BN] (coalesced along j)
+    // Each thread loads multiple elements to cover BK2*BN.
+    for (int kk = ty; kk < BK2; kk += blockDim.y) {
+      for (int jj = tx; jj < BN; jj += blockDim.x) {
+        const int gk = k2 + kk;
+        const int gj = j0 + jj;
+        double v = 0.0;
+        if (gk < nj && gj < nl) v = C[gk * nl + gj];
+        C_sh[kk][jj] = v;
+      }
+    }
+    __syncthreads();
+
+    // tmp_reg fragment for this thread: TM x BK2 (small fragment of tmp for its i-subtile and k2-subtile)
+    double tmp_reg[TM][BK2];
+#pragma unroll
+    for (int ii = 0; ii < TM; ++ii)
+#pragma unroll
+      for (int kk = 0; kk < BK2; ++kk)
+        tmp_reg[ii][kk] = 0.0;
+
+    // Compute tmp fragment for this k2-chunk by looping k1 in chunks BK1
+    for (int k1 = 0; k1 < nk; k1 += BK1) {
+
+      // Load A_sh[i0:i0+BM, k1:k1+BK1] (coalesced along k1)
+      // Cover BM*BK1 elements.
+      for (int ii = ty; ii < BM; ii += blockDim.y) {
+        for (int kk = tx; kk < BK1; kk += blockDim.x) {
+          const int gi = i0 + ii;
+          const int gk = k1 + kk;
+          double v = 0.0;
+          if (gi < ni && gk < nk) v = A[gi * nk + gk];
+          A_sh[ii][kk] = v;
+        }
+      }
+
+      // Load B_sh[k1:k1+BK1, k2:k2+BK2] (coalesced along k2)
+      // Cover BK1*BK2 elements.
+      for (int kk1 = ty; kk1 < BK1; kk1 += blockDim.y) {
+        for (int kk2 = tx; kk2 < BK2; kk2 += blockDim.x) {
+          const int gk1 = k1 + kk1;
+          const int gk2 = k2 + kk2;
+          double v = 0.0;
+          if (gk1 < nk && gk2 < nj) v = B[gk1 * nj + gk2];
+          B_sh[kk1][kk2] = v;
+        }
+      }
+
+      __syncthreads();
+
+      // tmp_reg += alpha * (A_sh * B_sh) for this thread's TM rows and all BK2 cols
+#pragma unroll
+      for (int kk1 = 0; kk1 < BK1; ++kk1) {
+        double a_frag[TM];
+#pragma unroll
+        for (int ii = 0; ii < TM; ++ii) {
+          const int li = (ty * TM) + ii; // local row within BM
+          a_frag[ii] = A_sh[li][kk1];
+        }
+#pragma unroll
+        for (int kk2 = 0; kk2 < BK2; ++kk2) {
+          const double b = B_sh[kk1][kk2];
+#pragma unroll
+          for (int ii = 0; ii < TM; ++ii) {
+            tmp_reg[ii][kk2] += alpha * a_frag[ii] * b;
+          }
+        }
+      }
+
+      __syncthreads();
+    } // k1
+
+    // acc_reg += tmp_reg * C_sh  (BMxBK2)*(BK2xBN) -> BMxBN, per-thread TMxTN
+#pragma unroll
+    for (int kk2 = 0; kk2 < BK2; ++kk2) {
+      double c_frag[TN];
+#pragma unroll
+      for (int jj = 0; jj < TN; ++jj) {
+        const int lj = (tx * TN) + jj; // local col within BN
+        c_frag[jj] = C_sh[kk2][lj];
+      }
+#pragma unroll
+      for (int ii = 0; ii < TM; ++ii) {
+        const double t = tmp_reg[ii][kk2];
+#pragma unroll
+        for (int jj = 0; jj < TN; ++jj) {
+          acc[ii][jj] += t * c_frag[jj];
+        }
+      }
+    }
+
+    __syncthreads();
+  } // k2
+
+  // Write D = beta*D + acc (read D once, scale, add, store)
+#pragma unroll
+  for (int ii = 0; ii < TM; ++ii) {
+    const int gi = iBase + ii;
+    if (gi >= ni) continue;
+#pragma unroll
+    for (int jj = 0; jj < TN; ++jj) {
+      const int gj = jBase + jj;
+      if (gj >= nl) continue;
+      const int idx = gi * nl + gj;
+      const double d0 = D[idx];
+      D[idx] = beta * d0 + acc[ii][jj];
+    }
+  }
+}
+
+// Host launcher required by prompt.
+// NOTE: tmp is allocated/freed as device scratch to satisfy interface requirement,
+// but the chosen strategy fuses and does not materialize tmp to global memory.
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D)
+{
+  // Allocate tmp scratch as requested (unused by fused strategy).
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc(&tmp, tmp_bytes));
+
+  // Strategy tile sizes (recommended for FP64)
+  constexpr int BM  = 64;
+  constexpr int BN  = 64;
+  constexpr int BK1 = 16;
+  constexpr int BK2 = 16;
+
+  dim3 block(16, 16, 1); // 256 threads, 2D threadblock
+  dim3 grid((nl + BN - 1) / BN,
+            (ni + BM - 1) / BM,
+            1);
+
+  mm2_fused_kernel<BM, BN, BK1, BK2><<<grid, block>>>(
+      ni, nj, nk, nl, alpha, beta, A, B, C, D);
+
+  CUDA_CHECK(cudaGetLastError());
+
+  CUDA_CHECK(cudaFree(tmp));
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_2mm_pipeline/run2/2mm_pipeline_report.json
+kernel=2mm  timestamp=2026-05-25T20:00:24.824508  total_cost=0.064113
+
+--- DIRECT ---
+  strategy: 2kernels
+  result: {'cpu_ms': 2317.213, 'gpu_ms': 26.2533, 'speedup': 88.26, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: shared-mem+2kernels
+  result: {'cpu_ms': 2414.012, 'gpu_ms': 28.92, 'speedup': 83.47, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "compute-bound",
+  "data_dependencies": [
+    "The computation of tmp[i][j] in the first loop nest depends on the completion of all iterations of the innermost loop over k.",
+    "The computation of D[i][j] in the second loop nest depends on the completion of all iterations of the innermost loop over k."
+  ],
+  "parallelization_challenges": [
+    "Ensuring that each thread has access to the correct elements of A, B, C, and D without causing race conditions.",
+    "Efficiently managing memory access patterns to maximize coalesced memory accesses and minimize memory latency.",
+    "Handling the potential for large memory usage due to the size of matrices A, B, C, D, and tmp."
+  ],
+  "recommended_strategy": "Use a two-stage parallelization approach. In the first stage, parallelize the computation of tmp[i][j] using a 2D grid of threads, where each thread computes one element of tmp. In the second stage, parallelize the computation of D[i][j] using another 2D grid of threads, where each thread computes one element of D. Utilize shared memory to store submatrices of A, B, and C to reduce global memory accesses and improve performance.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "mostly compute-bound at large sizes, but can become memory/latency-bound if matrices are small or poorly tiled; overall performance is dominated by GEMM-like arithmetic intensity when using shared-memory tiling",
+    "data_dependencies": [
+      "Within each output element tmp[i][j], the reduction over k must be completed before tmp[i][j] is final (true).",
+      "Within each output element D[i][j], the reduction over k (over nj) must be completed before D[i][j] is final (true).",
+      "There is a strict inter-kernel dependency: the second phase (D = tmp*C + beta*D) depends on completion (or at least availability of the needed tiles) of tmp from the first phase. In the given code structure, this is a full barrier between the two loop nests."
+    ],
+    "parallelism": [
+      "Across (i,j) output elements in each phase: embarrassingly parallel (no races if each thread/block owns distinct output tiles).",
+      "Across k within a single output element: reduction; parallelizing k requires either intra-block reduction or using tensor-core/GEMM primitives; the standard approach is block-tiled GEMM."
+    ],
+    "parallelization_challenges": [
+      "The main race-condition risk is only if multiple threads update the same output element; avoid by assigning each output element (or tile) to exactly one thread/block and doing the k-reduction privately.",
+      "Memory traffic: naive 'one thread per element' causes each thread to stream entire rows/cols from global memory (very inefficient). Need tiling and shared memory (or use cuBLAS GEMM).",
+      "Intermediate tmp storage is large and writing/reading it adds bandwidth cost; if tmp is materialized in global memory, the algorithm becomes two GEMMs plus an extra global round-trip for tmp."
+    ],
+    "recommended_strategy_correction": "The prior recommendation ('each thread computes one element') is incomplete: it ignores the need for k-tiling and reuse. The correct high-performance strategy is GEMM-style block tiling (shared memory / WMMA) for both multiplications, and optionally fusing the two GEMMs via a blocked pipeline to reduce tmp global-memory traffic."
+  },
+  "gpu_strategy": {
+    "approach": "Two-kernel GEMM (baseline, simplest and fast) OR fused blocked 2-stage GEMM (advanced, reduces tmp traffic). Prefer cuBLAS for production; otherwise implement tiled GEMM kernels.",
+    "description": [
+      "Baseline (recommended for concreteness and robustness):",
+      "1) Compute tmp = alpha * A * B using a tiled GEMM kernel (or cublasDgemm).",
+      "2) Compute D = tmp * C + beta * D using a tiled GEMM kernel with beta scaling fused into the epilogue (or cublasDgemm with beta).",
+      "This matches the dependency: kernel2 launches after kernel1 completes (same stream).",
+      "",
+      "Advanced (optional): fused blocked pipeline to avoid writing full tmp:",
+      "Compute D in tiles (BMxBN). For each D-tile, iterate over k0 in [0,nj) in chunks BK2; for each chunk, compute a partial tmp_tile = alpha*(A_tile * B_tile) for that k0-range (requires an inner reduction over nk), then immediately multiply partial tmp_tile by C_subtile and accumulate into D_tile. This reduces tmp global memory but increases on-chip storage/complexity and may reduce occupancy for double precision."
+    ],
+    "kernel_design": {
+      "baseline_two_kernel_design": {
+        "kernel1_tmp_gemm": {
+          "operation": "tmp(ni x nj) = alpha * A(ni x nk) * B(nk x nj)",
+          "grid": "2D grid of threadblocks over (i,j) tiles: grid.x = ceil(nj/BN), grid.y = ceil(ni/BM)",
+          "block": "e.g., 256 threads (16x16) or 128/256 threads depending on tile; each block computes one BMxBN tile of tmp",
+          "tiling": {
+            "BM": 64,
+            "BN": 64,
+            "BK": 8,
+            "notes": "For double, common choices are BM=64, BN=64, BK=8 or BM=128, BN=64, BK=8 depending on shared memory and register pressure."
+          },
+          "memory": [
+            "Load A_tile (BM x BK) and B_tile (BK x BN) into shared memory each k-step.",
+            "Each thread accumulates one or multiple output elements in registers (register blocking).",
+            "Write tmp_tile to global memory coalesced."
+          ],
+          "alpha_handling": "Multiply alpha into the accumulation (either scale A_tile or scale final accumulators)."
+        },
+        "kernel2_D_gemm": {
+          "operation": "D(ni x nl) = tmp(ni x nj) * C(nj x nl) + beta * D",
+          "grid": "2D grid over (i,j) tiles: grid.x = ceil(nl/BN), grid.y = ceil(ni/BM)",
+          "block": "same tiling style as kernel1",
+          "tiling": {
+            "BM": 64,
+            "BN": 64,
+            "BK": 8,
+            "notes": "Here BK tiles the nj dimension."
+          },
+          "memory": [
+            "Load tmp_tile (BM x BK) and C_tile (BK x BN) into shared memory each k-step.",
+            "Accumulate into registers.",
+            "Epilogue: D_out = accum + beta * D_in (beta scaling fused; no separate pass)."
+          ]
+        },
+        "synchronization": "Launch kernel2 after kernel1 in the same CUDA stream (implicit dependency). No global sync needed beyond kernel launch ordering."
+      },
+      "advanced_fused_design_optional": {
+        "idea": "Block over D tiles; for each D tile, stream over nj in chunks; for each chunk compute partial tmp_tile from A and B (stream over nk) and immediately apply to C to update D tile.",
+        "when_worth_it": "When tmp is very large and global memory bandwidth becomes limiting, and when you can afford reduced occupancy/complexity. Often less attractive than using highly tuned GEMMs unless tmp traffic is the dominant limiter."
+      }
+    }
+  },
+  "expected_speedup": "Against the naive CPU-like triple loops on GPU, a tiled GEMM approach is typically orders of magnitude faster. Against a naive GPU 'one thread per element' kernel, expect ~5-50x depending on sizes. Using cuBLAS DGEMM for both stages should get near-peak DGEMM throughput; overall runtime will be roughly time(GEMM1)+time(GEMM2)+tmp write/read overhead (already included in GEMM timings). Fusing may save up to ~1 global write + 1 global read of tmp (bandwidth), but may or may not beat cuBLAS in practice.",
+  "implementation_notes": [
+    "Best practical solution: call cuBLAS twice: cublasDgemm(handle, ..., alpha, A, B, 0, tmp) then cublasDgemm(handle, ..., 1.0, tmp, C, beta, D). This automatically uses optimal tiling and avoids hand-tuning.",
+    "If writing custom kernels: use shared-memory tiling + register blocking; avoid atomics; each block owns a unique output tile.",
+    "Use column-major vs row-major carefully. cuBLAS assumes column-major; either store accordingly or swap operands/transposes.",
+    "Fuse beta scaling into the second GEMM epilogue (as shown) to avoid an extra kernel.",
+    "Choose tile sizes based on SM shared memory and registers; for double precision, keep shared memory under limits (e.g., (BM*BK + BK*BN)*8 bytes).",
+    "Use __restrict__ pointers and align loads; consider using cp.async (on Ampere+) for pipelined shared-memory loads (mostly beneficial for FP32/TF32; still can help DP).",
+    "If matrices are small, kernel launch overhead dominates; consider batching or using cuBLASLt heuristics.",
+    "tmp storage: if memory footprint is an issue, consider computing in chunks of nj (paneling) so tmp panels are produced and consumed sequentially (still two kernels but reduced peak tmp residency)."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_2mm_pipeline/run2/2mm_direct.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                     \
+  do {                                                                       \
+    cudaError_t err__ = (call);                                              \
+    if (err__ != cudaSuccess) {                                              \
+      std::fprintf(stderr, "CUDA error %s:%d: %s\n",                         \
+                   __FILE__, __LINE__, cudaGetErrorString(err__));           \
+    }                                                                        \
+  } while (0)
+#endif
+
+// tmp(i,j) = alpha * sum_k A(i,k) * B(k,j)
+// A: ni x nk, B: nk x nj, tmp: ni x nj
+__global__ void k_tmp_ab(int ni, int nj, int nk,
+                         double alpha,
+                         const double* __restrict__ A,
+                         const double* __restrict__ B,
+                         double* __restrict__ tmp) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= ni || j >= nj) return;
+
+  double acc = 0.0;
+  const int a_row = i * nk;
+  for (int k = 0; k < nk; ++k) {
+    acc += A[a_row + k] * B[k * nj + j];
+  }
+  tmp[i * nj + j] = alpha * acc;
+}
+
+// D(i,j) = sum_k tmp(i,k) * C(k,j) + beta * D(i,j)
+// tmp: ni x nj, C: nj x nl, D: ni x nl
+__global__ void k_d_tmpc(int ni, int nj, int nl,
+                         double beta,
+                         const double* __restrict__ tmp,
+                         const double* __restrict__ C,
+                         double* __restrict__ D) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= ni || j >= nl) return;
+
+  double acc = 0.0;
+  const int tmp_row = i * nj;
+  for (int k = 0; k < nj; ++k) {
+    acc += tmp[tmp_row + k] * C[k * nl + j];
+  }
+  const int idx = i * nl + j;
+  D[idx] = acc + beta * D[idx];
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D) {
+  // Allocate device scratch tmp (ni * nj)
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc((void**)&tmp, tmp_bytes));
+  if (!tmp) return;
+
+  // Launch configuration
+  dim3 block(16, 16);
+  dim3 grid_tmp((nj + block.x - 1) / block.x,
+                (ni + block.y - 1) / block.y);
+  dim3 grid_d((nl + block.x - 1) / block.x,
+              (ni + block.y - 1) / block.y);
+
+  // tmp = alpha * A * B
+  k_tmp_ab<<<grid_tmp, block>>>(ni, nj, nk, alpha, A, B, tmp);
+  CUDA_CHECK(cudaGetLastError());
+
+  // D = tmp * C + beta * D
+  k_d_tmpc<<<grid_d, block>>>(ni, nj, nl, beta, tmp, C, D);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Ensure kernels complete before freeing tmp
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaFree(tmp));
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_2mm_pipeline/run2/2mm_full.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+
+#ifndef TILE_M
+#define TILE_M 16
+#endif
+#ifndef TILE_N
+#define TILE_N 16
+#endif
+#ifndef TILE_K
+#define TILE_K 16
+#endif
+
+#define CUDA_CHECK(call) do {                                   \
+  cudaError_t _e = (call);                                      \
+  if (_e != cudaSuccess) {                                      \
+    fprintf(stderr, "CUDA error %s:%d: %s\n",                   \
+            __FILE__, __LINE__, cudaGetErrorString(_e));        \
+  }                                                             \
+} while (0)
+
+__global__ void gemm_tmp_kernel(int ni, int nj, int nk,
+                                double alpha,
+                                const double* __restrict__ A, // ni x nk
+                                const double* __restrict__ B, // nk x nj
+                                double* __restrict__ tmp)     // ni x nj
+{
+  __shared__ double As[TILE_M][TILE_K];
+  __shared__ double Bs[TILE_K][TILE_N];
+
+  int row = blockIdx.y * TILE_M + threadIdx.y;
+  int col = blockIdx.x * TILE_N + threadIdx.x;
+
+  double acc = 0.0;
+
+  for (int k0 = 0; k0 < nk; k0 += TILE_K) {
+    // Load A tile
+    int a_col = k0 + threadIdx.x;
+    if (row < ni && a_col < nk) As[threadIdx.y][threadIdx.x] = A[row * nk + a_col];
+    else                       As[threadIdx.y][threadIdx.x] = 0.0;
+
+    // Load B tile
+    int b_row = k0 + threadIdx.y;
+    if (b_row < nk && col < nj) Bs[threadIdx.y][threadIdx.x] = B[b_row * nj + col];
+    else                        Bs[threadIdx.y][threadIdx.x] = 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int k = 0; k < TILE_K; ++k) {
+      acc += As[threadIdx.y][k] * Bs[k][threadIdx.x];
+    }
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nj) {
+    tmp[row * nj + col] = alpha * acc;
+  }
+}
+
+__global__ void gemm_D_kernel(int ni, int nj, int nl,
+                              double beta,
+                              const double* __restrict__ tmp, // ni x nj
+                              const double* __restrict__ C,   // nj x nl
+                              double* __restrict__ D)         // ni x nl (in/out)
+{
+  __shared__ double Ts[TILE_M][TILE_K];
+  __shared__ double Cs[TILE_K][TILE_N];
+
+  int row = blockIdx.y * TILE_M + threadIdx.y;
+  int col = blockIdx.x * TILE_N + threadIdx.x;
+
+  double acc = 0.0;
+
+  for (int k0 = 0; k0 < nj; k0 += TILE_K) {
+    // Load tmp tile
+    int t_col = k0 + threadIdx.x;
+    if (row < ni && t_col < nj) Ts[threadIdx.y][threadIdx.x] = tmp[row * nj + t_col];
+    else                       Ts[threadIdx.y][threadIdx.x] = 0.0;
+
+    // Load C tile
+    int c_row = k0 + threadIdx.y;
+    if (c_row < nj && col < nl) Cs[threadIdx.y][threadIdx.x] = C[c_row * nl + col];
+    else                        Cs[threadIdx.y][threadIdx.x] = 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int k = 0; k < TILE_K; ++k) {
+      acc += Ts[threadIdx.y][k] * Cs[k][threadIdx.x];
+    }
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nl) {
+    double d0 = D[row * nl + col];
+    D[row * nl + col] = acc + beta * d0;
+  }
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D)
+{
+  // Allocate tmp on device
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc((void**)&tmp, tmp_bytes));
+  if (!tmp) return;
+
+  dim3 block(TILE_N, TILE_M);
+
+  // Kernel 1: tmp = alpha * A * B
+  dim3 grid1((nj + TILE_N - 1) / TILE_N,
+             (ni + TILE_M - 1) / TILE_M);
+  gemm_tmp_kernel<<<grid1, block>>>(ni, nj, nk, alpha, A, B, tmp);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Kernel 2: D = tmp * C + beta * D
+  dim3 grid2((nl + TILE_N - 1) / TILE_N,
+             (ni + TILE_M - 1) / TILE_M);
+  gemm_D_kernel<<<grid2, block>>>(ni, nj, nl, beta, tmp, C, D);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Free tmp
+  CUDA_CHECK(cudaFree(tmp));
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_2mm_pipeline/run3/2mm_pipeline_report.json
+kernel=2mm  timestamp=2026-05-25T20:01:33.146420  total_cost=0.06013525
+
+--- DIRECT ---
+  strategy: 2kernels
+  result: {'cpu_ms': 3708.748, 'gpu_ms': 30.0733, 'speedup': 123.32, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: shared-mem+1kernels
+  result: {'cpu_ms': 2183.325, 'gpu_ms': 26.6556, 'speedup': 81.91, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of tmp[i][j] in the first loop nest is independent for each (i, j) pair.",
+    "The computation of D[i][j] in the second loop nest depends on the values of tmp[i][k] for all k, but each (i, j) pair is independent."
+  ],
+  "parallelization_challenges": [
+    "Efficiently managing memory access patterns to maximize coalesced memory accesses.",
+    "Ensuring that the temporary array tmp is efficiently utilized and does not become a bottleneck due to memory bandwidth limitations."
+  ],
+  "recommended_strategy": "Use a two-step kernel launch approach. First, parallelize the computation of tmp using a grid of threads where each thread computes one element of tmp. Second, launch another kernel to compute D, where each thread computes one element of D. Use shared memory to cache portions of A, B, and C to reduce global memory accesses and improve performance.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "compute-bound (if implemented as tiled GEMM); memory-bound only if done naively without reuse/tiling",
+    "data_dependencies": [
+      "Stage 1 (tmp = alpha*A*B): each tmp[i][j] is independent across (i,j); reduction over k.",
+      "Stage 2 (D = tmp*C + beta*D): each D[i][j] is independent across (i,j); reduction over k (k spans nj).",
+      "Inter-stage dependency: Stage 2 depends on all tmp values it reads; tmp must be fully produced (or streamed in tiles) before consuming corresponding portions."
+    ],
+    "what_was_incomplete_or_wrong": [
+      "Calling it memory-bound is not generally correct: GEMM-like kernels have high arithmetic intensity when tiled; the naive per-element approach is memory-bandwidth limited, but the correct GPU approach is blocked/tiled and becomes compute/throughput bound.",
+      "The recommended 'each thread computes one element' is a baseline but not a good concrete strategy for performance; you need block tiling, shared memory (or WMMA/Tensor Cores where applicable), and ideally avoid materializing full tmp in global memory if possible.",
+      "tmp can be a major bandwidth and storage cost: writing tmp (ni*nj) and rereading it for stage 2 adds extra global traffic; a fused/streamed approach can reduce this, but full fusion is nontrivial because stage 2 needs a dot over nj."
+    ],
+    "parallelization_challenges": [
+      "Choosing tiling so A/B/C loads are coalesced and reused (shared memory or L2) and so register pressure stays reasonable.",
+      "Managing tmp: either (a) store tmp to global (simple, two GEMMs) or (b) stream tiles of tmp through shared memory/registers to reduce global traffic (more complex).",
+      "Double precision: Tensor Core acceleration may not apply (unless using Hopper DP Tensor Cores / specific modes); otherwise use CUDA cores with good tiling."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Treat as two GEMMs (tmp = alpha*A*B, then D = tmp*C + beta*D) using tiled GPU kernels or cuBLAS; optionally use a streamed-tile variant to reduce tmp global traffic.",
+    "description": [
+      "Baseline high-performance solution: call cuBLAS dgemm for tmp = alpha*A*B and then cuBLAS dgemm for D = 1.0*tmp*C + beta*D. This is typically near-optimal and simplest.",
+      "Custom-kernel solution (concrete): launch two tiled GEMM kernels. Each thread block computes a BMxBN tile of the output (tmp or D). Use shared memory tiles of the left and right operands (A/B or tmp/C), loop over K in chunks BK, accumulate in registers, then write the tile.",
+      "If tmp storage is problematic: compute D in tiles of (i,j) and stream over k in chunks; for each k-chunk, compute a BMxBK tile of (A*B) on-the-fly and immediately multiply by the corresponding BKxBN tile of C, accumulating into D registers. This reduces tmp global writes/reads but is more complex and increases compute (still correct) and shared-memory usage."
+    ],
+    "kernel_design": {
+      "two_kernel_tiled_gemm": {
+        "grid_mapping": [
+          "Kernel1 (A*B -> tmp): grid.x = ceil(nj/BN), grid.y = ceil(ni/BM). Block computes tmp tile [i0:i0+BM, j0:j0+BN].",
+          "Kernel2 (tmp*C -> D): grid.x = ceil(nl/BN), grid.y = ceil(ni/BM). Block computes D tile [i0:i0+BM, j0:j0+BN]."
+        ],
+        "tile_sizes_example": {
+          "BM": 128,
+          "BN": 128,
+          "BK": 16,
+          "threads_per_block": 256,
+          "per_thread_output_tile": "each thread accumulates a small r x c micro-tile, e.g., 8x4 doubles in registers (tune to GPU)"
+        },
+        "memory_plan": [
+          "Use shared memory for A_tile (BMxBK) and B_tile (BKxBN) in kernel1; similarly tmp_tile (BMxBK) and C_tile (BKxBN) in kernel2.",
+          "Coalesced loads: load B and C tiles with contiguous threads along the fastest-changing dimension; consider transposing B/C offline if original layout causes strided loads.",
+          "Use vectorized loads (double2) when aligned; pad shared memory to avoid bank conflicts."
+        ],
+        "math_plan": [
+          "Kernel1: accum = sum_k A(i,k)*B(k,j); multiply alpha either during accumulation or at writeback.",
+          "Kernel2: start with accum = beta*D(i,j); then accum += sum_k tmp(i,k)*C(k,j); write back."
+        ],
+        "synchronization": [
+          "__syncthreads() after loading each A/B (or tmp/C) tile into shared memory.",
+          "No inter-block sync needed; tmp completion is ensured by kernel launch order (or CUDA stream dependencies)."
+        ]
+      },
+      "optional_streamed_tmp_reduction": {
+        "idea": "Avoid writing full tmp to global by computing partial tmp tiles (BMxBK) and immediately using them with C tiles (BKxBN) to update D tile.",
+        "mapping": "Block owns a D tile (BMxBN). Loop over k0 in [0,nj) step BK: (1) compute tmp_sub = alpha*(A[:,kA]*B[kA,:]) reduced over kA in [0,nk) in chunks, producing BMxBK; (2) load C_sub (BKxBN); (3) D_tile += tmp_sub * C_sub. This is effectively a 3-matrix contraction; it saves tmp bandwidth but is significantly more complex and may increase compute/SMEM pressure.",
+        "when_to_use": "When ni*nj tmp is too large for memory/bandwidth budget and you can afford more complex tuning; otherwise prefer two GEMMs."
+      }
+    }
+  },
+  "expected_speedup": "On a modern GPU, a tiled GEMM (or cuBLAS) implementation is typically 10x–100x faster than a naive CPU version and often >10x faster than a naive GPU per-element kernel. Relative to the naive two-kernel 'one thread per element' GPU approach, a properly tiled GEMM approach commonly yields ~3x–20x depending on sizes and GPU.",
+  "implementation_notes": [
+    "Strong recommendation: use cuBLAS dgemm twice: (1) tmp = alpha*A*B, (2) D = tmp*C + beta*D. This is the most concrete and highest ROI strategy.",
+    "If writing custom kernels: use standard GEMM blocking (BM/BN/BK) + register micro-tiling; avoid 'one thread computes one element' except as a correctness baseline.",
+    "Consider data layout: if B and/or C access is strided for your chosen mapping, pretranspose B or C (or use cuBLAS with op flags) to ensure coalesced loads.",
+    "Use CUDA streams to overlap H2D/D2H transfers with compute if matrices are streamed; otherwise keep all matrices resident on device.",
+    "tmp size can be large; allocate tmp on device once and reuse; if memory is tight, consider the streamed-tmp approach or recomputation tradeoffs.",
+    "For double precision, ensure you target appropriate GPU (DP throughput varies widely). Tune tile sizes to avoid register spilling and to maximize occupancy without starving compute.",
+    "Numerical note: reassociation from tiling changes floating-point summation order vs CPU; results may differ slightly (normal for GEMM)."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_2mm_pipeline/run3/2mm_direct.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                     \
+  do {                                                                       \
+    cudaError_t err__ = (call);                                              \
+    if (err__ != cudaSuccess) {                                              \
+      std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,     \
+                   cudaGetErrorString(err__));                               \
+      std::abort();                                                          \
+    }                                                                        \
+  } while (0)
+#endif
+
+// tmp(i,j) = alpha * sum_k A(i,k) * B(k,j)
+// A: ni x nk, B: nk x nj, tmp: ni x nj
+__global__ void k_tmp_ab(int ni, int nj, int nk,
+                         double alpha,
+                         const double* __restrict__ A,
+                         const double* __restrict__ B,
+                         double* __restrict__ tmp) {
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= ni || j >= nj) return;
+
+  double acc = 0.0;
+  const int a_row = i * nk;
+  for (int k = 0; k < nk; ++k) {
+    acc += A[a_row + k] * B[k * nj + j];
+  }
+  tmp[i * nj + j] = alpha * acc;
+}
+
+// D(i,j) = sum_k tmp(i,k) * C(k,j) + beta * D(i,j)
+// tmp: ni x nj, C: nj x nl, D: ni x nl
+__global__ void k_d_tmpc(int ni, int nj, int nl,
+                         double beta,
+                         const double* __restrict__ tmp,
+                         const double* __restrict__ C,
+                         double* __restrict__ D) {
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= ni || j >= nl) return;
+
+  double acc = 0.0;
+  const int tmp_row = i * nj;
+  for (int k = 0; k < nj; ++k) {
+    acc += tmp[tmp_row + k] * C[k * nl + j];
+  }
+  const int idx = i * nl + j;
+  D[idx] = acc + beta * D[idx];
+}
+
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D) {
+  // Allocate device scratch tmp (ni * nj)
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CUDA_CHECK(cudaMalloc((void**)&tmp, tmp_bytes));
+
+  // Launch 1: tmp = alpha * A * B
+  dim3 block1(16, 16);
+  dim3 grid1((nj + block1.x - 1) / block1.x,
+             (ni + block1.y - 1) / block1.y);
+  k_tmp_ab<<<grid1, block1>>>(ni, nj, nk, alpha, A, B, tmp);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Launch 2: D = tmp * C + beta * D
+  dim3 block2(16, 16);
+  dim3 grid2((nl + block2.x - 1) / block2.x,
+             (ni + block2.y - 1) / block2.y);
+  k_d_tmpc<<<grid2, block2>>>(ni, nj, nl, beta, tmp, C, D);
+  CUDA_CHECK(cudaGetLastError());
+
+  // Ensure kernels complete before freeing tmp
+  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaFree(tmp));
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_2mm_pipeline/run3/2mm_full.cu]:
+LLM Generated (kernels + host launcher mm2_gpu) =====
+#include <cuda_runtime.h>
+#include <cstdio>
+
+#ifndef CHECK_CUDA
+#define CHECK_CUDA(call)                                                        \
+  do {                                                                          \
+    cudaError_t _e = (call);                                                    \
+    if (_e != cudaSuccess) {                                                    \
+      fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,             \
+              cudaGetErrorString(_e));                                          \
+    }                                                                           \
+  } while (0)
+#endif
+
+// Tiled GEMM kernel: C = alpha*A*B + beta*C
+// Row-major storage.
+// A: MxK, B: KxN, C: MxN
+template <int BM, int BN, int BK>
+__global__ void gemm_tiled_rm(const double* __restrict__ A,
+                             const double* __restrict__ B,
+                             double* __restrict__ C,
+                             int M, int N, int K,
+                             double alpha, double beta)
+{
+  // Block tile origin
+  const int row0 = blockIdx.y * BM;
+  const int col0 = blockIdx.x * BN;
+
+  // Thread coordinates within the BMxBN tile
+  const int tx = threadIdx.x; // [0, BN)
+  const int ty = threadIdx.y; // [0, BM)
+
+  // Shared memory tiles
+  __shared__ double As[BM][BK];
+  __shared__ double Bs[BK][BN];
+
+  // Global indices this thread computes
+  const int row = row0 + ty;
+  const int col = col0 + tx;
+
+  double acc = 0.0;
+
+  // Loop over K dimension in chunks of BK
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    // Load A tile: BMxBK
+    if (row < M && (k0 + tx) < K && tx < BK) {
+      As[ty][tx] = A[row * K + (k0 + tx)];
+    } else if (tx < BK) {
+      As[ty][tx] = 0.0;
+    }
+
+    // Load B tile: BKxBN
+    if ((k0 + ty) < K && col < N && ty < BK) {
+      Bs[ty][tx] = B[(k0 + ty) * N + col];
+    } else if (ty < BK) {
+      Bs[ty][tx] = 0.0;
+    }
+
+    __syncthreads();
+
+    // Compute partial dot for this (row,col)
+    if (row < M && col < N) {
+#pragma unroll
+      for (int kk = 0; kk < BK; ++kk) {
+        acc += As[ty][kk] * Bs[kk][tx];
+      }
+    }
+
+    __syncthreads();
+  }
+
+  // Write back
+  if (row < M && col < N) {
+    double c_old = C[row * N + col];
+    C[row * N + col] = alpha * acc + beta * c_old;
+  }
+}
+
+// Host launcher required by prompt.
+// All pointers are device pointers, row-major.
+void mm2_gpu(int ni, int nj, int nk, int nl,
+             double alpha, double beta,
+             double* A, double* B, double* C, double* D)
+{
+  // Allocate tmp on device: ni x nj
+  double* tmp = nullptr;
+  size_t tmp_bytes = (size_t)ni * (size_t)nj * sizeof(double);
+  CHECK_CUDA(cudaMalloc((void**)&tmp, tmp_bytes));
+
+  // Strategy: two tiled GEMMs
+  // 1) tmp = alpha*A*B + 0*tmp
+  // 2) D   = 1.0*tmp*C + beta*D
+
+  // Tile sizes (simple, faithful tiled GEMM approach)
+  constexpr int BM = 16;
+  constexpr int BN = 16;
+  constexpr int BK = 16;
+
+  dim3 block(BN, BM, 1);
+
+  // GEMM1: (ni x nk) * (nk x nj) -> (ni x nj)
+  dim3 grid1((nj + BN - 1) / BN, (ni + BM - 1) / BM, 1);
+  gemm_tiled_rm<BM, BN, BK><<<grid1, block>>>(A, B, tmp, ni, nj, nk, alpha, 0.0);
+
+  // GEMM2: (ni x nj) * (nj x nl) -> (ni x nl), accumulate with beta*D
+  dim3 grid2((nl + BN - 1) / BN, (ni + BM - 1) / BM, 1);
+  gemm_tiled_rm<BM, BN, BK><<<grid2, block>>>(tmp, C, D, ni, nl, nj, 1.0, beta);
+
+  // Cleanup
+  CHECK_CUDA(cudaFree(tmp));
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_jacobi2d_pipeline/jacobi2d_pipeline_report.json
+kernel=jacobi2d  timestamp=2026-05-25T19:23:11.628053  total_cost=0.05837125
+
+--- DIRECT ---
+  strategy: None
+  result: {'cpu_ms': 176.4467, 'gpu_ms': 19.6144, 'speedup': 9.0, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: None
+  result: {'cpu_ms': 166.2137, 'gpu_ms': 19.1784, 'speedup': 8.67, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of B[i][j] depends on A[i][j], A[i][j-1], A[i][j+1], A[i+1][j], and A[i-1][j].",
+    "The computation of A[i][j] in the next step depends on B[i][j], B[i][j-1], B[i][j+1], B[i+1][j], and B[i-1][j]."
+  ],
+  "parallelization_challenges": [
+    "The kernel exhibits a stencil pattern, which has inherent data dependencies between neighboring elements.",
+    "Boundary conditions need to be handled carefully to avoid out-of-bounds memory access.",
+    "The two-step update process (A to B, then B to A) requires synchronization between steps."
+  ],
+  "recommended_strategy": "Use a 2D grid of threads where each thread computes one element of B or A. Employ shared memory to cache neighboring elements to reduce global memory accesses. Synchronize threads at the end of each time step to ensure all updates are completed before proceeding to the next step.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "memory-bound",
+    "why_memory_bound": [
+      "Per interior point update: ~5 global loads + 1 global store (double). That is ~48 bytes moved (5*8 + 1*8) for ~6 FLOPs (5 adds + 1 mul), i.e., ~0.125 FLOP/byte -> strongly bandwidth-limited on modern GPUs.",
+      "Two sweeps per time step doubles traffic; arithmetic intensity remains low."
+    ],
+    "data_dependencies": [
+      "Within a single sweep (A->B), each B[i][j] depends only on A values from the previous time step/sweep; there are no write-after-read hazards within the same sweep because B is written once and A is read-only.",
+      "Between sweeps (A->B then B->A), there is a global dependency: the second sweep must see all B results from the first sweep for the same time step."
+    ],
+    "parallelization_challenges": [
+      "Main challenge is memory bandwidth and redundant global loads due to stencil reuse; shared memory tiling (or cache-friendly access) is key.",
+      "Boundary handling: only update i,j in [1, n-2]; boundaries can be left unchanged or handled separately.",
+      "Synchronization requirement is only between the two sweeps (and between time steps). This is naturally provided by launching separate kernels (global barrier). A per-block __syncthreads() is insufficient for the whole grid."
+    ],
+    "notes_on_previous_analysis": [
+      "Correct that it is memory-bound and stencil-based.",
+      "Incomplete/incorrect implication: 'inherent data dependencies between neighboring elements' within a sweep is misleading—neighbors are read-only, so the sweep is embarrassingly parallel over (i,j). The true dependency is only across sweeps/time steps.",
+      "Correct that shared memory can help; must be described as tiling with halo."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Two-kernel-per-timestep Jacobi with 2D tiling + shared-memory halo (ping-pong A/B). Optionally fuse the two sweeps using cooperative groups (grid sync) if supported, but default is separate kernels.",
+    "description": [
+      "Map the interior (n-2)x(n-2) points to a 2D CUDA grid. Each thread computes one output point.",
+      "Use shared memory to stage a tile of the input array plus a 1-cell halo on all sides (tileDim+2 by tileDim+2). This reduces global loads from ~5 per point toward ~1 per point (amortized), limited by halo overhead.",
+      "Launch kernel1: compute B = stencil(A). Launch kernel2: compute A = stencil(B). Repeat for tsteps.",
+      "Keep A and B resident on device for all time steps; only copy back at the end."
+    ],
+    "kernel_design": {
+      "thread_block_shape": "Use 2D blocks, e.g., (32,8) or (16,16). Prefer x dimension multiple of 32 for coalescing. Tune based on occupancy and shared memory.",
+      "indexing": [
+        "Global indices: i = blockIdx.y*blockDim.y + threadIdx.y + 1; j = blockIdx.x*blockDim.x + threadIdx.x + 1;",
+        "Only compute if i <= n-2 and j <= n-2."
+      ],
+      "shared_memory_tiling": {
+        "tile": "shared double sh[tileY+2][tileX+2]",
+        "loads": [
+          "Each thread loads its center element into sh[ty+1][tx+1].",
+          "Threads on block borders additionally load halo cells (left/right/top/bottom).",
+          "Four corner halo elements loaded by 4 threads (or guarded loads).",
+          "__syncthreads() after loads."
+        ],
+        "compute": "out = 0.2*(sh[ty+1][tx+1] + sh[ty+1][tx] + sh[ty+1][tx+2] + sh[ty][tx+1] + sh[ty+2][tx+1])",
+        "store": "Write to output array at [i][j]."
+      },
+      "boundary_handling": [
+        "Do not launch/compute for boundaries (i=0,n-1 or j=0,n-1).",
+        "Alternatively, allow threads to exist but guard with if and avoid out-of-bounds halo loads."
+      ],
+      "synchronization": [
+        "Kernel launch boundary provides global synchronization between A->B and B->A sweeps and between time steps.",
+        "Do not rely on __syncthreads() for inter-block sync."
+      ],
+      "optional_optimizations": [
+        "Use __restrict__ pointers and linearized indexing (row-major) for better compiler optimization.",
+        "Consider read-only cache (__ldg) on older architectures; on newer GPUs normal global loads are cached.",
+        "If n is large, consider using CUDA graphs to reduce kernel launch overhead across many tsteps.",
+        "If hardware supports cooperative launch and grid synchronization, you can fuse the two sweeps into one kernel per timestep with grid.sync() between sweeps; otherwise keep two kernels."
+      ]
+    }
+  },
+  "expected_speedup": "Typically large vs single-core CPU (often 10x-100x depending on CPU baseline and n,tsteps). Versus a naive GPU kernel without shared-memory tiling, tiling often yields ~1.3x-2.5x by reducing redundant global loads; exact gain depends on cache behavior, block size, and memory subsystem.",
+  "implementation_notes": [
+    "Use double precision; ensure GPU has adequate FP64 throughput, but kernel remains bandwidth-bound so FP64 rate is usually not the limiter.",
+    "Allocate A_d and B_d once; copy A/B in, iterate tsteps on device, copy final result out.",
+    "Prefer linear memory (double* with pitch or contiguous n*n) over VLA-style 2D arrays for CUDA; compute idx = i*n + j.",
+    "Choose block sizes to balance shared memory usage and occupancy. Shared memory per block is (tileX+2)*(tileY+2)*8 bytes; e.g., 32x8 -> 34*10*8 = 2720 bytes (small).",
+    "Grid dimensions: dim3 grid(ceil((n-2)/tileX), ceil((n-2)/tileY)).",
+    "If boundaries must remain constant, do not write them; if they must be updated differently, run a separate boundary kernel.",
+    "Validate correctness with small n and tsteps; compare against CPU reference."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_jacobi2d_pipeline/jacobi2d_direct.cu]:
+LLM Generated code (kernels + host launcher jacobi_gpu) ============
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                  \
+  cudaError_t err__ = (call);                                   \
+  if (err__ != cudaSuccess) {                                   \
+    /* In production you might handle/log this differently. */   \
+  }                                                             \
+} while (0)
+#endif
+
+__global__ void jacobi_stencil_2d(const double* __restrict__ in,
+                                  double* __restrict__ out,
+                                  int n)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // col
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // row
+
+  if (i >= 1 && i <= n - 2 && j >= 1 && j <= n - 2) {
+    int idx = i * n + j;
+    out[idx] = 0.2 * (in[idx] +
+                      in[idx - 1] +
+                      in[idx + 1] +
+                      in[idx + n] +
+                      in[idx - n]);
+  }
+}
+
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+  // A and B are device pointers to row-major n*n arrays.
+  if (tsteps <= 0 || n <= 2) return;
+
+  dim3 block(32, 8);
+  dim3 grid((n + block.x - 1) / block.x,
+            (n + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    jacobi_stencil_2d<<<grid, block>>>(A, B, n); // B = stencil(A)
+    jacobi_stencil_2d<<<grid, block>>>(B, A, n); // A = stencil(B)
+  }
+
+  // No host/device copies; caller owns synchronization policy.
+  // If you want jacobi_gpu to be synchronous, uncomment:
+  // CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ============
+
+  >>> GENERATED CUDA (full) [results/cuda_jacobi2d_pipeline/jacobi2d_full.cu]:
+LLM Generated code (kernels + host launcher jacobi_gpu) ============
+#include <cuda_runtime.h>
+
+#ifndef JACOBI_BLOCK_X
+#define JACOBI_BLOCK_X 32
+#endif
+
+#ifndef JACOBI_BLOCK_Y
+#define JACOBI_BLOCK_Y 8
+#endif
+
+// One sweep: out = stencil(in) on interior points, using shared-memory tiling + 1-cell halo.
+__global__ void jacobi2d_sweep_shmem(const double* __restrict__ in,
+                                    double* __restrict__ out,
+                                    int n)
+{
+    // Shared tile with halo: (blockDim.y+2) x (blockDim.x+2)
+    extern __shared__ double sh[];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int tileW = blockDim.x;
+    const int tileH = blockDim.y;
+    const int shW   = tileW + 2;
+
+    // Global indices for interior mapping (+1 shift to skip boundary)
+    const int j = blockIdx.x * tileW + tx + 1; // col
+    const int i = blockIdx.y * tileH + ty + 1; // row
+
+    // Shared indices (+1 for halo offset)
+    const int sj = tx + 1;
+    const int si = ty + 1;
+
+    auto sh_at = [&](int r, int c) -> double& { return sh[r * shW + c]; };
+
+    // Helper to safely load from global (guarded to avoid OOB)
+    auto gload = [&](int gr, int gc) -> double {
+        return in[gr * n + gc];
+    };
+
+    // Load center (only if within interior bounds; otherwise load something valid to avoid OOB)
+    if (i <= n - 2 && j <= n - 2) {
+        sh_at(si, sj) = gload(i, j);
+    } else {
+        // For threads outside interior, clamp to nearest valid index (keeps loads in-bounds)
+        int ci = (i < 0) ? 0 : (i > n - 1 ? n - 1 : i);
+        int cj = (j < 0) ? 0 : (j > n - 1 ? n - 1 : j);
+        sh_at(si, sj) = gload(ci, cj);
+    }
+
+    // Halo loads: only threads on tile borders participate, with bounds checks.
+    // Left halo
+    if (tx == 0) {
+        int gj = j - 1;
+        int gi = i;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(si, 0) = gload(gi, gj);
+        else sh_at(si, 0) = sh_at(si, sj);
+    }
+    // Right halo
+    if (tx == tileW - 1) {
+        int gj = j + 1;
+        int gi = i;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(si, sj + 1) = gload(gi, gj);
+        else sh_at(si, sj + 1) = sh_at(si, sj);
+    }
+    // Top halo
+    if (ty == 0) {
+        int gi = i - 1;
+        int gj = j;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(0, sj) = gload(gi, gj);
+        else sh_at(0, sj) = sh_at(si, sj);
+    }
+    // Bottom halo
+    if (ty == tileH - 1) {
+        int gi = i + 1;
+        int gj = j;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(si + 1, sj) = gload(gi, gj);
+        else sh_at(si + 1, sj) = sh_at(si, sj);
+    }
+
+    // Corner halos (4 threads)
+    if (tx == 0 && ty == 0) {
+        int gi = i - 1, gj = j - 1;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(0, 0) = gload(gi, gj);
+        else sh_at(0, 0) = sh_at(si, sj);
+    }
+    if (tx == tileW - 1 && ty == 0) {
+        int gi = i - 1, gj = j + 1;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(0, sj + 1) = gload(gi, gj);
+        else sh_at(0, sj + 1) = sh_at(si, sj);
+    }
+    if (tx == 0 && ty == tileH - 1) {
+        int gi = i + 1, gj = j - 1;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(si + 1, 0) = gload(gi, gj);
+        else sh_at(si + 1, 0) = sh_at(si, sj);
+    }
+    if (tx == tileW - 1 && ty == tileH - 1) {
+        int gi = i + 1, gj = j + 1;
+        if (gi >= 0 && gi < n && gj >= 0 && gj < n) sh_at(si + 1, sj + 1) = gload(gi, gj);
+        else sh_at(si + 1, sj + 1) = sh_at(si, sj);
+    }
+
+    __syncthreads();
+
+    // Compute only for interior points
+    if (i <= n - 2 && j <= n - 2) {
+        const double center = sh_at(si, sj);
+        const double left   = sh_at(si, sj - 1);
+        const double right  = sh_at(si, sj + 1);
+        const double up     = sh_at(si - 1, sj);
+        const double down   = sh_at(si + 1, sj);
+
+        out[i * n + j] = 0.2 * (center + left + right + down + up);
+    }
+}
+
+// Host launcher: device pointers A, B are n*n row-major on device.
+// Performs tsteps of: B=stencil(A) then A=stencil(B). Final result in A.
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+    const dim3 block(JACOBI_BLOCK_X, JACOBI_BLOCK_Y);
+    const int interiorW = (n >= 2) ? (n - 2) : 0;
+    const int interiorH = (n >= 2) ? (n - 2) : 0;
+    const dim3 grid((interiorW + block.x - 1) / block.x,
+                    (interiorH + block.y - 1) / block.y);
+
+    const size_t shmemBytes = (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(double);
+
+    for (int t = 0; t < tsteps; ++t) {
+        jacobi2d_sweep_shmem<<<grid, block, shmemBytes>>>(A, B, n);
+        jacobi2d_sweep_shmem<<<grid, block, shmemBytes>>>(B, A, n);
+    }
+}
+
+// ============
+
+==========================================================================================
+REPORT: results/cuda_jacobi2d_pipeline/run1/jacobi2d_pipeline_report.json
+kernel=jacobi2d  timestamp=2026-05-25T20:16:11.000722  total_cost=0.052767749999999995
+
+--- DIRECT ---
+  strategy: 1kernels
+  result: {'cpu_ms': 224.0167, 'gpu_ms': 21.7932, 'speedup': 10.28, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: shared-mem+1kernels
+  result: {'cpu_ms': 248.361, 'gpu_ms': 22.0031, 'speedup': 11.29, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of B[i][j] depends on A[i][j], A[i][j-1], A[i][j+1], A[i+1][j], and A[i-1][j].",
+    "The computation of A[i][j] in the next step depends on B[i][j], B[i][j-1], B[i][j+1], B[i+1][j], and B[i-1][j]."
+  ],
+  "parallelization_challenges": [
+    "The kernel exhibits a stencil pattern, which has inherent data dependencies between neighboring elements.",
+    "Boundary conditions need to be handled carefully to avoid out-of-bounds memory access.",
+    "The two-step update process (A to B, then B to A) requires synchronization between steps."
+  ],
+  "recommended_strategy": "Use a 2D grid of threads where each thread computes one element of B or A. Employ shared memory to cache neighboring elements to reduce global memory accesses. Synchronize threads at the end of each time step to ensure all updates are completed before proceeding to the next step.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "memory-bound",
+    "why_memory_bound": "Each interior point performs ~5 loads + 1 store (per sweep) with only a handful of FLOPs (5 adds + 1 mul). Arithmetic intensity is low, so performance is dominated by global memory bandwidth unless reuse is increased via tiling/shared memory.",
+    "data_dependencies": [
+      "Within a single sweep (A->B), each B[i][j] depends only on A values from the previous time level (same t). There are no write-after-read hazards within the sweep because B is written once per point and A is read-only for that sweep.",
+      "Between sweeps in the same time step, the second sweep (B->A) depends on the completed B from the first sweep, requiring a global synchronization point (i.e., separate kernel launch or a grid-wide sync mechanism).",
+      "Across time steps, A at time t+1 depends on A at time t through the intermediate B; thus time steps are sequential (cannot parallelize across t without advanced time-tiling/wavefront methods)."
+    ],
+    "parallelization_challenges": [
+      "Stencil neighbor accesses cause redundant global loads unless data is tiled (shared memory) or cache reuse is exploited.",
+      "Boundary handling: only update i,j in [1..n-2]; boundaries can be left unchanged or handled by a separate kernel if needed.",
+      "Need a global barrier between the two sweeps (A->B then B->A). A block-level __syncthreads() is insufficient."
+    ],
+    "what_was_incomplete_or_misleading_in_previous": [
+      "Saying the stencil has 'inherent data dependencies between neighboring elements' is misleading for Jacobi: within a sweep, points are independent because all reads come from the old array (A or B). The dependency is only between sweeps/time steps, not between threads computing different (i,j) in the same sweep.",
+      "The recommendation 'synchronize threads at the end of each time step' must be interpreted as a device-wide sync; in CUDA this is naturally achieved by ending a kernel and launching the next one (or using cooperative groups with restrictions)."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Two-kernel ping-pong per time step (A->B then B->A), using 2D thread blocks with shared-memory tiling (halo) to reduce redundant global loads. Optionally fuse the two sweeps using cooperative groups (grid sync) only if the GPU and launch constraints allow; otherwise keep two kernels.",
+    "description": [
+      "Map the 2D interior domain to a 2D grid of thread blocks. Each thread computes one output cell.",
+      "For each sweep, each block loads a tile of the input array into shared memory including a 1-cell halo on all sides (tileDim+2 by tileDim+2).",
+      "Compute the 5-point stencil from shared memory and write the result to the output array in global memory.",
+      "Repeat for the second sweep by swapping input/output pointers (ping-pong).",
+      "Launch configuration chosen to maximize occupancy while keeping shared memory per block reasonable (e.g., 16x16 or 32x8)."
+    ],
+    "kernel_design": {
+      "grid_mapping": {
+        "threads_per_block": "Typically (16,16) or (32,8). For doubles, (16,16) is a safe default; (32,8) can improve coalescing along x while keeping 256 threads/block.",
+        "global_indices": "i = blockIdx.y*blockDim.y + threadIdx.y + 1; j = blockIdx.x*blockDim.x + threadIdx.x + 1; (offset by +1 to skip boundary).",
+        "bounds": "Only compute if i < n-1 and j < n-1."
+      },
+      "shared_memory_tiling": {
+        "tile_shape": "(blockDim.y+2) x (blockDim.x+2) doubles",
+        "loads": [
+          "Each thread loads its center element into shared memory at [ty+1][tx+1].",
+          "Threads on tile edges additionally load halo elements (left/right/top/bottom).",
+          "Four corner halo elements can be loaded by a few threads (e.g., (0,0), (0,bdx-1), (bdy-1,0), (bdy-1,bdx-1)) or via conditional loads."
+        ],
+        "sync": "__syncthreads() after loads; then compute stencil from shared memory."
+      },
+      "memory_access": {
+        "coalescing": "Ensure j corresponds to the fastest-changing dimension (x/threadIdx.x) so global loads/stores are coalesced.",
+        "read_only_cache": "Mark input pointer as const and use __ldg() on older CUDA or rely on modern caching; shared memory still helps reduce redundant loads."
+      },
+      "time_stepping": {
+        "baseline": "for t in [0..tsteps-1]: launch jacobi_sweep(A,B); launch jacobi_sweep(B,A);",
+        "optional_optimization": "If tsteps is large, consider doing multiple time steps per launch only with cooperative groups grid synchronization (cooperative launch) or with temporal blocking (complex). Baseline two-launch-per-step is simplest and usually effective."
+      },
+      "boundary_conditions": {
+        "handling": "Do not update boundaries (i=0,n-1 or j=0,n-1). Leave them as-is. If boundaries must be set each step, run a small boundary kernel or incorporate conditionals."
+      }
+    }
+  },
+  "expected_speedup": "Typically large vs single-thread CPU (10x-100x depending on n, GPU, and CPU baseline). Versus a well-vectorized multi-core CPU, expect ~2x-10x. The kernel remains bandwidth-limited; shared-memory tiling often yields ~1.2x-2x over a naive global-memory stencil depending on cache behavior and block size.",
+  "implementation_notes": [
+    "Use two separate CUDA kernels for the two sweeps to get a device-wide synchronization between them (kernel launch boundary).",
+    "Prefer pointer swapping (double* A, *B) rather than copying arrays; treat A and B as linear memory with leading dimension n for simpler CUDA indexing.",
+    "Choose block sizes that balance occupancy and shared memory: shared bytes/block = (blockDim.x+2)*(blockDim.y+2)*8. For 16x16, that is 18*18*8 = 2592 bytes (small).",
+    "Avoid branch-heavy halo loading by using a cooperative loading scheme (e.g., have all threads participate in loading a (bdx+2)*(bdy+2) tile via a linearized loop over shared elements). This often improves performance and simplifies code.",
+    "Use restrict qualifiers (e.g., const double* __restrict__ in, double* __restrict__ out) to help the compiler.",
+    "If n is not a multiple of block dimensions, keep bounds checks; overhead is small relative to memory traffic.",
+    "If using CUDA, consider using cudaOccupancyMaxPotentialBlockSize to tune block size; for HIP, similar occupancy tools exist.",
+    "For very large n, ensure pitch/leading dimension alignment; cudaMallocPitch can help, but linear allocation is often fine if n is large and contiguous.",
+    "If correctness requires preserving A/B boundaries across steps, ensure you never write them (or explicitly copy boundary values if needed)."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_jacobi2d_pipeline/run1/jacobi2d_direct.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                   \
+  cudaError_t err__ = (call);                                   \
+  if (err__ != cudaSuccess) {                                   \
+    /* In production you might handle/log this differently. */  \
+  }                                                             \
+} while (0)
+#endif
+
+__global__ void jacobi_stencil_2d(const double* __restrict__ in,
+                                 double* __restrict__ out,
+                                 int n)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // col
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // row
+
+  if (i >= 1 && i <= n - 2 && j >= 1 && j <= n - 2) {
+    int idx = i * n + j;
+    out[idx] = 0.2 * (in[idx] +
+                      in[idx - 1] +
+                      in[idx + 1] +
+                      in[idx + n] +
+                      in[idx - n]);
+  }
+}
+
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+  // A and B are device pointers to row-major n*n arrays.
+  if (tsteps <= 0 || n <= 2) return;
+
+  dim3 block(32, 8);
+  dim3 grid((n + block.x - 1) / block.x,
+            (n + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    jacobi_stencil_2d<<<grid, block>>>(A, B, n); // B = stencil(A)
+    jacobi_stencil_2d<<<grid, block>>>(B, A, n); // A = stencil(B)
+  }
+
+  // Ensure completion before returning (no host/device copies performed).
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_jacobi2d_pipeline/run1/jacobi2d_full.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef JACOBI_BLOCK_X
+#define JACOBI_BLOCK_X 16
+#endif
+
+#ifndef JACOBI_BLOCK_Y
+#define JACOBI_BLOCK_Y 16
+#endif
+
+// One Jacobi sweep: out = stencil(in) on interior [1..n-2]x[1..n-2].
+// Shared-memory tiling with 1-cell halo on all sides.
+__global__ void jacobi_sweep_tiled(const double* __restrict__ in,
+                                  double* __restrict__ out,
+                                  int n)
+{
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const int bdx = blockDim.x;
+    const int bdy = blockDim.y;
+
+    // Global indices for interior, offset by +1 to skip boundary.
+    const int j = blockIdx.x * bdx + tx + 1;
+    const int i = blockIdx.y * bdy + ty + 1;
+
+    // Shared tile dimensions include halo.
+    const int sh_w = bdx + 2;
+    const int sh_h = bdy + 2;
+
+    extern __shared__ double sh[]; // size = (bdx+2)*(bdy+2)
+    auto sh_at = [&](int y, int x) -> double& { return sh[y * sh_w + x]; };
+
+    // Cooperative loading of the entire shared tile (including halo)
+    // using a linearized loop to avoid branch-heavy halo code.
+    const int tile_elems = sh_w * sh_h;
+    const int threads = bdx * bdy;
+    const int tid = ty * bdx + tx;
+
+    // Top-left global coordinate of the shared tile (including halo).
+    const int base_i = blockIdx.y * bdy; // corresponds to global i = base_i + sy, where sy in [0..bdy+1]
+    const int base_j = blockIdx.x * bdx; // corresponds to global j = base_j + sx, where sx in [0..bdx+1]
+
+    for (int idx = tid; idx < tile_elems; idx += threads) {
+        const int sy = idx / sh_w; // 0..bdy+1
+        const int sx = idx - sy * sh_w; // 0..bdx+1
+
+        const int gi = base_i + sy; // 0..n-1 (may exceed at edges)
+        const int gj = base_j + sx; // 0..n-1 (may exceed at edges)
+
+        // Clamp to valid range to avoid OOB loads for partial blocks at domain edges.
+        // This does not affect correctness because we never compute boundary outputs,
+        // and interior blocks are fully in-range.
+        const int cgi = (gi < 0) ? 0 : (gi >= n ? (n - 1) : gi);
+        const int cgj = (gj < 0) ? 0 : (gj >= n ? (n - 1) : gj);
+
+        sh_at(sy, sx) = in[cgi * n + cgj];
+    }
+
+    __syncthreads();
+
+    // Compute only interior points.
+    if (i < n - 1 && j < n - 1) {
+        const int sy = ty + 1;
+        const int sx = tx + 1;
+
+        const double center = sh_at(sy, sx);
+        const double left   = sh_at(sy, sx - 1);
+        const double right  = sh_at(sy, sx + 1);
+        const double down   = sh_at(sy + 1, sx);
+        const double up     = sh_at(sy - 1, sx);
+
+        out[i * n + j] = 0.2 * (center + left + right + down + up);
+    }
+}
+
+// Host launcher required by prompt.
+// A and B are device pointers to row-major n*n doubles.
+// Performs: for each t: B=stencil(A) then A=stencil(B). Final result in A.
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+    dim3 block(JACOBI_BLOCK_X, JACOBI_BLOCK_Y);
+    dim3 grid((n - 2 + block.x - 1) / block.x,
+              (n - 2 + block.y - 1) / block.y);
+
+    const size_t shmem_bytes = (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(double);
+
+    for (int t = 0; t < tsteps; ++t) {
+        jacobi_sweep_tiled<<<grid, block, shmem_bytes>>>(A, B, n);
+        jacobi_sweep_tiled<<<grid, block, shmem_bytes>>>(B, A, n);
+    }
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_jacobi2d_pipeline/run2/jacobi2d_pipeline_report.json
+kernel=jacobi2d  timestamp=2026-05-25T20:17:07.577917  total_cost=0.05416425
+
+--- DIRECT ---
+  strategy: 1kernels
+  result: {'cpu_ms': 194.679, 'gpu_ms': 21.0334, 'speedup': 9.26, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: shared-mem+1kernels
+  result: {'cpu_ms': 252.226, 'gpu_ms': 21.4623, 'speedup': 11.75, 'error': 0.0, 'correct': True}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of B[i][j] depends on A[i][j], A[i][j-1], A[i][j+1], A[i+1][j], and A[i-1][j].",
+    "The computation of A[i][j] in the next step depends on B[i][j], B[i][j-1], B[i][j+1], B[i+1][j], and B[i-1][j]."
+  ],
+  "parallelization_challenges": [
+    "The kernel exhibits a stencil pattern, which has inherent data dependencies between neighboring elements.",
+    "Boundary conditions need to be handled carefully to avoid out-of-bounds memory access.",
+    "The two-step update process (first updating B, then A) requires synchronization between steps."
+  ],
+  "recommended_strategy": "Use a 2D grid of threads where each thread computes one element of B or A. Employ shared memory to cache neighboring elements to reduce global memory accesses. Synchronize threads at the end of each time step to ensure all updates to B are completed before updating A.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "memory-bound (strongly), unless n is tiny",
+    "why_memory_bound": "Per interior point update: ~5 global loads + 1 global store of doubles (48 bytes) for ~6 FLOPs (5 adds + 1 mul) => ~0.125 FLOP/byte, far below typical GPU balance. Even with some cache reuse, bandwidth dominates.",
+    "data_dependencies": [
+      "Within a single sweep A->B: B[i][j] depends only on A at (i,j) and its 4-neighbors. There are no write-after-read hazards within the same sweep because B is written once per point and reads only A.",
+      "Within a single sweep B->A: A[i][j] depends only on B at (i,j) and its 4-neighbors. Same property.",
+      "Across time steps: A at time t+1 depends on A at time t through the intermediate B. This creates a global synchronization requirement between the two sweeps and between time steps."
+    ],
+    "parallelization_challenges": [
+      "No intra-sweep dependencies, so the stencil itself is not a parallelization blocker; the real dependency is the required global barrier between sweeps (A->B then B->A) and between time steps.",
+      "Boundary handling (i=0,n-1 or j=0,n-1) must avoid OOB and preserve boundary values (typically unchanged).",
+      "Memory traffic is high; naive implementation will be bandwidth-limited. Need to maximize coalescing and reuse via tiling/shared memory (or rely on L2/texture cache if acceptable)."
+    ],
+    "what_was_incomplete_or_wrong": [
+      "Saying 'stencil has inherent data dependencies between neighboring elements' is misleading for Jacobi: neighbors are read-only from the previous array, so all interior points in a sweep are embarrassingly parallel.",
+      "Synchronizing 'threads at the end of each time step' is not sufficient on GPU: you need a grid-wide barrier, which typically means separate kernel launches (or cooperative groups with restrictions)."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Two-kernel-per-timestep Jacobi with 2D tiling in shared memory (halo), optional kernel fusion via cooperative groups if supported; otherwise standard launches. Use ping-pong pointers to avoid extra copies.",
+    "description": [
+      "Launch kernel1 to compute B = stencil(A).",
+      "Launch kernel2 to compute A = stencil(B).",
+      "Repeat for tsteps. Each kernel uses a 2D thread block that loads a tile of the input array into shared memory including a 1-cell halo, then computes one output per thread for interior points of the tile.",
+      "This reduces redundant global loads of neighbor elements and ensures coalesced accesses along j (row-major)."
+    ],
+    "kernel_design": {
+      "thread_mapping": "2D grid. thread (tx,ty) computes global (j,i) = (blockIdx.x*BX+tx, blockIdx.y*BY+ty). Prefer x dimension mapped to contiguous j for coalescing.",
+      "block_size": "Typical: BX=32, BY=8 or 16 (tune). Shared tile size = (BY+2) x (BX+2) doubles.",
+      "shared_memory_tiling": [
+        "Allocate shared double tile[BY+2][BX+2].",
+        "Each thread loads its center element tile[ty+1][tx+1] from global if in-bounds.",
+        "Halo loads: threads on block edges additionally load left/right/top/bottom halo cells; optionally corners by 4 threads.",
+        "__syncthreads()",
+        "Compute output for interior global points (i in 1..n-2, j in 1..n-2) using shared neighbors.",
+        "Write output to global."
+      ],
+      "boundary_handling": "Guard computation with if (i>0 && i<n-1 && j>0 && j<n-1). For boundaries, either skip (leaving pre-initialized values) or explicitly copy input to output if required by the application.",
+      "synchronization": "Use kernel launch boundaries as global barriers between A->B and B->A. No device-wide sync inside a normal kernel.",
+      "memory_access": "Ensure A and B are contiguous row-major (C layout). Use leading dimension = n. Consider using __ldg()/read-only cache on older CUDA, or rely on modern caching.",
+      "precision": "double is bandwidth-heavy; if acceptable, consider float for higher throughput."
+    }
+  },
+  "expected_speedup": "Typically large vs single-thread CPU (10x-100x depending on n, tsteps, GPU/CPU). Versus optimized multicore CPU, often ~2x-10x. Actual speedup is bounded by memory bandwidth; shared-memory tiling helps but may be limited by L2 reuse already capturing some neighbor reuse.",
+  "implementation_notes": [
+    "Use two device arrays dA and dB; for each timestep launch stencil(dA->dB) then stencil(dB->dA). This is already 'ping-pong'; no extra swap needed if you alternate pointers or just overwrite as shown.",
+    "Choose grid dims: dim3 block(BX,BY); dim3 grid(ceil(n/BX), ceil(n/BY)). Computation guards handle edges.",
+    "Shared memory footprint: (BX+2)*(BY+2)*8 bytes. Example BX=32,BY=8 => 34*10*8=2720 bytes/block (small).",
+    "Unroll halo loads carefully to avoid branch divergence; a common pattern is: load center for all threads, then conditional loads for halos based on tx/ty.",
+    "If tsteps is large, kernel launch overhead is usually negligible; if tsteps is small and n is small, overhead can dominate.",
+    "Optional advanced: time-tiling (multiple timesteps per launch) is non-trivial for Jacobi because it needs two arrays and introduces larger halos; consider only if tsteps is huge and you can afford complexity.",
+    "If using CUDA Cooperative Groups for a single fused kernel with grid-wide sync between the two sweeps, you must launch as a cooperative kernel and ensure the whole grid fits concurrently on the GPU; otherwise prefer two kernels.",
+    "For best bandwidth: align allocations, use pitched allocation if helpful, and ensure j is the fastest-varying index in threadIdx.x."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_jacobi2d_pipeline/run2/jacobi2d_direct.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                   \
+  cudaError_t err__ = (call);                                   \
+  if (err__ != cudaSuccess) {                                   \
+    /* In production you might handle/log this differently. */  \
+  }                                                             \
+} while (0)
+#endif
+
+__global__ void jacobi_stencil_2d(const double* __restrict__ in,
+                                  double* __restrict__ out,
+                                  int n)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // column
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // row
+
+  if (i >= 1 && i <= n - 2 && j >= 1 && j <= n - 2) {
+    int idx = i * n + j;
+    out[idx] = 0.2 * (in[idx] +
+                      in[idx - 1] +
+                      in[idx + 1] +
+                      in[idx + n] +
+                      in[idx - n]);
+  }
+}
+
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+  if (tsteps <= 0 || n <= 2) return;
+
+  dim3 block(16, 16);
+  dim3 grid((n + block.x - 1) / block.x,
+            (n + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    jacobi_stencil_2d<<<grid, block>>>(A, B, n); // B = stencil(A)
+    jacobi_stencil_2d<<<grid, block>>>(B, A, n); // A = stencil(B)
+  }
+
+  CUDA_CHECK(cudaGetLastError());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_jacobi2d_pipeline/run2/jacobi2d_full.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef JACOBI_BX
+#define JACOBI_BX 32
+#endif
+
+#ifndef JACOBI_BY
+#define JACOBI_BY 8
+#endif
+
+// One sweep: out = 0.2 * (in(center) + in(left) + in(right) + in(down) + in(up))
+// Uses 2D shared-memory tiling with 1-cell halo.
+__global__ void jacobi2d_sweep_shared(const double* __restrict__ in,
+                                      double* __restrict__ out,
+                                      int n)
+{
+    // Global indices (i=row=y, j=col=x)
+    const int j = (int)blockIdx.x * JACOBI_BX + (int)threadIdx.x;
+    const int i = (int)blockIdx.y * JACOBI_BY + (int)threadIdx.y;
+
+    // Shared tile with halo: [BY+2][BX+2]
+    __shared__ double tile[JACOBI_BY + 2][JACOBI_BX + 2];
+
+    const int tx = (int)threadIdx.x;
+    const int ty = (int)threadIdx.y;
+
+    // Load center (or 0 if OOB; computation is guarded anyway)
+    if (i < n && j < n) {
+        tile[ty + 1][tx + 1] = in[i * n + j];
+    } else {
+        tile[ty + 1][tx + 1] = 0.0;
+    }
+
+    // Load halos (only threads on block edges participate)
+    // Left halo
+    if (tx == 0) {
+        if (i < n && (j - 1) >= 0) tile[ty + 1][0] = in[i * n + (j - 1)];
+        else tile[ty + 1][0] = 0.0;
+    }
+    // Right halo
+    if (tx == JACOBI_BX - 1) {
+        if (i < n && (j + 1) < n) tile[ty + 1][JACOBI_BX + 1] = in[i * n + (j + 1)];
+        else tile[ty + 1][JACOBI_BX + 1] = 0.0;
+    }
+    // Top halo (i-1)
+    if (ty == 0) {
+        if ((i - 1) >= 0 && j < n) tile[0][tx + 1] = in[(i - 1) * n + j];
+        else tile[0][tx + 1] = 0.0;
+    }
+    // Bottom halo (i+1)
+    if (ty == JACOBI_BY - 1) {
+        if ((i + 1) < n && j < n) tile[JACOBI_BY + 1][tx + 1] = in[(i + 1) * n + j];
+        else tile[JACOBI_BY + 1][tx + 1] = 0.0;
+    }
+
+    // Corner halos (4 threads)
+    if (tx == 0 && ty == 0) {
+        if ((i - 1) >= 0 && (j - 1) >= 0) tile[0][0] = in[(i - 1) * n + (j - 1)];
+        else tile[0][0] = 0.0;
+    }
+    if (tx == JACOBI_BX - 1 && ty == 0) {
+        if ((i - 1) >= 0 && (j + 1) < n) tile[0][JACOBI_BX + 1] = in[(i - 1) * n + (j + 1)];
+        else tile[0][JACOBI_BX + 1] = 0.0;
+    }
+    if (tx == 0 && ty == JACOBI_BY - 1) {
+        if ((i + 1) < n && (j - 1) >= 0) tile[JACOBI_BY + 1][0] = in[(i + 1) * n + (j - 1)];
+        else tile[JACOBI_BY + 1][0] = 0.0;
+    }
+    if (tx == JACOBI_BX - 1 && ty == JACOBI_BY - 1) {
+        if ((i + 1) < n && (j + 1) < n) tile[JACOBI_BX ? (JACOBI_BY + 1) : 0][JACOBI_BX + 1] = in[(i + 1) * n + (j + 1)];
+        else tile[JACOBI_BY + 1][JACOBI_BX + 1] = 0.0;
+    }
+
+    __syncthreads();
+
+    // Compute only interior points; boundaries are left untouched (as in reference loops).
+    if (i > 0 && i < (n - 1) && j > 0 && j < (n - 1)) {
+        const double center = tile[ty + 1][tx + 1];
+        const double left   = tile[ty + 1][tx + 0];
+        const double right  = tile[ty + 1][tx + 2];
+        const double up     = tile[ty + 0][tx + 1];
+        const double down   = tile[ty + 2][tx + 1];
+        out[i * n + j] = 0.2 * (center + left + right + down + up);
+    }
+}
+
+// Host launcher: operates on DEVICE pointers A and B (row-major n*n).
+// Per timestep: B = stencil(A) then A = stencil(B). Final result in A.
+extern "C" void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+    const dim3 block(JACOBI_BX, JACOBI_BY);
+    const dim3 grid((n + JACOBI_BX - 1) / JACOBI_BX,
+                    (n + JACOBI_BY - 1) / JACOBI_BY);
+
+    for (int t = 0; t < tsteps; ++t) {
+        jacobi2d_sweep_shared<<<grid, block>>>(A, B, n);
+        jacobi2d_sweep_shared<<<grid, block>>>(B, A, n);
+    }
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_jacobi2d_pipeline/run3/jacobi2d_pipeline_report.json
+kernel=jacobi2d  timestamp=2026-05-25T20:18:01.051392  total_cost=0.05584425
+
+--- DIRECT ---
+  strategy: 1kernels
+  result: {'cpu_ms': 214.0787, 'gpu_ms': 24.3811, 'speedup': 8.78, 'error': 0.0, 'correct': True}
+  msg: OK
+
+--- FULL ---
+  strategy: shared-mem+1kernels
+  result: {'cpu_ms': 200.78, 'gpu_ms': 21.8921, 'speedup': 9.17, 'error': 1480.0, 'correct': False}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of B[i][j] depends on A[i][j], A[i][j-1], A[i][j+1], A[i+1][j], and A[i-1][j].",
+    "The computation of A[i][j] in the next step depends on B[i][j], B[i][j-1], B[i][j+1], B[i+1][j], and B[i-1][j]."
+  ],
+  "parallelization_challenges": [
+    "The dependency on neighboring elements in both A and B arrays introduces a data dependency that requires careful handling to avoid race conditions.",
+    "The need to alternate between reading from A and writing to B, and vice versa, in each time step requires synchronization between iterations."
+  ],
+  "recommended_strategy": "Use a 2D grid of threads where each thread computes one element of B or A. Employ shared memory to cache neighboring elements to reduce global memory accesses. Use double buffering to alternate between A and B arrays across time steps. Ensure proper synchronization between threads to handle data dependencies.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": {
+    "bottleneck_type": "memory-bound",
+    "why_memory_bound": "Each interior point update performs ~5 loads + 1 store of double (48 bytes) for ~6 FLOPs (5 adds + 1 mul) => ~0.125 FLOP/byte, strongly bandwidth-limited on modern GPUs. Using shared memory can reduce redundant global loads but you still must write one output per point per sweep.",
+    "data_dependencies": [
+      "Within a single sweep A->B: B[i][j] depends only on A values from the previous sweep (same time step), so there are no intra-sweep write-after-read hazards if each thread writes a unique B[i][j].",
+      "Within a single sweep B->A: similarly, A[i][j] depends only on B values produced by the prior sweep, again no intra-sweep hazards.",
+      "Between the two sweeps inside each time step: the second sweep must see the completed B from the first sweep (a global synchronization point).",
+      "Between time steps: A at time t+1 depends on A at time t through the intermediate B; effectively you need two full-grid sweeps per time step."
+    ],
+    "parallelization_challenges": [
+      "Not race conditions from neighbor reads (reads are safe), but ensuring global completion between the two sweeps (A->B then B->A) and between time steps.",
+      "Halo/edge handling: boundaries (i=0,n-1 or j=0,n-1) are not updated; threads must guard or launch only interior.",
+      "Memory traffic dominates; performance hinges on coalesced accesses and reducing redundant loads via tiling/shared memory."
+    ],
+    "what_was_wrong_or_incomplete_in_previous": [
+      "It implies neighbor dependencies create race conditions; they do not, because each output element is written once and neighbors are only read.",
+      "It does not explicitly identify the required global barrier between the two sweeps; on GPUs this typically means separate kernel launches (or cooperative groups if supported).",
+      "It suggests 'synchronization between threads' for dependencies; only block-level sync is needed for shared-memory tiling, while grid-level sync is needed between sweeps."
+    ]
+  },
+  "gpu_strategy": {
+    "approach": "Two-kernel-per-timestep (or fused two-sweep kernel with cooperative launch), 2D thread blocks with shared-memory tiling (halo) to reduce global loads; double-buffer A/B pointers swapped each sweep.",
+    "description": [
+      "Map each interior grid point (i,j) to one GPU thread.",
+      "Use a 2D block (e.g., 32x8 or 16x16) and load a tile of the input array into shared memory including a 1-cell halo on all sides.",
+      "Compute the 5-point stencil from shared memory and write the result to the output array in global memory.",
+      "Perform two sweeps per time step: sweep1 reads A writes B; sweep2 reads B writes A. Enforce global ordering via kernel launch boundaries (default stream) or cooperative groups grid sync.",
+      "Use pointer swapping rather than copying arrays."
+    ],
+    "kernel_design": {
+      "launch_geometry": {
+        "block_dim_candidates": [
+          {"x": 32, "y": 8, "reason": "Good coalescing along x (j dimension), enough warps/block, moderate shared memory footprint."},
+          {"x": 16, "y": 16, "reason": "Simple square tile; may be fine but sometimes less ideal for coalescing/occupancy tradeoffs."}
+        ],
+        "grid_dim": "ceil((n-2)/blockDim.y) by ceil((n-2)/blockDim.x) blocks, covering interior indices i=1..n-2, j=1..n-2"
+      },
+      "shared_memory_tiling": {
+        "tile_shape": "(blockDim.y + 2) x (blockDim.x + 2) doubles",
+        "loads": [
+          "Each thread loads its center element into shared memory.",
+          "Threads on block borders additionally load halo elements (left/right/top/bottom); optionally corners by a few threads.",
+          "Synchronize within block (__syncthreads) before computing."
+        ],
+        "compute": "out = 0.2*(s[y][x] + s[y][x-1] + s[y][x+1] + s[y-1][x] + s[y+1][x])"
+      },
+      "synchronization_model": {
+        "within_block": "__syncthreads() after shared loads",
+        "between_sweeps": "Separate kernel launches (AtoB then BtoA) per time step in the same CUDA stream; this provides a global barrier."
+      },
+      "boundary_handling": "Threads compute only if (i>=1 && i<=n-2 && j>=1 && j<=n-2). Boundaries remain unchanged (or handled by a separate kernel if needed).",
+      "memory_access": [
+        "Store arrays in row-major; map threadIdx.x to j so global loads/stores are coalesced.",
+        "Consider using __restrict__ pointers and const-qualified input pointer to help compiler.",
+        "Optionally use read-only cache (__ldg) on older CUDA, though modern compilers often handle this."
+      ],
+      "optional_advanced_variant": {
+        "name": "Cooperative-groups fused timestep",
+        "idea": "One kernel performs both sweeps with grid-wide synchronization between them (cooperative launch). This reduces launch overhead but requires hardware/runtime support and limits occupancy due to cooperative constraints.",
+        "note": "Usually not necessary unless tsteps is small and launch overhead dominates."
+      }
+    }
+  },
+  "expected_speedup": "Typically large vs single-thread CPU (orders of magnitude), but vs optimized multicore CPU expect ~5x–30x depending on n, tsteps, GPU bandwidth, and whether shared-memory tiling is used. With tiling, you mainly approach a fraction of peak memory bandwidth; without tiling, redundant global loads reduce achieved bandwidth and speed.",
+  "implementation_notes": [
+    "Use two device arrays dA and dB; for each t: launch stencil(dA->dB), then stencil(dB->dA). No host-device transfers inside the loop.",
+    "Choose blockDim.x as a multiple of 32 for coalescing (e.g., 32).",
+    "Shared memory per block: (blockDim.x+2)*(blockDim.y+2)*8 bytes; e.g., 34*10*8=2720 bytes for 32x8, very small (good occupancy).",
+    "If n is large, ensure leading dimension is contiguous; if using pitched allocations, adjust indexing accordingly.",
+    "Consider unrolling the 0.2 multiply as multiplication by a constant; compiler will do this.",
+    "If double precision is required, ensure GPU has adequate FP64 throughput; however this kernel is bandwidth-bound so FP64 rate is usually not the limiter.",
+    "If boundaries must be preserved from input, either leave them untouched (don’t write them) or copy boundary rows/cols once per sweep with a small kernel."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_jacobi2d_pipeline/run3/jacobi2d_direct.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                   \
+  cudaError_t err__ = (call);                                   \
+  if (err__ != cudaSuccess) {                                   \
+    /* In production you might handle/log this differently. */  \
+  }                                                             \
+} while (0)
+#endif
+
+__global__ void jacobi_stencil_2d(const double* __restrict__ in,
+                                  double* __restrict__ out,
+                                  int n)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x; // column
+  int i = blockIdx.y * blockDim.y + threadIdx.y; // row
+
+  if (i >= 1 && i <= n - 2 && j >= 1 && j <= n - 2) {
+    int idx = i * n + j;
+    out[idx] = 0.2 * (in[idx] +
+                      in[idx - 1] +
+                      in[idx + 1] +
+                      in[idx + n] +
+                      in[idx - n]);
+  }
+}
+
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+  // A and B are device pointers to row-major n*n arrays.
+  if (tsteps <= 0 || n <= 2) return;
+
+  dim3 block(32, 8);
+  dim3 grid((n + block.x - 1) / block.x,
+            (n + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    jacobi_stencil_2d<<<grid, block>>>(A, B, n); // B = stencil(A)
+    jacobi_stencil_2d<<<grid, block>>>(B, A, n); // A = stencil(B)
+  }
+
+  // No host/device copies; caller owns synchronization if needed.
+  // Optionally, you could uncomment the next line for safety:
+  // CUDA_CHECK(cudaGetLastError());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_jacobi2d_pipeline/run3/jacobi2d_full.cu]:
+LLM Generated (kernels + host launcher jacobi_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef JACOBI_BLOCK_X
+#define JACOBI_BLOCK_X 32
+#endif
+
+#ifndef JACOBI_BLOCK_Y
+#define JACOBI_BLOCK_Y 8
+#endif
+
+// One sweep: out = stencil(in) on interior points.
+// Uses shared-memory tiling with 1-cell halo on all sides.
+__global__ void jacobi2d_sweep_kernel(const double* __restrict__ in,
+                                     double* __restrict__ out,
+                                     int n)
+{
+    // Interior coordinates covered by this block start at (1,1)
+    const int j = 1 + (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; // column
+    const int i = 1 + (int)blockIdx.y * (int)blockDim.y + (int)threadIdx.y; // row
+
+    const int tx = (int)threadIdx.x;
+    const int ty = (int)threadIdx.y;
+
+    // Shared tile: (blockDim.y+2) x (blockDim.x+2)
+    extern __shared__ double s[];
+    const int shW = (int)blockDim.x + 2;
+    const int sx  = tx + 1;
+    const int sy  = ty + 1;
+
+    // Helper lambda for shared indexing
+    auto S = [&](int y, int x) -> double& { return s[y * shW + x]; };
+
+    // Load center
+    if (i < n - 1 && j < n - 1) {
+        S(sy, sx) = in[i * n + j];
+    }
+
+    // Load halos (guarded by bounds)
+    if (tx == 0) {
+        // left halo
+        if (i < n - 1 && (j - 1) >= 0) S(sy, 0) = in[i * n + (j - 1)];
+    }
+    if (tx == (int)blockDim.x - 1) {
+        // right halo
+        if (i < n - 1 && (j + 1) < n) S(sy, sx + 1) = in[i * n + (j + 1)];
+    }
+    if (ty == 0) {
+        // top halo
+        if ((i - 1) >= 0 && j < n - 1) S(0, sx) = in[(i - 1) * n + j];
+    }
+    if (ty == (int)blockDim.y - 1) {
+        // bottom halo
+        if ((i + 1) < n && j < n - 1) S(sy + 1, sx) = in[(i + 1) * n + j];
+    }
+
+    // Load corners (optional but needed for completeness when both halo directions are used)
+    if (tx == 0 && ty == 0) {
+        if ((i - 1) >= 0 && (j - 1) >= 0) S(0, 0) = in[(i - 1) * n + (j - 1)];
+    }
+    if (tx == (int)blockDim.x - 1 && ty == 0) {
+        if ((i - 1) >= 0 && (j + 1) < n) S(0, sx + 1) = in[(i - 1) * n + (j + 1)];
+    }
+    if (tx == 0 && ty == (int)blockDim.y - 1) {
+        if ((i + 1) < n && (j - 1) >= 0) S(sy + 1, 0) = in[(i + 1) * n + (j - 1)];
+    }
+    if (tx == (int)blockDim.x - 1 && ty == (int)blockDim.y - 1) {
+        if ((i + 1) < n && (j + 1) < n) S(sy + 1, sx + 1) = in[(i + 1) * n + (j + 1)];
+    }
+
+    __syncthreads();
+
+    // Compute only interior points (boundaries untouched)
+    if (i >= 1 && i <= n - 2 && j >= 1 && j <= n - 2) {
+        const double v =
+            S(sy, sx) +
+            S(sy, sx - 1) +
+            S(sy, sx + 1) +
+            S(sy - 1, sx) +
+            S(sy + 1, sx);
+
+        out[i * n + j] = 0.2 * v;
+    }
+}
+
+// Host launcher: operates on device pointers A and B (row-major n*n).
+// Per time step: B = stencil(A) then A = stencil(B). Final result in A.
+void jacobi_gpu(int tsteps, int n, double* A, double* B)
+{
+    const dim3 block(JACOBI_BLOCK_X, JACOBI_BLOCK_Y);
+
+    // Cover interior (n-2) x (n-2), offset handled in kernel by +1
+    const int interiorW = (n >= 2) ? (n - 2) : 0;
+    const int interiorH = (n >= 2) ? (n - 2) : 0;
+
+    const dim3 grid(
+        (interiorW + (int)block.x - 1) / (int)block.x,
+        (interiorH + (int)block.y - 1) / (int)block.y
+    );
+
+    const size_t shmemBytes = (size_t)(block.x + 2) * (size_t)(block.y + 2) * sizeof(double);
+
+    for (int t = 0; t < tsteps; ++t) {
+        // Sweep 1: A -> B
+        jacobi2d_sweep_kernel<<<grid, block, shmemBytes>>>(A, B, n);
+        // Sweep 2: B -> A
+        jacobi2d_sweep_kernel<<<grid, block, shmemBytes>>>(B, A, n);
+    }
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_seidel_pipeline/run1/seidel_pipeline_report.json
+kernel=seidel_2d  timestamp=2026-05-25T20:08:37.663054  total_cost=0.05756625
+
+--- DIRECT ---
+  strategy: red-black+1kernels
+  result: {'cpu_ms': 745.5947, 'gpu_ms': 38.5333, 'speedup': 19.35, 'error': 0.00494, 'correct': False}
+  msg: OK
+
+--- FULL ---
+  strategy: wavefront+shared-mem+1kernels
+  result: {'cpu_ms': 744.005, 'gpu_ms': 86.1591, 'speedup': 8.64, 'error': 0.00259, 'correct': False}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "Each element A[i][j] depends on the values of its neighbors from the previous iteration, creating a data dependency across iterations.",
+    "The computation of A[i][j] in the current iteration depends on A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1], A[i][j], A[i][j+1], A[i+1][j-1], A[i+1][j], and A[i+1][j+1] from the previous iteration."
+  ],
+  "parallelization_challenges": [
+    "The inherent data dependencies across iterations make it difficult to parallelize the kernel directly without introducing synchronization or using a multi-step approach.",
+    "The need to update the array in-place means that care must be taken to avoid race conditions when parallelizing."
+  ],
+  "recommended_strategy": "Use a double-buffering technique where two arrays are used: one for reading the current state and another for writing the updated state. This allows for parallelization of the inner loops over i and j using GPU threads, while ensuring that each thread reads from the old state and writes to the new state. After each time step, swap the roles of the arrays.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": "Bottleneck: likely memory-bound for large n (9 loads + 1 store per point, low arithmetic intensity), though cache/shared-memory tiling can help. The dependency analysis is incomplete/wrong in a key way: this is a Gauss–Seidel (in-place) stencil, not a Jacobi stencil. Within a single time step t, A[i][j] depends on some values that have already been updated in the same sweep order (i increasing, j increasing): specifically A[i][j-1], A[i-1][j-1], A[i-1][j], A[i-1][j+1] are from the current time step (new), while A[i][j], A[i][j+1], A[i+1][*] are still old at the moment of update. Therefore, a naive 2D GPU mapping that updates all (i,j) in parallel violates these intra-timestep dependencies and changes semantics. Double-buffering would produce a Jacobi method, which is not semantically equivalent to this kernel (it changes the numerical method and convergence behavior). Correct parallelization must respect the wavefront/partial-order dependency (top-to-bottom, left-to-right) or use a mathematically equivalent reformulation (e.g., red-black Gauss–Seidel) only if changing the algorithm is allowed.",
+  "gpu_strategy": {
+    "approach": "Wavefront (anti-diagonal) Gauss–Seidel with tiled shared-memory, one kernel launch per wavefront (or cooperative-groups grid sync if supported)",
+    "description": "Preserve exact CPU loop semantics by executing updates in the same partial order: (i,j) depends on (i,j-1) and row i-1, so all points with equal (i+j) can be updated in parallel once the previous anti-diagonal (i+j-1) is complete. For each time step t, iterate wavefront index s = 2..2*(n-2). Launch a kernel where each thread updates one (i,j) such that i in [1,n-2], j in [1,n-2], and i+j = s. This guarantees that (i,j-1) lies on s-1 and is already updated, and all i-1 neighbors are also on earlier wavefronts. To reduce global memory traffic, process in tiles: each block owns a tile of A, loads a (T+2)x(T+2) halo into shared memory, then performs internal wavefront updates within the tile (local anti-diagonals) using __syncthreads() between local diagonals. Inter-tile dependencies are handled by global wavefront ordering: tiles are scheduled by tile-diagonal (tile_i + tile_j), and within a tile the local wavefront proceeds. This keeps correctness while increasing data reuse.",
+    "preserves_semantics": true,
+    "kernel_design": "For each t:\n1) For tileWave = 0 .. (numTilesI-1 + numTilesJ-1): launch kernel(tileWave)\n   - Each block corresponds to one tile (bi,bj) with bi+bj==tileWave.\n   - Load tile+halo into shared memory from global A.\n   - For localWave = 0 .. 2*(T-1):\n       threads whose (li+lj)==localWave update shared[li+1][lj+1] using 3x3 neighbors in shared.\n       __syncthreads() between localWave steps.\n   - Write updated interior tile back to global A.\n2) Next time step.\nIf cooperative launch is available, you can fuse tileWave loop into one kernel per t using grid-wide sync; otherwise it is one kernel launch per tileWave (and optionally per t)."
+  },
+  "expected_speedup": "Moderate. Correct Gauss–Seidel wavefront exposes limited parallelism per wavefront (O(n) points) and requires O(n) global synchronizations per time step (kernel launches or grid sync), so speedup vs CPU may be limited and may underutilize the GPU for small/medium n. Tiling improves memory efficiency, but synchronization/launch overhead remains. If algorithmic change is allowed (e.g., red-black Gauss–Seidel or Jacobi), speedups can be much higher due to full 2D parallelism.",
+  "implementation_notes": [
+    "Do NOT use simple double-buffering if you must preserve exact semantics; that converts Gauss–Seidel to Jacobi.",
+    "Wavefront parallelism: update all (i,j) with constant (i+j) in parallel; enforce completion between successive wavefronts.",
+    "Prefer tiled wavefront: shared-memory tile with halo, then local anti-diagonal updates with __syncthreads(); reduces redundant global loads.",
+    "Inter-tile ordering: schedule blocks by tile anti-diagonal (bi+bj). Without cooperative groups, implement as a host loop over tileWave with one kernel launch per tileWave (per t).",
+    "If using CUDA Cooperative Groups (cooperative launch), you can run one kernel per time step and do grid.sync() between tileWave phases to reduce launch overhead (requires supported GPU and occupancy constraints).",
+    "Choose tile size T (e.g., 16 or 32) to balance shared memory usage ((T+2)^2 doubles) and occupancy; use padding to avoid shared-memory bank conflicts if needed.",
+    "Boundary handling: only update i,j in [1,n-2]; halo loads must clamp or conditionally load boundaries.",
+    "Memory layout: ensure A is contiguous row-major; consider using pitched allocation for alignment/coalescing.",
+    "If semantics can be relaxed, consider red-black Gauss–Seidel (2-color) to get two global phases per t (much more GPU-friendly) or Jacobi with double buffering for maximal parallelism."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_seidel_pipeline/run1/seidel_direct.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                 \
+  cudaError_t err__ = (call);                                  \
+  if (err__ != cudaSuccess) {                                  \
+    /* In production you might handle/log this differently. */ \
+  }                                                            \
+} while (0)
+#endif
+
+// Red-black Gauss-Seidel for 2D 9-point stencil.
+// Update "red" cells then "black" cells each timestep.
+// This preserves Gauss-Seidel in-place semantics while enabling parallelism.
+
+__global__ void seidel_rb9_kernel(double* __restrict__ A, int n, int parity)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // interior: 1..n-2
+  int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i >= n - 1 || j >= n - 1) return;
+
+  if ( ((i + j) & 1) != parity ) return;
+
+  int idx = i * n + j;
+
+  double sum =
+      A[(i - 1) * n + (j - 1)] + A[(i - 1) * n + (j    )] + A[(i - 1) * n + (j + 1)] +
+      A[(i    ) * n + (j - 1)] + A[(i    ) * n + (j    )] + A[(i    ) * n + (j + 1)] +
+      A[(i + 1) * n + (j - 1)] + A[(i + 1) * n + (j    )] + A[(i + 1) * n + (j + 1)];
+
+  A[idx] = sum / 9.0;
+}
+
+void seidel_gpu(int tsteps, int n, double* A)
+{
+  if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+  dim3 block(16, 16);
+  dim3 grid(( (n - 2) + block.x - 1) / block.x,
+            ( (n - 2) + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    // Update red cells (parity 0), then black cells (parity 1)
+    seidel_rb9_kernel<<<grid, block>>>(A, n, 0);
+    CUDA_CHECK(cudaGetLastError());
+    seidel_rb9_kernel<<<grid, block>>>(A, n, 1);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Ensure completion before returning (caller may rely on updated A).
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_seidel_pipeline/run1/seidel_full.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef TILE
+#define TILE 16  // interior tile size (T). Shared tile is (T+2)x(T+2).
+#endif
+
+// One kernel processes all tiles on a given tile anti-diagonal: bi + bj == tileWave.
+// Each block handles one tile (bi,bj) and performs an in-tile wavefront (anti-diagonal)
+// Gauss–Seidel update using shared memory and __syncthreads() between local wavefronts.
+__global__ void seidel2d_tilewave_kernel(int n, double* __restrict__ A, int tileWave)
+{
+    // Number of interior points per dimension is (n-2). Tiles cover that interior.
+    const int interior = n - 2;
+    if (interior <= 0) return;
+
+    const int numTiles = (interior + TILE - 1) / TILE;
+
+    // Map blockIdx.x to a unique (bi,bj) such that bi+bj == tileWave.
+    // Enumerate bi in [max(0, tileWave-(numTiles-1)) .. min(numTiles-1, tileWave)].
+    const int bi_min = max(0, tileWave - (numTiles - 1));
+    const int bi_max = min(numTiles - 1, tileWave);
+    const int count  = bi_max - bi_min + 1;
+    if (count <= 0) return;
+
+    const int k = (int)blockIdx.x;
+    if (k >= count) return;
+
+    const int bi = bi_min + k;
+    const int bj = tileWave - bi;
+
+    // Global interior start indices for this tile (in full matrix coordinates).
+    const int i0 = 1 + bi * TILE;
+    const int j0 = 1 + bj * TILE;
+
+    // Actual interior extents for partial tiles at the boundary.
+    const int ti = min(TILE, (n - 1) - i0); // max i is n-2, so count is (n-1 - i0)
+    const int tj = min(TILE, (n - 1) - j0);
+
+    if (ti <= 0 || tj <= 0) return;
+
+    // Shared memory tile with halo: indices [0..ti+1][0..tj+1] within allocated (TILE+2)^2.
+    __shared__ double sh[(TILE + 2) * (TILE + 2)];
+    auto SH = [&](int si, int sj) -> double& { return sh[si * (TILE + 2) + sj]; };
+
+    // Load (ti+2) x (tj+2) region from global A into shared (including halo).
+    // Threads cooperate over the full shared tile footprint.
+    const int tid = (int)threadIdx.x;
+    const int threads = (int)blockDim.x;
+
+    const int sh_rows = ti + 2;
+    const int sh_cols = tj + 2;
+    const int sh_elems = sh_rows * sh_cols;
+
+    for (int idx = tid; idx < sh_elems; idx += threads) {
+        int si = idx / sh_cols; // 0..ti+1
+        int sj = idx - si * sh_cols; // 0..tj+1
+
+        int gi = i0 + (si - 1);
+        int gj = j0 + (sj - 1);
+
+        // gi,gj are guaranteed within [0..n-1] because i0>=1, j0>=1 and halo extends by 1.
+        SH(si, sj) = A[gi * n + gj];
+    }
+    __syncthreads();
+
+    // In-tile wavefront updates over interior shared indices [1..ti][1..tj].
+    // localWave = (li + lj) where li in [0..ti-1], lj in [0..tj-1].
+    // Update SH(li+1, lj+1) using 3x3 neighbors in shared.
+    const int localWaves = (ti - 1) + (tj - 1); // max (li+lj)
+    for (int w = 0; w <= localWaves; ++w) {
+        // Each thread updates at most one point on this local anti-diagonal.
+        // Map threadIdx.x to a candidate li; compute lj = w - li.
+        int li = tid; // 0..(threads-1)
+        if (li < ti) {
+            int lj = w - li;
+            if (0 <= lj && lj < tj) {
+                int si = li + 1;
+                int sj = lj + 1;
+
+                double sum =
+                    SH(si - 1, sj - 1) + SH(si - 1, sj) + SH(si - 1, sj + 1) +
+                    SH(si,     sj - 1) + SH(si,     sj) + SH(si,     sj + 1) +
+                    SH(si + 1, sj - 1) + SH(si + 1, sj) + SH(si + 1, sj + 1);
+
+                SH(si, sj) = sum * (1.0 / 9.0);
+            }
+        }
+        __syncthreads();
+    }
+
+    // Write updated interior back to global A.
+    const int interior_elems = ti * tj;
+    for (int idx = tid; idx < interior_elems; idx += threads) {
+        int li = idx / tj;      // 0..ti-1
+        int lj = idx - li * tj; // 0..tj-1
+        int gi = i0 + li;
+        int gj = j0 + lj;
+        A[gi * n + gj] = SH(li + 1, lj + 1);
+    }
+}
+
+// Host launcher: performs tsteps Gauss–Seidel sweeps in-place on device array A.
+// Uses global tile-wavefront ordering (one kernel launch per tileWave per time step).
+void seidel_gpu(int tsteps, int n, double* A)
+{
+    if (tsteps <= 0 || n <= 2 || A == nullptr) return;
+
+    const int interior = n - 2;
+    const int numTiles = (interior + TILE - 1) / TILE;
+    const int maxTileWave = (numTiles - 1) + (numTiles - 1);
+
+    // Threads per block: choose at least TILE threads so each localWave can be covered.
+    // (Correctness does not require full coverage in one step because threads stride,
+    // but using >= TILE is important for good coverage of li dimension.)
+    const int threads = 256; // must be >= TILE; 256 is a reasonable default.
+
+    for (int t = 0; t < tsteps; ++t) {
+        for (int tileWave = 0; tileWave <= maxTileWave; ++tileWave) {
+            const int bi_min = max(0, tileWave - (numTiles - 1));
+            const int bi_max = min(numTiles - 1, tileWave);
+            const int blocks = (bi_max >= bi_min) ? (bi_max - bi_min + 1) : 0;
+            if (blocks > 0) {
+                seidel2d_tilewave_kernel<<<blocks, threads>>>(n, A, tileWave);
+            }
+        }
+    }
+
+    // Ensure completion before returning (caller expects results ready on device).
+    cudaDeviceSynchronize();
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_seidel_pipeline/run2/seidel_pipeline_report.json
+kernel=seidel_2d  timestamp=2026-05-25T20:09:39.709607  total_cost=0.057582
+
+--- DIRECT ---
+  strategy: red-black+colored+1kernels
+  result: {'cpu_ms': 778.341, 'gpu_ms': 37.8687, 'speedup': 20.55, 'error': 0.00494, 'correct': False}
+  msg: OK
+
+--- FULL ---
+  strategy: wavefront+shared-mem+1kernels
+  result: {'cpu_ms': 701.8327, 'gpu_ms': 183.2014, 'speedup': 3.83, 'error': 0.00259, 'correct': False}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "Each element A[i][j] depends on its neighbors from the previous time step.",
+    "The computation of A[i][j] requires A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1], A[i][j+1], A[i+1][j-1], A[i+1][j], and A[i+1][j+1]."
+  ],
+  "parallelization_challenges": [
+    "The inherent data dependencies between consecutive time steps prevent straightforward parallelization across time.",
+    "The need to access neighboring elements in a 2D grid can lead to non-coalesced memory accesses on a GPU, which can reduce memory throughput."
+  ],
+  "recommended_strategy": "Use a tiling approach to divide the grid into smaller blocks that fit into shared memory, allowing for efficient data reuse and minimizing global memory accesses. Implement a double-buffering technique to handle data dependencies across time steps, where one buffer holds the current state and another holds the next state.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": "Bottleneck: likely memory-bandwidth-bound for large n (9 loads + 1 store per point, low arithmetic intensity), though shared-memory tiling can reduce redundant global loads. The dependency analysis is incomplete/wrong for this specific kernel: this is Gauss–Seidel (in-place) Seidel 2D, not Jacobi. Within a single time step t, the update A[i][j] reads A[i][j] and neighbors, some of which (A[i][j-1], A[i-1][*]) have already been updated earlier in the same sweep order, while others (A[i][j+1], A[i+1][*]) are not yet updated. Therefore there are loop-carried dependencies in both i and j (lexicographic order), so a naive 2D GPU mapping that updates all (i,j) in parallel would violate semantics. Double-buffering would change the algorithm to Jacobi and does NOT preserve the original semantics unless you accept a different numerical method. Correct parallelization must respect the wavefront/partial-order dependencies (e.g., diagonal wavefront / coloring / blocked Gauss–Seidel with ordering). Memory coalescing concerns are real, but secondary to correctness: the primary challenge is intra-timestep dependencies from in-place updates.",
+  "gpu_strategy": {
+    "approach": "Wavefront (anti-diagonal) Gauss–Seidel with per-diagonal parallelism; optional blocked wavefront for better locality",
+    "description": "Preserve the exact lexicographic Gauss–Seidel semantics by executing updates in increasing (i,j) order, but exploiting the fact that all points on the same anti-diagonal d=i+j are independent given that all points with smaller d have been completed. For each time step t: iterate d from 2 to 2*(n-2) (since i,j in [1,n-2]); launch a GPU kernel (or a cooperative-groups grid-wide sync kernel) that updates all (i,j) such that i+j=d in parallel. Each thread updates one grid point using the in-place A array. This respects dependencies because any neighbor that must be 'new' (i-1,*, or *,j-1) lies on diagonal d-1 or d-2 and is completed before diagonal d; neighbors that are 'old' (i+1,* or *,j+1) lie on diagonals > d and have not been updated yet, matching the CPU sweep. To reduce launch overhead and improve memory reuse, use blocked wavefront: partition the domain into tiles (e.g., BxB). Process tiles in wavefront order of tile coordinates (bi+bj increasing). Within a tile, perform the B internal anti-diagonals sequentially, with threads collaborating via shared memory to reuse halo data; between tiles on the same tile-diagonal, run in parallel. This keeps correctness while improving locality.",
+    "preserves_semantics": true,
+    "kernel_design": "Two viable concrete designs:\n(1) Simple diagonal kernels (easiest correctness): For each t and each diagonal d, launch a 1D grid where thread k maps to one (i,j) on that diagonal: i = max(1, d-(n-2)) + k; j = d - i. Bounds-check i,j in [1,n-2]. Each thread loads the 3x3 neighborhood from global memory and writes A[i][j]. This is correct but has many kernel launches: O(tsteps*n).\n(2) Blocked wavefront with shared memory (recommended): Choose tile size B (e.g., 16). Grid of tiles over interior. For each time step t, for tile-wavefront s = 0..(ntx+nty-2): launch a kernel over all tiles with (tx+ty)==s. Each block handles one tile. Block loads (B+2)x(B+2) region (tile + 1-cell halo) into shared memory, but note: top/left halo values may have been updated earlier in this timestep by predecessor tiles; bottom/right halo are still old—this is naturally satisfied if tile-wavefront ordering is enforced. Then inside the block, perform local anti-diagonals dd=0..(2B-2): threads update cells (ii,jj) with ii+jj==dd using shared memory, with __syncthreads() between dd steps. After finishing, write the BxB updated tile back to global. This preserves the same update order as the global lexicographic sweep when tiles are processed in wavefront order and intra-tile order is anti-diagonal.\nIf the GPU supports cooperative launch, you can fuse all diagonals (or all tile-wavefronts) into one kernel per timestep using grid-wide synchronization; otherwise you need one kernel launch per diagonal (simple) or per tile-wavefront (blocked), which is far fewer: O(tsteps*(ntx+nty))."
+  },
+  "expected_speedup": "Moderate. Compared to a CPU baseline, speedup depends heavily on n and tsteps. The algorithm’s strict ordering limits parallelism to O(n) per diagonal (or O(number_of_tiles_on_wavefront)), and requires synchronization between diagonals/wavefronts, so it will not reach the throughput of a fully parallel Jacobi stencil. For large n, blocked wavefront can still provide meaningful acceleration (often a few× to ~10× vs single-thread CPU; vs optimized multicore CPU, smaller). If you instead switch to Jacobi (double-buffer), speedups can be much higher, but semantics change.",
+  "implementation_notes": [
+    "Do NOT use double-buffering if you must preserve Seidel/Gauss–Seidel semantics; that converts to Jacobi.",
+    "Correctness hinge: enforce diagonal (or tile-wavefront) ordering across the whole grid for each timestep.",
+    "Prefer blocked wavefront to reduce kernel launches: launch per tile-wavefront (ntx+nty-1 launches per timestep) rather than per element-diagonal (O(n) launches per timestep).",
+    "Within a tile, use shared memory for (B+2)x(B+2) to reduce redundant global loads; synchronize between intra-tile diagonals with __syncthreads().",
+    "Memory access: store A in row-major; map threads so consecutive threads access consecutive j when possible (within each intra-tile diagonal, accesses are strided; overall benefit comes more from shared memory reuse than perfect coalescing).",
+    "Boundary handling: only update i,j in [1,n-2]; keep borders unchanged.",
+    "If cooperative groups are available, consider a single kernel per timestep with grid-wide sync between tile-wavefronts to reduce launch overhead further; otherwise multiple launches are required.",
+    "Tile size B should balance occupancy and shared memory: e.g., B=16 for double typically fits (18x18x8 bytes ≈ 2.6KB shared for the tile array, plus overhead).",
+    "Numerical note: because this is in-place, results are order-dependent; any reordering beyond the proven wavefront partial order can change results."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_seidel_pipeline/run2/seidel_direct.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                  \
+  cudaError_t _e = (call);                                      \
+  if (_e != cudaSuccess) {                                      \
+    /* In production you might handle/report the error. */      \
+  }                                                             \
+} while (0)
+#endif
+
+// Red-black Gauss-Seidel for 9-point stencil.
+// Update rule matches the C kernel, but parallelized via checkerboarding.
+// Each "t" sweep = red update + black update.
+__global__ void seidel9_rb_kernel(double* __restrict__ A, int n, int color)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // interior: 1..n-2
+  int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i >= n - 1 || j >= n - 1) return;
+
+  if ( ((i + j) & 1) != color ) return;
+
+  int idx = i * n + j;
+
+  double sum =
+      A[(i - 1) * n + (j - 1)] + A[(i - 1) * n + (j    )] + A[(i - 1) * n + (j + 1)] +
+      A[(i    ) * n + (j - 1)] + A[(i    ) * n + (j    )] + A[(i    ) * n + (j + 1)] +
+      A[(i + 1) * n + (j - 1)] + A[(i + 1) * n + (j    )] + A[(i + 1) * n + (j + 1)];
+
+  A[idx] = sum / 9.0;
+}
+
+void seidel_gpu(int tsteps, int n, double* A)
+{
+  if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+  dim3 block(32, 8);
+  dim3 grid((unsigned)((n - 2 + block.x - 1) / block.x),
+            (unsigned)((n - 2 + block.y - 1) / block.y));
+
+  for (int t = 0; t < tsteps; ++t) {
+    // Red update (color 0), then black update (color 1)
+    seidel9_rb_kernel<<<grid, block>>>(A, n, 0);
+    seidel9_rb_kernel<<<grid, block>>>(A, n, 1);
+  }
+
+  // Ensure completion before returning to caller.
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_seidel_pipeline/run2/seidel_full.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef SEIDEL_TILE_B
+#define SEIDEL_TILE_B 16
+#endif
+
+// Blocked wavefront Gauss–Seidel:
+// - One CUDA block updates one BxB interior tile.
+// - Tiles are launched in wavefront order of (tile_i + tile_j) = s.
+// - Inside a tile, updates proceed along anti-diagonals with __syncthreads().
+// This preserves the lexicographic in-place Gauss–Seidel semantics.
+__global__ void seidel2d_tile_wavefront_kernel(int n, double* __restrict__ A, int s)
+{
+    constexpr int B = SEIDEL_TILE_B;
+
+    // Tile grid over interior [1..n-2]x[1..n-2]
+    const int interior = n - 2;
+    const int ntx = (interior + B - 1) / B;
+    const int nty = (interior + B - 1) / B;
+
+    // Enumerate tiles on this wavefront s
+    const int tiles_on_s = min(ntx, s + 1) - max(0, s - (nty - 1));
+    const int idx = (int)blockIdx.x;
+    if (idx >= tiles_on_s) return;
+
+    const int tx_min = max(0, s - (nty - 1));
+    const int tile_x = tx_min + idx;
+    const int tile_y = s - tile_x;
+
+    if (tile_x < 0 || tile_x >= ntx || tile_y < 0 || tile_y >= nty) return;
+
+    // Global start indices (interior coordinates)
+    const int i0 = 1 + tile_y * B;
+    const int j0 = 1 + tile_x * B;
+
+    // Actual tile extents (for boundary tiles)
+    const int tile_h = min(B, (n - 1) - i0); // i in [i0 .. i0+tile_h-1] <= n-2
+    const int tile_w = min(B, (n - 1) - j0); // j in [j0 .. j0+tile_w-1] <= n-2
+
+    // Shared memory tile with 1-cell halo on all sides
+    __shared__ double sh[B + 2][B + 2];
+
+    // Load (tile_h+2) x (tile_w+2) region into shared memory.
+    // Halo indices map to global [i0-1 .. i0+tile_h] and [j0-1 .. j0+tile_w]
+    for (int li = threadIdx.y; li < tile_h + 2; li += blockDim.y) {
+        const int gi = i0 - 1 + li;
+        for (int lj = threadIdx.x; lj < tile_w + 2; lj += blockDim.x) {
+            const int gj = j0 - 1 + lj;
+            sh[li][lj] = A[gi * n + gj];
+        }
+    }
+    __syncthreads();
+
+    // Intra-tile anti-diagonals over local interior cells (1..tile_h, 1..tile_w)
+    // dd = (li-1) + (lj-1) ranges 0..(tile_h-1 + tile_w-1)
+    const int max_dd = (tile_h - 1) + (tile_w - 1);
+    for (int dd = 0; dd <= max_dd; ++dd) {
+        // Map threads to candidate (li, lj) pairs on this diagonal.
+        // Use a simple 2D threadblock mapping; each thread checks one (li,lj).
+        const int li = 1 + (int)threadIdx.y;
+        const int lj = 1 + (int)threadIdx.x;
+
+        if (li <= tile_h && lj <= tile_w) {
+            if ((li - 1) + (lj - 1) == dd) {
+                const double v =
+                    (sh[li - 1][lj - 1] + sh[li - 1][lj] + sh[li - 1][lj + 1] +
+                     sh[li][lj - 1]     + sh[li][lj]     + sh[li][lj + 1] +
+                     sh[li + 1][lj - 1] + sh[li + 1][lj] + sh[li + 1][lj + 1]) * (1.0 / 9.0);
+                sh[li][lj] = v;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Store updated interior tile back to global memory
+    for (int li = threadIdx.y; li < tile_h; li += blockDim.y) {
+        const int gi = i0 + li;
+        for (int lj = threadIdx.x; lj < tile_w; lj += blockDim.x) {
+            const int gj = j0 + lj;
+            A[gi * n + gj] = sh[li + 1][lj + 1];
+        }
+    }
+}
+
+void seidel_gpu(int tsteps, int n, double* A)
+{
+    if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+    constexpr int B = SEIDEL_TILE_B;
+
+    const int interior = n - 2;
+    const int ntx = (interior + B - 1) / B;
+    const int nty = (interior + B - 1) / B;
+    const int num_wavefronts = ntx + nty - 1;
+
+    // Threads: BxB so each thread can own one interior cell in the tile-diagonal step.
+    dim3 block(B, B, 1);
+
+    for (int t = 0; t < tsteps; ++t) {
+        for (int s = 0; s < num_wavefronts; ++s) {
+            const int tiles_on_s = min(ntx, s + 1) - max(0, s - (nty - 1));
+            if (tiles_on_s <= 0) continue;
+
+            dim3 grid((unsigned)tiles_on_s, 1, 1);
+            seidel2d_tile_wavefront_kernel<<<grid, block>>>(n, A, s);
+        }
+        // Ensure all wavefront launches for this timestep are complete before next timestep.
+        cudaDeviceSynchronize();
+    }
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_seidel_pipeline/run3/seidel_pipeline_report.json
+kernel=seidel_2d  timestamp=2026-05-25T20:10:49.021410  total_cost=0.06929825
+
+--- DIRECT ---
+  strategy: red-black+1kernels
+  result: {'cpu_ms': 720.237, 'gpu_ms': 24.5312, 'speedup': 29.36, 'error': 0.00494, 'correct': False}
+  msg: OK
+
+--- FULL ---
+  strategy: wavefront+shared-mem+3kernels
+  result: {'cpu_ms': 703.5857, 'gpu_ms': 370.6966, 'speedup': 1.9, 'error': 0.00263, 'correct': False}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "Each element A[i][j] depends on the values of its neighbors from the previous iteration, creating a data dependency across iterations.",
+    "The computation of A[i][j] in the current iteration depends on A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1], A[i][j], A[i][j+1], A[i+1][j-1], A[i+1][j], and A[i+1][j+1] from the previous iteration."
+  ],
+  "parallelization_challenges": [
+    "The inherent data dependencies across iterations make it difficult to parallelize the time steps directly.",
+    "Within a single time step, the computation of A[i][j] depends on neighboring elements, which can lead to race conditions if not handled properly."
+  ],
+  "recommended_strategy": "Use a double-buffering technique where two arrays are used: one for reading the current state and another for writing the updated state. This allows parallelization within each time step by assigning each thread to compute a specific element A[i][j] independently, while ensuring that reads are from the previous state and writes are to the new state. Utilize shared memory to cache neighboring elements for each thread block to reduce global memory accesses.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": "Bottleneck: likely memory-bound for large n (9 loads + 1 store per point, low arithmetic intensity), though cache reuse can help somewhat. The dependency analysis is incomplete/misleading: this kernel is Gauss–Seidel (in-place) because A[i][j] is overwritten and subsequent points in the same time step read the updated values (not purely 'previous iteration' values). Specifically, within a fixed t, A[i][j] depends on A[i][j-1] and A[i-1][*] that have already been updated in the same sweep order, while it depends on A[i][j+1] and A[i+1][*] that are not yet updated. Therefore, a naive 2D parallel mapping (one thread per (i,j) updating in-place) violates true loop-carried dependencies and changes semantics. Double-buffering would remove these intra-time-step dependencies but would change the algorithm to Jacobi (different numerical method / different results for finite tsteps), so it does not preserve semantics unless you explicitly accept that change. Correct parallelization must respect Gauss–Seidel ordering, e.g., via wavefront (anti-diagonal) scheduling or red-black (multi-color) Gauss–Seidel (still not identical to lexicographic GS unless you accept that semantic change).",
+  "gpu_strategy": {
+    "approach": "Wavefront (anti-diagonal) Gauss–Seidel with one kernel launch per wavefront (or per tile-wavefront), in-place update",
+    "description": "Preserve the exact lexicographic (i outer, j inner) Gauss–Seidel semantics by executing updates in dependency order. For a given time step t, define wavefronts by s = i + j. Because each update depends on (i-1, j-1), (i-1, j), (i-1, j+1), and (i, j-1) which all have smaller (i+j) than (i,j), executing increasing s ensures all required 'already-updated' neighbors are complete. For each s from 2 to 2*(n-2), launch a GPU kernel that updates all (i,j) with i in [1,n-2], j in [1,n-2], and i+j = s. All points on the same anti-diagonal are independent and can run in parallel. This keeps the in-place array A and matches the CPU loop order’s dataflow (up to reordering within the same anti-diagonal, which is safe because there are no dependencies among same-s points). To reduce launch overhead, use tiled wavefront: partition the domain into BxB tiles; process tiles in tile-wavefront order (tile_i + tile_j increasing). Within a tile, compute elements in local wavefront order using shared memory for the tile plus 1-cell halo, writing back to global after finishing the tile. This reduces global traffic and reduces the number of global synchronizations from O(n) wavefronts to O(n/B) tile-wavefronts (still requiring a global barrier between tile-wavefronts, typically implemented as separate kernel launches).",
+    "preserves_semantics": true,
+    "kernel_design": "Two-level wavefront. (1) Host loop over t. (2) Host loop over tile wavefront index ws = tile_i + tile_j. Launch kernel<<<grid(ws), block>>> where each block handles one tile on that ws. In-kernel: load (B+2)x(B+2) region into shared memory (halo included). Then for local wavefront k=0..2*(B-1): threads whose (li+lj)==k update shared[li+1][lj+1] using the 3x3 stencil from shared; __syncthreads() between k steps. After finishing, store the BxB interior back to A. Boundary tiles handle edges by clamping/conditional loads; global boundaries (i=0,n-1 or j=0,n-1) are not updated per original code."
+  },
+  "expected_speedup": "Moderate. Compared to a CPU baseline, speedup can be significant for large n, but it will be limited by (a) global synchronization frequency (kernel launches per tile-wavefront per t) and (b) memory bandwidth. Versus an incorrect fully-parallel in-place GPU version, this is slower but correct. Versus a Jacobi (double-buffer) GPU version, this is typically slower due to synchronization, but preserves Gauss–Seidel semantics.",
+  "implementation_notes": [
+    "Do NOT use simple double-buffering if you must preserve exact Gauss–Seidel semantics; that changes the method to Jacobi.",
+    "Naive 2D thread mapping updating A in-place is incorrect due to loop-carried dependencies (not just race conditions).",
+    "Tile size B: typically 16 or 32 for doubles depending on shared memory limits: shared bytes ~ (B+2)^2 * 8. Example B=32 => ~9 KB, fine; but occupancy also depends on registers.",
+    "Within-tile wavefront requires __syncthreads() per local diagonal; cost is acceptable because it is intra-block.",
+    "Global ordering between tiles must follow tile-wavefronts; easiest correct mechanism is one kernel launch per tile-wavefront (global barrier). For large tsteps, consider CUDA Graphs to reduce launch overhead.",
+    "Memory access: load/store coalescing is best when threads map to contiguous j. When loading halos, use cooperative loads with linear thread indexing.",
+    "Use restrict-qualified pointers and consider __ldg (or rely on modern caching) for read-only loads; but note reads are from A that is being updated, so only safe within the staged shared-memory tile.",
+    "If you can relax semantics (accept different iteration ordering), red-black Gauss–Seidel (2-color) gives much more parallelism (2 kernels per t) but is not identical to lexicographic GS; only use if acceptable."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_seidel_pipeline/run3/seidel_direct.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                 \
+  cudaError_t err__ = (call);                                  \
+  if (err__ != cudaSuccess) {                                  \
+    /* In production you might handle/log this differently. */ \
+  }                                                            \
+} while (0)
+#endif
+
+// Red-black Gauss-Seidel for 2D 9-point stencil.
+// Update rule matches the C kernel, but uses two sub-sweeps per time step:
+//  - update "red" cells (i+j even) using current neighbors
+//  - update "black" cells (i+j odd) using updated red + current black neighbors
+__global__ void seidel_rb_sweep(double* __restrict__ A, int n, int parity)
+{
+  int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // interior: 1..n-2
+  int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i >= n - 1 || j >= n - 1) return;
+
+  if (((i + j) & 1) != parity) return;
+
+  int idx = i * n + j;
+
+  double sum =
+      A[(i - 1) * n + (j - 1)] + A[(i - 1) * n + (j    )] + A[(i - 1) * n + (j + 1)] +
+      A[(i    ) * n + (j - 1)] + A[(i    ) * n + (j    )] + A[(i    ) * n + (j + 1)] +
+      A[(i + 1) * n + (j - 1)] + A[(i + 1) * n + (j    )] + A[(i + 1) * n + (j + 1)];
+
+  A[idx] = sum * (1.0 / 9.0);
+}
+
+void seidel_gpu(int tsteps, int n, double* A)
+{
+  if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+  dim3 block(16, 16);
+  dim3 grid((n - 2 + block.x - 1) / block.x,
+            (n - 2 + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    // Red sweep (even parity)
+    seidel_rb_sweep<<<grid, block>>>(A, n, 0);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Black sweep (odd parity)
+    seidel_rb_sweep<<<grid, block>>>(A, n, 1);
+    CUDA_CHECK(cudaGetLastError());
+  }
+
+  // Ensure completion before returning to caller.
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+// =====
+
+  >>> GENERATED CUDA (full) [results/cuda_seidel_pipeline/run3/seidel_full.cu]:
+LLM Generated (kernel + host launcher seidel_gpu) =====
+#include <cuda_runtime.h>
+
+#ifndef SEIDEL_TILE_B
+#define SEIDEL_TILE_B 32
+#endif
+
+// One block processes one BxB tile (interior only), in tile-wavefront order.
+// Within the tile, we perform local anti-diagonal (wavefront) updates in shared memory.
+__global__ void seidel2d_tile_wavefront_kernel(double* __restrict__ A, int n,
+                                               int tilesPerDim, int ws)
+{
+    constexpr int B = SEIDEL_TILE_B;
+
+    // Map this block to a tile (ti, tj) such that ti + tj == ws
+    int ti = blockIdx.x;
+    int tj = ws - ti;
+    if (tj < 0 || tj >= tilesPerDim) return;
+
+    // Global coordinates of the tile's top-left interior element
+    int i0 = 1 + ti * B;
+    int j0 = 1 + tj * B;
+
+    // Shared memory for (B+2)x(B+2) including 1-cell halo
+    __shared__ double sh[(B + 2) * (B + 2)];
+    auto SH = [&](int si, int sj) -> double& { return sh[si * (B + 2) + sj]; };
+
+    // Cooperative load of the tile region + halo from global memory.
+    // We clamp loads to [0, n-1] to safely handle partial tiles near the boundary.
+    int tid = threadIdx.x;
+    int total = (B + 2) * (B + 2);
+    for (int idx = tid; idx < total; idx += blockDim.x) {
+        int si = idx / (B + 2);
+        int sj = idx - si * (B + 2);
+
+        int gi = i0 + (si - 1);
+        int gj = j0 + (sj - 1);
+
+        gi = (gi < 0) ? 0 : (gi >= n ? (n - 1) : gi);
+        gj = (gj < 0) ? 0 : (gj >= n ? (n - 1) : gj);
+
+        SH(si, sj) = A[gi * n + gj];
+    }
+    __syncthreads();
+
+    // Local wavefront updates over the BxB interior of the tile.
+    // Only update points that are truly interior globally: 1..n-2.
+    // Local interior indices: li, lj in [0, B-1] correspond to shared [li+1][lj+1].
+    for (int k = 0; k <= 2 * (B - 1); ++k) {
+        // Each thread handles multiple (li, lj) pairs on this diagonal via linear enumeration.
+        // Enumerate all B*B points; update those with li+lj==k.
+        for (int p = tid; p < B * B; p += blockDim.x) {
+            int li = p / B;
+            int lj = p - li * B;
+            if (li + lj != k) continue;
+
+            int gi = i0 + li;
+            int gj = j0 + lj;
+
+            // Only update global interior points
+            if (gi >= 1 && gi <= n - 2 && gj >= 1 && gj <= n - 2) {
+                int si = li + 1;
+                int sj = lj + 1;
+
+                double sum =
+                    SH(si - 1, sj - 1) + SH(si - 1, sj) + SH(si - 1, sj + 1) +
+                    SH(si,     sj - 1) + SH(si,     sj) + SH(si,     sj + 1) +
+                    SH(si + 1, sj - 1) + SH(si + 1, sj) + SH(si + 1, sj + 1);
+
+                SH(si, sj) = sum * (1.0 / 9.0);
+            }
+        }
+        __syncthreads(); // enforce local wavefront dependency order
+    }
+
+    // Store back the updated BxB interior to global memory (only true interior points).
+    for (int p = tid; p < B * B; p += blockDim.x) {
+        int li = p / B;
+        int lj = p - li * B;
+
+        int gi = i0 + li;
+        int gj = j0 + lj;
+
+        if (gi >= 1 && gi <= n - 2 && gj >= 1 && gj <= n - 2) {
+            A[gi * n + gj] = SH(li + 1, lj + 1);
+        }
+    }
+}
+
+// Host launcher required by the prompt.
+// A is an n*n row-major array already resident in device memory.
+void seidel_gpu(int tsteps, int n, double* A)
+{
+    if (tsteps <= 0 || n <= 2 || A == nullptr) return;
+
+    constexpr int B = SEIDEL_TILE_B;
+
+    // Number of tiles covering the interior extent (1..n-2) in each dimension
+    int interior = n - 2;
+    int tilesPerDim = (interior + B - 1) / B;
+    int maxWs = 2 * (tilesPerDim - 1);
+
+    // Threads per block: 256 is a good default for cooperative loads and updates.
+    dim3 block(256);
+
+    for (int t = 0; t < tsteps; ++t) {
+        for (int ws = 0; ws <= maxWs; ++ws) {
+            // For a given ws, valid ti are [max(0, ws-(tilesPerDim-1)) .. min(tilesPerDim-1, ws)]
+            int ti_min = (ws - (tilesPerDim - 1) > 0) ? (ws - (tilesPerDim - 1)) : 0;
+            int ti_max = (ws < (tilesPerDim - 1)) ? ws : (tilesPerDim - 1);
+            int numTilesThisWs = ti_max - ti_min + 1;
+            if (numTilesThisWs <= 0) continue;
+
+            // Launch blocks indexed by local ti' in [0..numTilesThisWs-1], map to ti = ti_min + blockIdx.x
+            // We implement this by passing ws and tilesPerDim, and offsetting ti inside kernel via grid-stride:
+            // simplest: launch exactly numTilesThisWs blocks and add ti_min to blockIdx.x in-kernel.
+            // To avoid changing kernel signature, we incorporate ti_min by shifting ws and tilesPerDim? Not possible.
+            // So we use a small wrapper: encode ti_min into ws via negative? Not allowed.
+            // Instead, we launch tilesPerDim blocks and let kernel return for invalid tj; but that wastes blocks.
+            // We'll do the efficient way by using a separate kernel that adds ti_min.
+            // However prompt allows "any kernels it needs"; so we provide a tiny wrapper kernel.
+
+            // Wrapper launch:
+            // grid.x = numTilesThisWs, kernel computes ti = ti_min + blockIdx.x, tj = ws - ti.
+            // We'll call a specialized kernel via a lambda-like pattern by using a second kernel below.
+            extern __global__ void seidel2d_tile_wavefront_kernel_offset(double*, int, int, int, int);
+            dim3 grid(numTilesThisWs);
+            seidel2d_tile_wavefront_kernel_offset<<<grid, block>>>(A, n, tilesPerDim, ws, ti_min);
+        }
+    }
+}
+
+// Offset wrapper kernel (declared after seidel_gpu uses it via extern).
+__global__ void seidel2d_tile_wavefront_kernel_offset(double* __restrict__ A, int n,
+                                                      int tilesPerDim, int ws, int ti_min)
+{
+    int ti = ti_min + blockIdx.x;
+    int tj = ws - ti;
+    if (ti < 0 || ti >= tilesPerDim || tj < 0 || tj >= tilesPerDim) return;
+
+    // Reuse the main kernel logic by inlining it here (cannot launch a kernel from a kernel without dynamic parallelism).
+    constexpr int B = SEIDEL_TILE_B;
+
+    int i0 = 1 + ti * B;
+    int j0 = 1 + tj * B;
+
+    __shared__ double sh[(B + 2) * (B + 2)];
+    auto SH = [&](int si, int sj) -> double& { return sh[si * (B + 2) + sj]; };
+
+    int tid = threadIdx.x;
+    int total = (B + 2) * (B + 2);
+    for (int idx = tid; idx < total; idx += blockDim.x) {
+        int si = idx / (B + 2);
+        int sj = idx - si * (B + 2);
+
+        int gi = i0 + (si - 1);
+        int gj = j0 + (sj - 1);
+
+        gi = (gi < 0) ? 0 : (gi >= n ? (n - 1) : gi);
+        gj = (gj < 0) ? 0 : (gj >= n ? (n - 1) : gj);
+
+        SH(si, sj) = A[gi * n + gj];
+    }
+    __syncthreads();
+
+    for (int k = 0; k <= 2 * (B - 1); ++k) {
+        for (int p = tid; p < B * B; p += blockDim.x) {
+            int li = p / B;
+            int lj = p - li * B;
+            if (li + lj != k) continue;
+
+            int gi = i0 + li;
+            int gj = j0 + lj;
+
+            if (gi >= 1 && gi <= n - 2 && gj >= 1 && gj <= n - 2) {
+                int si = li + 1;
+                int sj = lj + 1;
+
+                double sum =
+                    SH(si - 1, sj - 1) + SH(si - 1, sj) + SH(si - 1, sj + 1) +
+                    SH(si,     sj - 1) + SH(si,     sj) + SH(si,     sj + 1) +
+                    SH(si + 1, sj - 1) + SH(si + 1, sj) + SH(si + 1, sj + 1);
+
+                SH(si, sj) = sum * (1.0 / 9.0);
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int p = tid; p < B * B; p += blockDim.x) {
+        int li = p / B;
+        int lj = p - li * B;
+
+        int gi = i0 + li;
+        int gj = j0 + lj;
+
+        if (gi >= 1 && gi <= n - 2 && gj >= 1 && gj <= n - 2) {
+            A[gi * n + gj] = SH(li + 1, lj + 1);
+        }
+    }
+}
+// =====
+
+==========================================================================================
+REPORT: results/cuda_seidel_pipeline/seidel_pipeline_report.json
+kernel=seidel_2d  timestamp=2026-05-25T18:53:55.164549  total_cost=0.04514825
+
+--- DIRECT ---
+  strategy: None
+  result: {'cpu_ms': 740.311, 'gpu_ms': 40.3652, 'speedup': 18.34, 'error': 0.00494, 'correct': False}
+  msg: OK
+
+--- FULL ---
+  strategy: None
+  result: {'cpu_ms': 742.4823, 'gpu_ms': 2492.6636, 'speedup': 0.3, 'error': 0.0026, 'correct': False}
+  msg: OK
+
+  >>> STAGE1 (GPT-4o raw output):
+```json
+{
+  "bottleneck_type": "memory-bound",
+  "data_dependencies": [
+    "The computation of A[i][j] depends on the values of A[i-1][j-1], A[i-1][j], A[i-1][j+1], A[i][j-1], A[i][j], A[i][j+1], A[i+1][j-1], A[i+1][j], and A[i+1][j+1].",
+    "This introduces a data dependency between consecutive iterations of the inner loops, as the computation of A[i][j] in the current timestep depends on the values of A from the previous timestep."
+  ],
+  "parallelization_challenges": [
+    "The inherent data dependencies make it difficult to parallelize the computation across the entire grid without introducing race conditions.",
+    "Each element update depends on its neighboring elements, which means that updates cannot be performed independently without careful synchronization or staging."
+  ],
+  "recommended_strategy": "Use a double-buffering technique where two arrays are used: one for reading the current state and another for writing the updated state. This allows for parallel updates across the grid for each timestep. Implement a tiling strategy to optimize memory access patterns and reduce global memory traffic. Each tile can be processed by a block of threads, with shared memory used to store the tile data to minimize global memory accesses.",
+  "gpu_suitable": true
+}
+```
+
+  >>> STAGE2 (GPT-5.2 raw output):
+```json
+{
+  "validation": "partial",
+  "corrected_analysis": "Bottleneck: likely memory-bound for large n (9 loads + 1 store per point, low arithmetic intensity), but the dominant issue is not bandwidth alone: the kernel is Gauss–Seidel (in-place) and therefore has loop-carried dependencies within each timestep. Dependency: A[i][j] uses A[i][j-1] and A[i-1][*] that have already been updated in the same timestep (because i and j sweep forward), while A[i][j+1] and A[i+1][*] are from the old values (not yet updated). So the update is not equivalent to a Jacobi stencil. The previous analysis incorrectly implies the dependence is only across timesteps and that double-buffering preserves semantics; double-buffering would change the algorithm to Jacobi and produce different results. Parallelization challenge: naive 2D mapping (one thread per (i,j) updating in-place) violates the required update order and introduces races. Correct parallelism must respect the partial order induced by the lexicographic sweep, e.g., via wavefront/colored updates or by changing semantics (Jacobi).",
+  "gpu_strategy": {
+    "approach": "Wavefront (anti-diagonal) Gauss–Seidel with per-diagonal kernel launches (or cooperative-grid sync), optionally tiled with shared memory",
+    "description": "Preserve exact lexicographic Gauss–Seidel semantics by executing updates in a top-left to bottom-right wavefront. Define interior indices i,j in [1, n-2]. For a fixed timestep t, process anti-diagonals d = i + j from d_min=2 to d_max=2*(n-2). All points on the same anti-diagonal are independent under the lexicographic order because their dependencies (i,j-1) and (i-1,*) lie on earlier diagonals (d-1 or d-2). Therefore, for each d, launch a GPU kernel where each thread updates one (i,j) satisfying i+j=d. After the kernel completes, proceed to d+1 (global barrier between diagonals). Repeat for all diagonals, then advance to next timestep.\n\nConcrete mapping for diagonal d:\n- i ranges from max(1, d-(n-2)) to min(n-2, d-1)\n- j = d - i\n- number of points on diagonal: len = i_max - i_min + 1\n- launch 1D grid: total threads = len (or multiple blocks covering len)\n- thread k computes i = i_min + k, j = d - i, then performs the 9-point average in-place.\n\nTiling optimization (optional but concrete): process the grid in square tiles (e.g., 32x32 interior) but still in wavefront order of tiles. For each tile-wavefront (tile_i + tile_j increasing), launch a kernel where each block handles one tile. Inside the block, load the tile plus 1-cell halo into shared memory, then perform an internal wavefront over the tile’s local anti-diagonals with __syncthreads() between local diagonals. This reduces global reads while preserving the global wavefront ordering between tiles (kernel launch boundary provides the inter-tile barrier).",
+    "preserves_semantics": true,
+    "kernel_design": "Option A (simplest, correct): for each t and each diagonal d, launch kernel update_diag<<<ceil(len/TPB), TPB>>>(A, n, d). Option B (fewer launches): use CUDA cooperative groups (cooperative launch) with grid-wide synchronization between diagonals inside one kernel per timestep; requires hardware/runtime support and limits occupancy. Option C (tiled wavefront): for each t and each tile-diagonal D, launch kernel update_tile_diag<<<numTilesOnD, blockDim(32,32)>>>(A,n,D); within each block do shared-memory load and local wavefront updates."
+  },
+  "expected_speedup": "Moderate. Compared to CPU, large speedups are possible, but compared to an ideal Jacobi GPU stencil this will be limited by (1) required global synchronization between diagonals (many kernel launches or cooperative sync) and (2) reduced parallelism near the beginning/end diagonals. Tiled wavefront reduces memory traffic and improves throughput; still, synchronization overhead can dominate for small n or small tsteps.",
+  "implementation_notes": [
+    "Do NOT use double-buffering if you must match this exact Seidel in-place semantics; that changes the method to Jacobi.",
+    "Diagonal-launch approach has O(n) kernel launches per timestep; mitigate by (a) cooperative groups grid sync, or (b) tile-wavefront to reduce launches to O(n/Tile).",
+    "Use row-major contiguous layout; ensure j is the fastest-varying index for coalescing. In diagonal kernels, accesses are strided; tiling with shared memory helps coalescing and cache reuse.",
+    "Handle boundaries by restricting i,j to [1,n-2]; no updates on edges.",
+    "For double precision, consider using __ldg (where applicable) and ensure alignment; shared memory tile should include halo (tileDim+2)^2 doubles.",
+    "If exact semantics are not required, a Jacobi (double-buffered) stencil is vastly easier and typically faster on GPU; but it will not match Seidel results."
+  ]
+}
+```
+
+  >>> GENERATED CUDA (direct) [results/cuda_seidel_pipeline/seidel_direct.cu]:
+LLM Generated code (kernel + host launcher seidel_gpu) ============
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                 \
+  cudaError_t _e = (call);                                    \
+  if (_e != cudaSuccess) {                                    \
+    /* In production you might handle/report the error. */    \
+  }                                                           \
+} while (0)
+#endif
+
+// Red-black Gauss-Seidel for 9-point stencil (in-place).
+// Update rule matches the C kernel, but uses two color phases per timestep
+// to avoid write-after-read hazards in parallel.
+__global__ void seidel9_redblack_phase(double* __restrict__ A, int n, int phase /*0=red,1=black*/) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x + 1; // interior: 1..n-2
+  int i = blockIdx.y * blockDim.y + threadIdx.y + 1;
+
+  if (i >= n - 1 || j >= n - 1) return;
+
+  // Checkerboard coloring on (i,j)
+  if (((i + j) & 1) != phase) return;
+
+  int idx = i * n + j;
+
+  double sum =
+      A[(i - 1) * n + (j - 1)] + A[(i - 1) * n + (j    )] + A[(i - 1) * n + (j + 1)] +
+      A[(i    ) * n + (j - 1)] + A[(i    ) * n + (j    )] + A[(i    ) * n + (j + 1)] +
+      A[(i + 1) * n + (j - 1)] + A[(i + 1) * n + (j    )] + A[(i + 1) * n + (j + 1)];
+
+  A[idx] = sum / 9.0;
+}
+
+void seidel_gpu(int tsteps, int n, double* A) {
+  if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+  dim3 block(16, 16);
+  dim3 grid((n - 2 + block.x - 1) / block.x,
+            (n - 2 + block.y - 1) / block.y);
+
+  for (int t = 0; t < tsteps; ++t) {
+    // Red phase then black phase = one Gauss-Seidel sweep
+    seidel9_redblack_phase<<<grid, block>>>(A, n, 0);
+    seidel9_redblack_phase<<<grid, block>>>(A, n, 1);
+  }
+
+  // Ensure completion before returning to caller.
+  CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// ============
+
+  >>> GENERATED CUDA (full) [results/cuda_seidel_pipeline/seidel_full.cu]:
+LLM Generated code (kernel + host launcher seidel_gpu) ============
+#include <cuda_runtime.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do {                                 \
+  cudaError_t _e = (call);                                     \
+  if (_e != cudaSuccess) {                                     \
+    /* In production you might handle/report this differently */\
+  }                                                            \
+} while (0)
+#endif
+
+// Update one anti-diagonal d = i + j (interior only), in-place Gauss–Seidel.
+// Points on the same anti-diagonal are independent given lexicographic order.
+__global__ void seidel_update_diag(double* __restrict__ A, int n, int d)
+{
+  // Interior indices: i,j in [1, n-2]
+  const int i_min = max(1, d - (n - 2));
+  const int i_max = min(n - 2, d - 1);
+  const int len   = i_max - i_min + 1;
+  if (len <= 0) return;
+
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= len) return;
+
+  int i = i_min + k;
+  int j = d - i; // guaranteed in [1, n-2] by construction
+
+  const int idx = i * n + j;
+
+  // 9-point average (in-place)
+  double sum =
+      A[(i - 1) * n + (j - 1)] + A[(i - 1) * n + (j    )] + A[(i - 1) * n + (j + 1)] +
+      A[(i    ) * n + (j - 1)] + A[(i    ) * n + (j    )] + A[(i    ) * n + (j + 1)] +
+      A[(i + 1) * n + (j - 1)] + A[(i + 1) * n + (j    )] + A[(i + 1) * n + (j + 1)];
+
+  A[idx] = sum * (1.0 / 9.0);
+}
+
+// Host launcher: performs tsteps Gauss–Seidel sweeps using wavefront (anti-diagonal)
+// ordering with a global barrier between diagonals via kernel launch boundaries.
+void seidel_gpu(int tsteps, int n, double* A)
+{
+  if (tsteps <= 0 || n < 3 || A == nullptr) return;
+
+  // Anti-diagonals over interior [1..n-2]x[1..n-2]:
+  // d ranges from 1+1=2 to (n-2)+(n-2)=2*(n-2)
+  const int d_min = 2;
+  const int d_max = 2 * (n - 2);
+
+  const int TPB = 256;
+
+  for (int t = 0; t < tsteps; ++t) {
+    for (int d = d_min; d <= d_max; ++d) {
+      const int i_min = (d - (n - 2) > 1) ? (d - (n - 2)) : 1;
+      const int i_max = (d - 1 < (n - 2)) ? (d - 1) : (n - 2);
+      const int len   = i_max - i_min + 1;
+      if (len <= 0) continue;
+
+      int blocks = (len + TPB - 1) / TPB;
+      seidel_update_diag<<<blocks, TPB>>>(A, n, d);
+
+      // Kernel launch boundary provides the required global ordering between diagonals.
+      // Ensure completion before proceeding to next diagonal.
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+  }
+}
+
+// ============
